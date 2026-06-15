@@ -2,8 +2,6 @@
 
 Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into **OpenAI-compatible** and **Google AI Studio-compatible** APIs. Single-file, zero dependencies.
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/banana2556/gemini2api-cfworker)
-
 ## Features
 
 - **OpenAI API** — `GET /v1/models`, `POST /v1/chat/completions`
@@ -19,6 +17,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 
 ### One-Click Deploy
 
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/banana2556/gemini2api-cfworker)
 Click the button above, or paste `worker.js` directly into **Cloudflare Dashboard > Workers & Pages > Create > Quick Edit > Deploy**.
 
 ### Wrangler CLI
