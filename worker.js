@@ -867,10 +867,6 @@ function parseToolCalls(text) {
   return [cleanParts.join("").trim(), toolCalls];
 }
 
-function toOpenAIStreamToolCallDeltas(toolCalls) {
-  return (toolCalls || []).map((toolCall, index) => ({ index, ...toolCall }));
-}
-
 // ─── Google 原生 API 辅助函数 ────────────────────────────────────────────────
 function buildToolPrompt(toolDefs) {
   const spec = JSON.stringify(toolDefs, null, 2);
@@ -1137,12 +1133,9 @@ async function handleChat(req, cfg) {
 
   if (stream) {
     return sseResponse(async (write) => {
-      const delta = toolCalls
-        ? { tool_calls: toOpenAIStreamToolCallDeltas(toolCalls) }
-        : { role: "assistant", content: text || "" };
       write(`data: ${JSON.stringify({
         id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
-        choices: [{ index: 0, delta, finish_reason: finish }],
+        choices: [{ index: 0, delta: msg, finish_reason: finish }],
       })}\n\n`);
       write("data: [DONE]\n\n");
     });
@@ -1486,7 +1479,7 @@ export default {
 export {
   MODELS, SLOT, resolveModel, getConfig, buildPayload, getUrl, buildHeaders, cleanText,
   extractTextsFromLine, extractResponseText, generate, generateStream,
-  messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
+  messagesToPrompt, parseToolCalls, googleContentsToPrompt, parseGoogleFunctionCalls,
   makeSapisidHash, parseImageUrl, getPageTokens, uploadImage, resolveImages,
   __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,
 };
