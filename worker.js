@@ -753,12 +753,345 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
 }
 
 // ─── 工具调用 / 消息转换 ─────────────────────────────────────────────────────
+function shimIsObj(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+function shimXmlEscapeAttr(v) {
+  return String(v == null ? "" : v)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function shimDecodeXmlEntities(v) {
+  return String(v == null ? "" : v)
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function shimPromptCDATA(v) {
+  return `<![CDATA[${String(v == null ? "" : v).replace(/\]\]>/g, "]]]]><![CDATA[>")}]]>`;
+}
+
+function shimDecodeCDATA(v) {
+  const s = String(v == null ? "" : v).trim();
+  const matches = [...s.matchAll(/<!\[CDATA\[([\s\S]*?)\]\]>/g)];
+  if (matches.length) return matches.map((m) => m[1] || "").join("");
+  return shimDecodeXmlEntities(s);
+}
+
+function shimParseJsonTolerant(value) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  try { return JSON.parse(trimmed); } catch (_) {}
+  try {
+    return JSON.parse(
+      trimmed
+        .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2":')
+        .replace(/:\s*'([^']*)'/g, ':"$1"')
+    );
+  } catch (_) {
+    return undefined;
+  }
+}
+
+function shimNormalizeToolDefs(tools) {
+  const out = [];
+  for (const tool of tools || []) {
+    if (!tool) continue;
+    if (Array.isArray(tool.functionDeclarations)) {
+      for (const fn of tool.functionDeclarations) {
+        if (!fn || !fn.name) continue;
+        out.push({
+          name: String(fn.name),
+          description: String(fn.description || ""),
+          parameters: fn.parameters || fn.parametersJsonSchema || {},
+        });
+      }
+      continue;
+    }
+    const fn = tool.type === "function" ? (tool.function || tool) : (tool.function || tool);
+    const name = fn.name != null ? fn.name : (tool.name || "");
+    if (!name) continue;
+    out.push({
+      name: String(name),
+      description: String(fn.description != null ? fn.description : (tool.description || "")),
+      parameters: fn.parameters || fn.input_schema || tool.parameters || {},
+    });
+  }
+  return out;
+}
+
+function shimBuildToolCallInstructions() {
+  return `TOOL CALL FORMAT - FOLLOW EXACTLY:
+
+<|DSML|tool_calls>
+  <|DSML|invoke name="TOOL_NAME_HERE">
+    <|DSML|parameter name="PARAMETER_NAME"><![CDATA[PARAMETER_VALUE]]></|DSML|parameter>
+  </|DSML|invoke>
+</|DSML|tool_calls>
+
+RULES:
+1) Use one <|DSML|tool_calls> wrapper.
+2) Put one or more <|DSML|invoke> entries under that wrapper.
+3) Put the tool name in the invoke name attribute.
+4) All string values must use <![CDATA[...]]>, especially code, diffs, file contents, paths, names, prompts, and queries.
+5) Every top-level argument must be a <|DSML|parameter name="ARG_NAME">...</|DSML|parameter> node.
+6) Objects use nested XML elements inside the parameter body. Arrays may repeat <item> children.
+7) Numbers, booleans, and null stay plain text.
+8) Use only parameter names from the tool schema. Do not invent aliases.
+9) Do not emit placeholder, blank, or whitespace-only required parameters.
+10) If a required parameter value is unknown, ask the user or answer normally instead of outputting an empty tool call.
+11) If you call a tool, output ONLY the DSML block. Do not wrap it in markdown fences.
+12) Compatibility note: legacy tool_call/function_call code fences are accepted, but DSML is preferred.`;
+}
+
+function shimBuildToolPrompt(toolDefs, toolChoiceInstruction = "") {
+  return (
+    "# Tool Use\n\n" +
+    "You have access to tools that are executed by the user's local environment. " +
+    "These tools may read the user's local workspace or perform other local actions after you request them.\n" +
+    "Some tools may create or modify local files. If the user asks to change local files and such a tool is available, request the local tool. Do not say you cannot modify local files solely because you are a remote model.\n\n" +
+    `Available tools:\n${JSON.stringify(toolDefs, null, 2)}\n\n` +
+    shimBuildToolCallInstructions() +
+    toolChoiceInstruction
+  );
+}
+
+function shimFormatPromptParamValue(value) {
+  if (typeof value === "string") return shimPromptCDATA(value);
+  if (value === null || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map((v) => `<item>${shimFormatPromptParamValue(v)}</item>`).join("");
+  if (shimIsObj(value)) {
+    return Object.entries(value).map(([k, v]) => {
+      if (/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(k)) return `<${k}>${shimFormatPromptParamValue(v)}</${k}>`;
+      return `<field name="${shimXmlEscapeAttr(k)}">${shimFormatPromptParamValue(v)}</field>`;
+    }).join("");
+  }
+  return "";
+}
+
+function shimFormatPromptToolCallBlock(name, input) {
+  const args = shimIsObj(input) ? input : {};
+  let out = `<|DSML|tool_calls><|DSML|invoke name="${shimXmlEscapeAttr(name || "")}">`;
+  for (const [key, value] of Object.entries(args)) {
+    out += `<|DSML|parameter name="${shimXmlEscapeAttr(key)}">${shimFormatPromptParamValue(value)}</|DSML|parameter>`;
+  }
+  return out + "</|DSML|invoke></|DSML|tool_calls>";
+}
+
+function shimParseTagAttributes(attrs) {
+  const out = {};
+  const re = /([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(["'])([\s\S]*?)\2/g;
+  let m;
+  while ((m = re.exec(String(attrs || ""))) !== null) out[m[1]] = shimDecodeXmlEntities(m[3]);
+  return out;
+}
+
+function shimNormalizeDSMLToolCallMarkup(text) {
+  return String(text || "")
+    .replace(/<\s*(\/?)\s*(?:\|DSML\|)?\s*(tool-calls|toolcalls|tool_calls|invoke|parameter)\b([^>]*)>/gi,
+      (_m, close, name, rest) => {
+        const n = String(name).toLowerCase().replace(/-/g, "_").replace(/^toolcalls$/, "tool_calls");
+        return `<${close ? "/" : ""}${n}${rest}>`;
+      });
+}
+
+function shimFindXmlElementBlocks(text, tag) {
+  const blocks = [];
+  const re = new RegExp(`<\\s*${tag}\\b([^>]*)>([\\s\\S]*?)<\\s*\\/\\s*${tag}\\s*>`, "gi");
+  let m;
+  while ((m = re.exec(String(text || ""))) !== null) {
+    blocks.push({ attrs: m[1] || "", body: m[2] || "", raw: m[0], start: m.index, end: m.index + m[0].length });
+  }
+  return blocks;
+}
+
+function shimAppendMarkupValue(obj, key, value) {
+  if (obj[key] === undefined) obj[key] = value;
+  else if (Array.isArray(obj[key])) obj[key].push(value);
+  else obj[key] = [obj[key], value];
+}
+
+function shimParseMarkupValue(body) {
+  const raw = String(body == null ? "" : body).trim();
+  if (!raw) return "";
+  if (/^<!\[CDATA\[/i.test(raw)) return shimDecodeCDATA(raw);
+
+  const childBlocks = [...raw.matchAll(/<\s*([A-Za-z_][A-Za-z0-9_.-]*|field)\b([^>]*)>([\s\S]*?)<\s*\/\s*\1\s*>/g)];
+  if (childBlocks.length) {
+    if (childBlocks.every((m) => m[1] === "item")) return childBlocks.map((m) => shimParseMarkupValue(m[3]));
+    const obj = {};
+    for (const m of childBlocks) {
+      const attrs = shimParseTagAttributes(m[2] || "");
+      const key = m[1] === "field" ? (attrs.name || "field") : m[1];
+      shimAppendMarkupValue(obj, key, shimParseMarkupValue(m[3]));
+    }
+    return obj;
+  }
+
+  const decoded = shimDecodeCDATA(raw).trim();
+  if (/^(true|false)$/i.test(decoded)) return /^true$/i.test(decoded);
+  if (/^null$/i.test(decoded)) return null;
+  if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(decoded)) {
+    const n = Number(decoded);
+    if (Number.isFinite(n)) return n;
+  }
+  if ((decoded.startsWith("{") && decoded.endsWith("}")) || (decoded.startsWith("[") && decoded.endsWith("]"))) {
+    try { return JSON.parse(decoded); } catch (_) {}
+  }
+  return shimDecodeXmlEntities(decoded);
+}
+
+function shimParseDSMLToolCallsDetailed(text) {
+  const raw = String(text || "");
+  if (!/<\s*(?:\|DSML\|)?\s*(tool_calls|tool-calls|toolcalls|invoke|parameter)\b/i.test(raw)) {
+    return { cleanText: raw.trim(), calls: [] };
+  }
+  let normalized = shimNormalizeDSMLToolCallMarkup(raw);
+  let blocks = shimFindXmlElementBlocks(normalized, "tool_calls");
+  if (!blocks.length && /<\s*invoke\b/i.test(normalized) && /<\s*\/\s*tool_calls\s*>/i.test(normalized)) {
+    normalized = "<tool_calls>" + normalized;
+    blocks = shimFindXmlElementBlocks(normalized, "tool_calls");
+  }
+
+  const calls = [];
+  for (const block of blocks) {
+    for (const invoke of shimFindXmlElementBlocks(block.body, "invoke")) {
+      const attrs = shimParseTagAttributes(invoke.attrs);
+      const name = String(attrs.name || "").trim();
+      if (!name) continue;
+      const input = {};
+      for (const param of shimFindXmlElementBlocks(invoke.body, "parameter")) {
+        const pAttrs = shimParseTagAttributes(param.attrs);
+        const pName = String(pAttrs.name || "").trim();
+        if (!pName) continue;
+        shimAppendMarkupValue(input, pName, shimParseMarkupValue(param.body));
+      }
+      calls.push({ name, input });
+    }
+  }
+
+  if (!calls.length) return { cleanText: raw.trim(), calls: [] };
+  let clean = normalized;
+  for (let i = blocks.length - 1; i >= 0; i--) clean = clean.slice(0, blocks[i].start) + clean.slice(blocks[i].end);
+  return { cleanText: clean.trim(), calls };
+}
+
+function shimExtractToolNames(tools) {
+  const names = shimNormalizeToolDefs(tools).map((t) => t.name).filter(Boolean);
+  return names.length ? new Set(names) : null;
+}
+
+function shimSchemaForTool(name, tools) {
+  const found = shimNormalizeToolDefs(tools).find((t) => t.name === name);
+  return found && found.parameters && found.parameters.properties ? found.parameters : null;
+}
+
+function shimCoerceBySchema(value, schema) {
+  if (!schema || value == null) return value;
+  const type = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+  if (type === "boolean" && typeof value === "string" && /^(true|false)$/i.test(value.trim())) return /^true$/i.test(value.trim());
+  if ((type === "number" || type === "integer") && typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return type === "integer" ? Math.trunc(n) : n;
+  }
+  if ((type === "object" || type === "array") && typeof value === "string") {
+    const parsed = shimParseJsonTolerant(value);
+    if (parsed !== undefined) return parsed;
+  }
+  return value;
+}
+
+function shimNormalizeCallInput(name, input, tools) {
+  const args = shimIsObj(input) ? { ...input } : {};
+  const schema = shimSchemaForTool(name, tools);
+  if (!schema || !schema.properties) return args;
+  for (const [key, propSchema] of Object.entries(schema.properties)) {
+    if (args[key] !== undefined) args[key] = shimCoerceBySchema(args[key], propSchema);
+  }
+  return args;
+}
+
+function shimMakeOpenAIToolCall(name, args, tools) {
+  const cleanName = String(name || "").trim();
+  if (!cleanName) return null;
+  return {
+    id: `call_${randHex(8)}`,
+    type: "function",
+    function: {
+      name: cleanName,
+      arguments: JSON.stringify(shimNormalizeCallInput(cleanName, args, tools)),
+    },
+  };
+}
+
+function shimFilterCallsForTools(calls, tools) {
+  const allowed = shimExtractToolNames(tools);
+  if (!allowed) return calls;
+  return calls.filter((call) => allowed.has(call.function.name));
+}
+
+function shimParseLegacyToolCalls(text, tools) {
+  const toolCalls = [];
+  const patterns = [
+    /```tool_call\s*\n([\s\S]*?)\n```/g,
+    /```function_call\s*\n([\s\S]*?)\n```/g,
+  ];
+  let clean = String(text || "");
+  for (const re of patterns) {
+    for (const m of clean.matchAll(new RegExp(re.source, re.flags))) {
+      try {
+        const data = JSON.parse(m[1].trim());
+        const name = data.name || data.tool_name || (data.function || {}).name;
+        const args = data.arguments != null ? data.arguments : (data.args != null ? data.args : (data.input != null ? data.input : {}));
+        const call = shimMakeOpenAIToolCall(name, args, tools);
+        if (call) toolCalls.push(call);
+      } catch (_) {}
+    }
+    clean = clean.replace(new RegExp(re.source, re.flags), "").trim();
+  }
+  return [clean, shimFilterCallsForTools(toolCalls, tools)];
+}
+
+function shimParseJsonToolEnvelope(text, tools) {
+  const source = String(text || "").trim();
+  if (!source.startsWith("{") && !source.startsWith("[")) return null;
+  const parsed = shimParseJsonTolerant(source);
+  if (parsed === undefined) return null;
+  const rawCalls = Array.isArray(parsed)
+    ? parsed
+    : (Array.isArray(parsed.tool_calls) ? parsed.tool_calls : (Array.isArray(parsed.function_calls) ? parsed.function_calls : (parsed.name || parsed.tool_name ? [parsed] : [])));
+  const calls = [];
+  for (const item of rawCalls) {
+    if (!item || typeof item !== "object") continue;
+    const fn = item.function && typeof item.function === "object" ? item.function : {};
+    const name = item.name || item.tool_name || fn.name || item.function;
+    const args = item.input != null ? item.input : (item.arguments != null ? item.arguments : (item.parameters != null ? item.parameters : (fn.arguments != null ? fn.arguments : {})));
+    const call = shimMakeOpenAIToolCall(name, args, tools);
+    if (call) calls.push(call);
+  }
+  return calls.length ? ["", shimFilterCallsForTools(calls, tools)] : null;
+}
+
 function buildToolChoiceInstruction(toolChoice) {
   if (toolChoice === "none") return "\n\nIMPORTANT: Do NOT call any tools. Respond with text only.";
   if (toolChoice === "required") return "\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only.";
   if (toolChoice && typeof toolChoice === "object") {
-    const fn = (toolChoice.function || {}).name || "";
+    const fn = (toolChoice.function || {}).name || toolChoice.name || "";
     if (fn) return `\n\nIMPORTANT: You MUST call the tool "${fn}". Do not call other tools.`;
+    if (toolChoice.type === "allowed_tools" && Array.isArray(toolChoice.tools) && toolChoice.tools.length) {
+      const names = toolChoice.tools
+        .map((t) => typeof t === "string" ? t : ((t.function || t).name || ""))
+        .filter(Boolean);
+      if (names.length) return `\n\nIMPORTANT: You may call only these tools: ${names.map((n) => `"${n}"`).join(", ")}.`;
+    }
   }
   return "";
 }
@@ -769,25 +1102,10 @@ function messagesToPrompt(messages, tools, toolChoice) {
   const images = [];
 
   if (tools && toolChoice !== "none") {
-    const toolDefs = [];
-    for (const tool of tools) {
-      const fn = tool.type === "function" ? (tool.function || tool) : tool;
-      toolDefs.push({
-        name: fn.name != null ? fn.name : (tool.name || ""),
-        description: fn.description != null ? fn.description : (tool.description || ""),
-        parameters: fn.parameters != null ? fn.parameters : (tool.parameters || {}),
-      });
-    }
+    const toolDefs = shimNormalizeToolDefs(tools);
     if (toolDefs.length) {
       const constraint = buildToolChoiceInstruction(toolChoice);
-      parts.push(
-        "# Tool Use\n\n" +
-          "You can call the following tools. Call format:\n" +
-          '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n' +
-          "When calling tools, output ONLY the tool_call block(s).\n\n" +
-          `Available tools:\n${JSON.stringify(toolDefs, null, 2)}` +
-          constraint
-      );
+      parts.push(shimBuildToolPrompt(toolDefs, constraint));
     }
   }
 
@@ -824,7 +1142,7 @@ function messagesToPrompt(messages, tools, toolChoice) {
       if (msg.tool_calls) {
         const tcStrs = msg.tool_calls.map((tc) => {
           const fn = tc.function || {};
-          return '```tool_call\n{"name": "' + fn.name + '", "arguments": ' + (fn.arguments || "{}") + "}\n```";
+          return shimFormatPromptToolCallBlock(fn.name || tc.name || "", shimParseJsonTolerant(fn.arguments || "{}") || {});
         });
         parts.push(`[Assistant]: ${content || ""}\n` + tcStrs.join("\n"));
       } else {
@@ -841,49 +1159,31 @@ function messagesToPrompt(messages, tools, toolChoice) {
 }
 
 /** 提取 ```tool_call``` 代码块 -> [cleanText, toolCalls]。 */
-function parseToolCalls(text) {
-  const toolCalls = [];
-  const re = /```tool_call\s*\n([\s\S]*?)\n```/g;
-  const cleanParts = [];
-  let lastEnd = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    cleanParts.push(text.slice(lastEnd, m.index));
-    lastEnd = m.index + m[0].length;
-    try {
-      const data = JSON.parse(m[1].trim());
-      if (data.name === undefined) throw new Error("no name");
-      toolCalls.push({
-        id: `call_${randHex(8)}`,
-        type: "function",
-        function: {
-          name: data.name,
-          arguments: JSON.stringify(data.arguments != null ? data.arguments : {}),
-        },
-      });
-    } catch (_) { /* 跳过格式错误的块 */ }
+function parseToolCalls(text, tools) {
+  const dsml = shimParseDSMLToolCallsDetailed(text);
+  if (dsml.calls.length) {
+    const calls = dsml.calls
+      .map((call) => shimMakeOpenAIToolCall(call.name, call.input, tools))
+      .filter(Boolean);
+    return [dsml.cleanText, shimFilterCallsForTools(calls, tools)];
   }
-  cleanParts.push(text.slice(lastEnd));
-  return [cleanParts.join("").trim(), toolCalls];
+
+  const [legacyClean, legacyCalls] = shimParseLegacyToolCalls(text, tools);
+  if (legacyCalls.length) return [legacyClean, legacyCalls];
+
+  const jsonCalls = shimParseJsonToolEnvelope(String(text || "").trim(), tools);
+  if (jsonCalls) return jsonCalls;
+
+  return [String(text || "").trim(), []];
 }
 
-// ─── Google 原生 API 辅助函数 ────────────────────────────────────────────────
+// Google native API helpers
+function toOpenAIStreamToolCallDeltas(toolCalls) {
+  return (toolCalls || []).map((toolCall, index) => ({ index, ...toolCall }));
+}
+
 function buildToolPrompt(toolDefs) {
-  const spec = JSON.stringify(toolDefs, null, 2);
-  return (
-    "# Tool Use\n\n" +
-    "You can call the following tools to help accomplish tasks. " +
-    "These tools connect to the user's local environment and will execute when called.\n\n" +
-    "Call format (use this exact format):\n" +
-    "```function_call\n" +
-    '{"name": "<tool_name>", "args": {<arguments>}}\n' +
-    "```\n\n" +
-    "When calling tools:\n" +
-    "- Output ONLY the function_call block(s), nothing else\n" +
-    "- You may call multiple tools with multiple blocks\n" +
-    "- After receiving a [Tool result for ...], use that data to answer the user\n\n" +
-    `Available tools:\n${spec}`
-  );
+  return shimBuildToolPrompt(toolDefs);
 }
 
 function googleToolChoiceInstruction(req) {
@@ -944,7 +1244,7 @@ function googleContentsToPrompt(req) {
         images.push({ b64: p.inlineData.data, mime: p.inlineData.mimeType || "image/png" });
       } else if (p.functionCall) {
         const fc = p.functionCall;
-        msgParts.push("```function_call\n" + JSON.stringify({ name: fc.name, args: fc.args || {} }) + "\n```");
+        msgParts.push(shimFormatPromptToolCallBlock(fc.name, fc.args || {}));
       } else if (p.functionResponse) {
         const fr = p.functionResponse;
         msgParts.push(`[Tool result for ${fr.name || ""}]: ${JSON.stringify(fr.response || {})}`);
@@ -959,7 +1259,15 @@ function googleContentsToPrompt(req) {
 }
 
 /** 提取 ```function_call``` 代码块(3 种格式)-> [cleanText, functionCalls]。 */
-function parseGoogleFunctionCalls(text) {
+function parseGoogleFunctionCalls(text, tools) {
+  const [openAIClean, openAIToolCalls] = parseToolCalls(text, tools);
+  if (openAIToolCalls.length) {
+    return [openAIClean, openAIToolCalls.map((tc) => ({
+      name: tc.function.name,
+      args: shimParseJsonTolerant(tc.function.arguments) || {},
+    }))];
+  }
+
   const functionCalls = [];
   const patterns = [
     /```function_call\s*\n([\s\S]*?)\n```/g,
@@ -1119,7 +1427,7 @@ async function handleChat(req, cfg) {
 
   let toolCalls = null;
   if (tools && text && toolChoice !== "none") {
-    const [clean, tc] = parseToolCalls(text);
+    const [clean, tc] = parseToolCalls(text, tools);
     text = clean;
     toolCalls = tc.length ? tc : null;
   }
@@ -1133,9 +1441,12 @@ async function handleChat(req, cfg) {
 
   if (stream) {
     return sseResponse(async (write) => {
+      const delta = toolCalls
+        ? { tool_calls: toOpenAIStreamToolCallDeltas(toolCalls) }
+        : { role: "assistant", content: text || "" };
       write(`data: ${JSON.stringify({
         id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
-        choices: [{ index: 0, delta: msg, finish_reason: finish }],
+        choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
       write("data: [DONE]\n\n");
     });
@@ -1228,7 +1539,7 @@ async function handleResponses(req, cfg) {
 
   let toolCalls = null;
   if (tools && text && toolChoice !== "none") {
-    const [clean, tc] = parseToolCalls(text);
+    const [clean, tc] = parseToolCalls(text, tools);
     text = clean;
     toolCalls = tc.length ? tc : null;
   }
@@ -1311,7 +1622,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
 
   const responseParts = [];
   if (hasTools && text) {
-    const [clean, fcs] = parseGoogleFunctionCalls(text);
+    const [clean, fcs] = parseGoogleFunctionCalls(text, req.tools);
     if (fcs.length) {
       if (clean) responseParts.push({ text: clean });
       for (const fc of fcs) responseParts.push({ functionCall: { name: fc.name, args: fc.args } });
@@ -1479,7 +1790,7 @@ export default {
 export {
   MODELS, SLOT, resolveModel, getConfig, buildPayload, getUrl, buildHeaders, cleanText,
   extractTextsFromLine, extractResponseText, generate, generateStream,
-  messagesToPrompt, parseToolCalls, googleContentsToPrompt, parseGoogleFunctionCalls,
+  messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
   makeSapisidHash, parseImageUrl, getPageTokens, uploadImage, resolveImages,
   __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,
 };
