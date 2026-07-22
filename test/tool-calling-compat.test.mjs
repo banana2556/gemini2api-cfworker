@@ -2,11 +2,25 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MODELS,
   messagesToPrompt,
   parseGoogleFunctionCalls,
   parseToolCalls,
+  resolveModel,
   toOpenAIStreamToolCallDeltas,
 } from "../worker.js";
+
+test("Flash model IDs use 3.6", () => {
+  const models = [
+    "gemini-3.6-flash",
+    "gemini-3.6-flash-lite",
+    "gemini-3.6-flash-thinking",
+    "gemini-3.6-flash-thinking-lite",
+  ];
+
+  assert.deepEqual(Object.keys(MODELS).filter((name) => name.includes("flash")).sort(), models.sort());
+  for (const model of models) assert.equal(resolveModel(model, "gemini-3.6-flash").name, model);
+});
 
 const tools = [
   {

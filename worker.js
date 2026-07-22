@@ -68,7 +68,7 @@ const CONFIG = {
   // true=优先 socket,不可用/失败再回退 fetch;false=只用 fetch。
   UPSTREAM_SOCKET: true,
 
-  DEFAULT_MODEL: "gemini-3.5-flash",
+  DEFAULT_MODEL: "gemini-3.6-flash",
   RETRY_ATTEMPTS: 3,
   RETRY_DELAY_SEC: 2,
   REQUEST_TIMEOUT_SEC: 180,
@@ -80,13 +80,13 @@ const CONFIG = {
 // MODE_CATEGORY 枚举(来自 Gemini 前端 JS):
 //   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 const MODELS = {
-  "gemini-3.5-flash": { mode: 1, think: 4, desc: "Fast general-purpose model" },
-  "gemini-3.5-flash-thinking": { mode: 2, think: 0, desc: "Deep thinking mode, longest output (~20k chars)" },
+  "gemini-3.6-flash": { mode: 1, think: 4, desc: "Fast general-purpose model" },
+  "gemini-3.6-flash-thinking": { mode: 2, think: 0, desc: "Deep thinking mode, longest output (~20k chars)" },
   "gemini-3.1-pro": { mode: 3, think: 4, desc: "Pro model (requires cookie for real routing)" },
   "gemini-3.1-pro-enhanced": { mode: 3, think: 4, extra: { 31: 2, 80: 3 }, desc: "Pro with enhanced output (experimental)" },
   "gemini-auto": { mode: 4, think: 4, desc: "Auto model selection" },
-  "gemini-3.5-flash-thinking-lite": { mode: 5, think: 0, desc: "Dynamic thinking with adaptive depth" },
-  "gemini-flash-lite": { mode: 6, think: 4, desc: "Lightweight fast model" },
+  "gemini-3.6-flash-thinking-lite": { mode: 5, think: 0, desc: "Dynamic thinking with adaptive depth" },
+  "gemini-3.6-flash-lite": { mode: 6, think: 4, desc: "Lightweight fast model" },
 };
 
 /**

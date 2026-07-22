@@ -39,7 +39,7 @@ Edit the `CONFIG` object at the top of `worker.js`, or set Worker environment va
 | `GEMINI_BL` | Gemini web build number (update when responses go empty) | `boq_assistant-bard-web-server_...` |
 | `GEMINI_ORIGIN` | Upstream origin; point to a relay proxy if 429'd | `https://gemini.google.com` |
 | `UPSTREAM_SOCKET` | Prefer raw TCP socket over fetch to upstream | `true` |
-| `DEFAULT_MODEL` | Default model when client doesn't specify | `gemini-3.5-flash` |
+| `DEFAULT_MODEL` | Default model when client doesn't specify | `gemini-3.6-flash` |
 | `RETRY_ATTEMPTS` | Max retry count on upstream failure | `3` |
 | `RETRY_DELAY_SEC` | Delay between retries (seconds) | `2` |
 | `REQUEST_TIMEOUT_SEC` | Per-request timeout (seconds) | `180` |
@@ -52,15 +52,15 @@ Edit the `CONFIG` object at the top of `worker.js`, or set Worker environment va
 
 | Model ID | Mode | Description |
 |---|---|---|
-| `gemini-3.5-flash` | Fast | Fast general-purpose model |
-| `gemini-3.5-flash-thinking` | Thinking | Deep thinking, longest output (~20k chars) |
+| `gemini-3.6-flash` | Fast | Fast general-purpose model |
+| `gemini-3.6-flash-thinking` | Thinking | Deep thinking, longest output (~20k chars) |
 | `gemini-3.1-pro` | Pro | Pro model (requires cookie) |
 | `gemini-3.1-pro-enhanced` | Pro+ | Pro with enhanced output (experimental) |
 | `gemini-auto` | Auto | Auto model selection |
-| `gemini-3.5-flash-thinking-lite` | Dynamic | Dynamic thinking with adaptive depth |
-| `gemini-flash-lite` | Lite | Lightweight fast model |
+| `gemini-3.6-flash-thinking-lite` | Dynamic | Dynamic thinking with adaptive depth |
+| `gemini-3.6-flash-lite` | Lite | Lightweight fast model |
 
-Append `@think=N` to override thinking depth, e.g. `gemini-3.5-flash@think=0`.
+Append `@think=N` to override thinking depth, e.g. `gemini-3.6-flash@think=0`.
 
 ## Usage Examples
 
@@ -75,7 +75,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gemini-3.5-flash",
+    model="gemini-3.6-flash",
     messages=[{"role": "user", "content": "Hello!"}],
     stream=True,
 )
@@ -90,7 +90,7 @@ curl https://your-worker.workers.dev/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3.6-flash",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
@@ -99,7 +99,7 @@ curl https://your-worker.workers.dev/v1/chat/completions \
 ### Google AI SDK
 
 ```bash
-curl "https://your-worker.workers.dev/v1beta/models/gemini-3.5-flash:generateContent?key=your-api-key" \
+curl "https://your-worker.workers.dev/v1beta/models/gemini-3.6-flash:generateContent?key=your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"contents":[{"parts":[{"text":"Hello!"}]}]}'
 ```
