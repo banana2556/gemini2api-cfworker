@@ -56,7 +56,7 @@ const CONFIG = {
 
   // Gemini 网页版构建号。如果返回开始变空,去 gemini.google.com 页面源码里
   // 找一个新的值("boq_assistant-bard-web-server_...")。
-  GEMINI_BL: "boq_assistant-bard-web-server_20260525.09_p0",
+  GEMINI_BL: "boq_assistant-bard-web-server_20260716.08_p0",
 
   // 上游源站。默认直连 gemini.google.com。若部署在 Cloudflare/无服务器平台
   // 被 Google 以 429 限流(出口 IP 被拦),把它指向一个跑在“干净 IP”上的反向
