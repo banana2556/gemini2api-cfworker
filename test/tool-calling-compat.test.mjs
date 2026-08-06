@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   MODELS,
+  extractGeminiBl,
   messagesToPrompt,
   parseGoogleFunctionCalls,
   parseToolCalls,
@@ -20,6 +21,13 @@ test("Flash model IDs use 3.6", () => {
 
   assert.deepEqual(Object.keys(MODELS).filter((name) => name.includes("flash")).sort(), models.sort());
   for (const model of models) assert.equal(resolveModel(model, "gemini-3.6-flash").name, model);
+});
+
+test("Gemini build is extracted from the app page", () => {
+  assert.equal(
+    extractGeminiBl('<script>"cfb2h":"boq_assistant-bard-web-server_20260806.01_p0"</script>'),
+    "boq_assistant-bard-web-server_20260806.01_p0",
+  );
 });
 
 const tools = [

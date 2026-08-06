@@ -31,20 +31,24 @@ npx wrangler deploy
 
 Edit the `CONFIG` object at the top of `worker.js`, or set Worker environment variables / secrets with the same names (secrets take precedence).
 
-| Variable | Description | Default |
-|---|---|---|
-| `API_KEYS` | Comma-separated keys or JSON array. Empty = no auth | `[]` |
-| `GEMINI_COOKIE` | Full cookie string or `{"cookie":"...","sapisid":"..."}` | `""` |
-| `SAPISID` | Explicit SAPISID (auto-extracted from cookie if omitted) | `""` |
-| `GEMINI_BL` | Gemini web build number (update when responses go empty) | `boq_assistant-bard-web-server_...` |
-| `GEMINI_ORIGIN` | Upstream origin; point to a relay proxy if 429'd | `https://gemini.google.com` |
-| `UPSTREAM_SOCKET` | Prefer raw TCP socket over fetch to upstream | `true` |
-| `DEFAULT_MODEL` | Default model when client doesn't specify | `gemini-3.6-flash` |
-| `RETRY_ATTEMPTS` | Max retry count on upstream failure | `3` |
-| `RETRY_DELAY_SEC` | Delay between retries (seconds) | `2` |
-| `REQUEST_TIMEOUT_SEC` | Per-request timeout (seconds) | `180` |
-| `LOG_REQUESTS` | Enable request logging | `true` |
-| `ENABLE_DEBUG` | Enable `/debug` probe endpoint | `true` |
+| Variable | Required? | Description | Default |
+|---|---|---|---|
+| `API_KEYS` | No | Comma-separated keys or JSON array. Empty = no auth | `[]` |
+| `GEMINI_COOKIE` | Conditional | Full cookie string or `{"cookie":"...","sapisid":"..."}`; required for image input and logged-in features | `""` |
+| `SAPISID` | No | Explicit SAPISID (auto-extracted from cookie if omitted) | `""` |
+| `GEMINI_BL` | No | Fallback Gemini web build number; the current value is detected automatically and cached | `boq_assistant-bard-web-server_...` |
+| `GEMINI_ORIGIN` | No | Upstream origin; point to a relay proxy if 429'd | `https://gemini.google.com` |
+| `UPSTREAM_SOCKET` | No | Prefer raw TCP socket over fetch to upstream | `true` |
+| `DEFAULT_MODEL` | No | Default model when client doesn't specify | `gemini-3.6-flash` |
+| `RETRY_ATTEMPTS` | No | Max retry count on upstream failure | `3` |
+| `RETRY_DELAY_SEC` | No | Delay between retries (seconds) | `2` |
+| `REQUEST_TIMEOUT_SEC` | No | Per-request timeout (seconds) | `180` |
+| `LOG_REQUESTS` | No | Enable request logging | `true` |
+| `ENABLE_DEBUG` | No | Enable `/debug` probe endpoint | `true` |
+
+No variable is required for anonymous text requests. `API_KEYS` is only needed
+when authentication is desired; `GEMINI_COOKIE` is needed for image input or
+other logged-in Gemini features.
 
 > **Security tip:** Set `GEMINI_COOKIE` and `API_KEYS` as Worker **secrets** (`wrangler secret put`) to avoid committing them to the repo.
 
@@ -139,7 +143,10 @@ Cloudflare Workers share egress IPs that Google may rate-limit. Solutions:
 
 **Responses suddenly all empty?**
 
-`GEMINI_BL` build number may be outdated. Visit `gemini.google.com` page source, search for `boq_assistant-bard-web-server_`, and update the value.
+`GEMINI_BL` is detected automatically from the Gemini `/app` page when a
+generation request needs it, then cached for one hour per origin. The configured
+value is only a fallback if Gemini cannot be reached. If responses stay empty,
+check `/debug` and the upstream status first.
 
 ## License
 

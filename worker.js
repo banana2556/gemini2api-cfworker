@@ -480,6 +480,79 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
 
 const _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 let _pageTokens = { tokens: null, ts: 0 };
+const GEMINI_BL_CACHE_TTL_SEC = 3600;
+let _geminiBlMemory = { origin: "", value: "", expiresAt: 0 };
+
+function extractGeminiBl(html) {
+  const cfb2h = /"cfb2h":"([^"]+)"/.exec(html || "");
+  if (cfb2h && /^boq_assistant-bard-web-server_/.test(cfb2h[1])) return cfb2h[1];
+  const build = /(boq_assistant-bard-web-server_[A-Za-z0-9._-]+)/.exec(html || "");
+  return build ? build[1] : "";
+}
+
+async function refreshGeminiBl(cfg) {
+  const origin = cfg.gemini_origin || "https://gemini.google.com";
+  const now = Date.now();
+  let stale = "";
+  if (_geminiBlMemory.origin === origin && _geminiBlMemory.value) {
+    stale = _geminiBlMemory.value;
+    if (_geminiBlMemory.expiresAt > now) {
+      cfg.gemini_bl = stale;
+      return stale;
+    }
+  }
+
+  const cache = globalThis.caches && globalThis.caches.default;
+  const key = new Request("https://gemini2api-cache.invalid/gemini-bl?origin=" + encodeURIComponent(origin));
+  if (cache) {
+    try {
+      const cached = await cache.match(key);
+      if (cached) {
+        const record = JSON.parse(await cached.text());
+        if (record.bl) {
+          stale = record.bl;
+          _geminiBlMemory = { origin, value: record.bl, expiresAt: record.expiresAt || 0 };
+          if (_geminiBlMemory.expiresAt > now) {
+            cfg.gemini_bl = record.bl;
+            return record.bl;
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  try {
+    const headers = { "User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9" };
+    if (cfg.cookie) headers.Cookie = cfg.cookie;
+    const resp = await httpFetch(origin + "/app", { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
+    const bl = extractGeminiBl(await resp.text());
+    if (bl) {
+      const expiresAt = Date.now() + GEMINI_BL_CACHE_TTL_SEC * 1000;
+      const record = { bl, expiresAt };
+      _geminiBlMemory = { origin, value: bl, expiresAt };
+      if (cache) {
+        try {
+          await cache.put(key, new Response(JSON.stringify(record), {
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "public, max-age=" + GEMINI_BL_CACHE_TTL_SEC,
+            },
+          }));
+        } catch (e) {
+          log(cfg, "GEMINI_BL cache write failed: " + e);
+        }
+      }
+      cfg.gemini_bl = bl;
+      return bl;
+    }
+    log(cfg, "GEMINI_BL auto-detect returned no build (status=" + resp.status + ")");
+  } catch (e) {
+    log(cfg, "GEMINI_BL auto-detect failed: " + e);
+  }
+
+  if (stale) cfg.gemini_bl = stale;
+  return cfg.gemini_bl;
+}
 
 function base64ToBytes(b64) {
   const bin = atob(b64);
@@ -637,6 +710,7 @@ function extractResponseText(raw) {
 
 /** 非流式生成(带重试)。返回最终的响应文本。 */
 async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
+  await refreshGeminiBl(cfg);
   const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
   const url = getUrl(cfg);
   const headers = await buildHeaders(cfg);
@@ -672,6 +746,7 @@ async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
  * 只在尚未 yield 过任何内容时才重试,以避免重复输出。
  */
 async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
+  await refreshGeminiBl(cfg);
   const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
   const url = getUrl(cfg);
   const headers = await buildHeaders(cfg);
@@ -1649,6 +1724,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
 // 探针 A:裸请求(现行做法);探针 B:先抓访客 cookie + at token 再请求。
 // 对比两者即可判断:是 IP 被拦(都空)、还是缺会话(B 能通 → 可自动修)。
 async function handleDebug(cfg) {
+  await refreshGeminiBl(cfg);
   const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
   async function probe(guest) {
@@ -1666,8 +1742,8 @@ async function handleDebug(cfg) {
         cookie = sc.map((c) => c.split(";")[0]).filter(Boolean).join("; ");
         const html = await pr.text();
         at = (/"SNlM0e":"([^"]+)"/.exec(html) || [])[1] || "";
-        const blm = /"cfb2h":"([^"]+)"/.exec(html);
-        if (blm) bl = blm[1];
+        const blm = extractGeminiBl(html);
+        if (blm) bl = blm;
       }
       const headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -1791,6 +1867,6 @@ export {
   MODELS, SLOT, resolveModel, getConfig, buildPayload, getUrl, buildHeaders, cleanText,
   extractTextsFromLine, extractResponseText, generate, generateStream,
   messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
-  makeSapisidHash, parseImageUrl, getPageTokens, uploadImage, resolveImages,
+  makeSapisidHash, parseImageUrl, extractGeminiBl, getPageTokens, uploadImage, resolveImages,
   __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,
 };
