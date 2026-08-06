@@ -112,7 +112,7 @@ curl "https://your-worker.workers.dev/v1beta/models/gemini-3.6-flash:generateCon
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/` | Health check (returns version + model list) |
+| `GET` | `/` | Health check (returns version + current `GEMINI_BL` + model list) |
 | `GET` | `/v1/models` | List models (OpenAI format) |
 | `POST` | `/v1/chat/completions` | Chat completions (OpenAI format) |
 | `POST` | `/v1/responses` | Responses API (Codex CLI) |

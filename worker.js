@@ -1822,7 +1822,8 @@ export default {
           });
         }
         if (path === "/") {
-          return jsonResponse({ status: "ok", version: VERSION, models: Object.keys(MODELS) });
+          await refreshGeminiBl(cfg);
+          return jsonResponse({ status: "ok", version: VERSION, gemini_bl: cfg.gemini_bl, models: Object.keys(MODELS) });
         }
         if (path === "/debug") {
           if (!cfg.enable_debug) return jsonResponse({ error: "debug endpoint disabled" }, 403);
