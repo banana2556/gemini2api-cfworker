@@ -11,6 +11,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 - Tool calling / function calling support
 - Image input via Scotty upload (requires cookie)
 - Raw TCP socket upstream to bypass Cloudflare egress 429
+- Actual upstream model reporting and Cookie/Pro route verification
 - Built-in retry, timeout, and debug probe endpoint
 
 ## Quick Start
@@ -66,6 +67,12 @@ other logged-in Gemini features.
 
 Append `@think=N` to override thinking depth, e.g. `gemini-3.6-flash@think=0`.
 
+Model IDs are stable client aliases. To probe Gemini and see the model each
+alias actually routes to, request `GET /v1/models?live=1`. Each entry then
+includes `available`, `upstream_model`, and `route_status` (`matched`,
+`fallback`, `auto`, or `unknown`). Live probing makes one small upstream
+request per alias, so use it for diagnostics rather than every client startup.
+
 ## Usage Examples
 
 ### OpenAI SDK (Python)
@@ -113,13 +120,13 @@ curl "https://your-worker.workers.dev/v1beta/models/gemini-3.6-flash:generateCon
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/` | Health check (returns version + current `GEMINI_BL` + model list) |
-| `GET` | `/v1/models` | List models (OpenAI format) |
+| `GET` | `/v1/models` | List stable aliases; add `?live=1` for actual upstream routes |
 | `POST` | `/v1/chat/completions` | Chat completions (OpenAI format) |
 | `POST` | `/v1/responses` | Responses API (Codex CLI) |
-| `GET` | `/v1beta/models` | List models (Google format) |
+| `GET` | `/v1beta/models` | List stable aliases; add `?live=1` for actual upstream routes |
 | `POST` | `/v1beta/models/{model}:generateContent` | Generate content (Google format) |
 | `POST` | `/v1beta/models/{model}:streamGenerateContent` | Stream generate (Google format) |
-| `GET` | `/debug` | Upstream connectivity probe |
+| `GET` | `/debug` | Connectivity, Cookie token, and Pro-route probe |
 
 ## Authentication
 
@@ -131,6 +138,20 @@ Clients can authenticate via any of:
 - `?key=<key>` query parameter
 
 If `API_KEYS` is empty, all endpoints are open (no auth required).
+
+## Cookie verification
+
+`hasCookie: true` only means a value was configured. Use `/debug` and check
+`cookie.status`:
+
+- `pro_route_verified`: the configured Cookie really routed a Pro request to Pro
+- `configured_but_pro_unavailable`: the request worked but did not use Pro; the Cookie may be expired, invalid, or lack Pro access
+- `unverified`: no upstream model label was returned
+
+Normal API responses keep the requested alias in `model`/`modelVersion` and
+report the truth separately as `upstream_model`/`upstreamModel` plus routing
+status. Cookie requests also attach
+Gemini's current page token automatically.
 
 ## Troubleshooting
 

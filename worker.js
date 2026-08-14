@@ -36,7 +36,7 @@
  * 时才会真正路由到 Pro,否则回退到 Flash。
  */
 
-const VERSION = "1.1.0-worker";
+const VERSION = "1.2.0-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -56,7 +56,7 @@ const CONFIG = {
 
   // Gemini 网页版构建号。如果返回开始变空,去 gemini.google.com 页面源码里
   // 找一个新的值("boq_assistant-bard-web-server_...")。
-  GEMINI_BL: "boq_assistant-bard-web-server_20260716.08_p0",
+  GEMINI_BL: "boq_assistant-bard-web-server_20260811.23_p0",
 
   // 上游源站。默认直连 gemini.google.com。若部署在 Cloudflare/无服务器平台
   // 被 Google 以 429 限流(出口 IP 被拦),把它指向一个跑在“干净 IP”上的反向
@@ -479,7 +479,7 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
 // 改为在 prompt 里追加一句提示,降级为纯文本。详见 test/live-image.mjs。
 
 const _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
-let _pageTokens = { tokens: null, ts: 0 };
+let _pageTokens = { key: "", tokens: null, ts: 0 };
 const GEMINI_BL_CACHE_TTL_SEC = 3600;
 let _geminiBlMemory = { origin: "", value: "", expiresAt: 0 };
 
@@ -573,22 +573,26 @@ function parseImageUrl(url) {
 // 抓取 gemini.google.com/app 页面里的上传 token(带 10 分钟缓存)。
 async function getPageTokens(cfg) {
   const now = Date.now();
-  if (_pageTokens.tokens && now - _pageTokens.ts < 600000) return _pageTokens.tokens;
+  const origin = cfg.gemini_origin || "https://gemini.google.com";
+  const key = `${origin}|${cfg.cookie ? "auth" : "guest"}`;
+  if (_pageTokens.key === key && _pageTokens.tokens && now - _pageTokens.ts < 600000) return _pageTokens.tokens;
   const headers = { "User-Agent": _UA };
   if (cfg.cookie) headers["Cookie"] = cfg.cookie;
   const tokens = {};
   try {
-    const resp = await httpFetch(`${cfg.gemini_origin || "https://gemini.google.com"}/app`, { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
+    const resp = await httpFetch(`${origin}/app`, { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
     const html = await resp.text();
-    for (const [k, re] of [["push_id", /"qKIAYe":"([^"]+)"/], ["pctx", /"Ylro7b":"([^"]+)"/]]) {
+    for (const [k, re] of [["push_id", /"qKIAYe":"([^"]+)"/], ["pctx", /"Ylro7b":"([^"]+)"/], ["at", /"SNlM0e":"([^"]+)"/]]) {
       const mm = re.exec(html);
       if (mm) tokens[k] = mm[1];
     }
+    const bl = extractGeminiBl(html);
+    if (bl) tokens.bl = bl;
   } catch (e) {
     log(cfg, `getPageTokens failed: ${e}`);
   }
   if (Object.keys(tokens).length) {
-    _pageTokens = { tokens, ts: now };
+    _pageTokens = { key, tokens, ts: now };
   }
   return tokens;
 }
@@ -708,10 +712,59 @@ function extractResponseText(raw) {
   return cleanText(lastText);
 }
 
+const ACTUAL_MODEL_RE = /^(?:Gemini\s+)?\d+(?:\.\d+)?\s+(?:Flash|Pro)\b[- A-Za-z0-9.()]{0,40}$/i;
+
+function extractActualModelFromLine(line) {
+  if (!line.includes('"wrb.fr"')) return "";
+  try {
+    const inner = JSON.parse(JSON.parse(line)[0][2]);
+    const label = Array.isArray(inner) ? inner.find((v) => typeof v === "string" && ACTUAL_MODEL_RE.test(v)) : "";
+    return label || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function extractActualModel(raw) {
+  let actualModel = "";
+  for (const line of raw.split("\n")) {
+    const found = extractActualModelFromLine(line);
+    if (found) actualModel = found;
+  }
+  return actualModel;
+}
+
+function routeStatus(modelId, actualModel) {
+  if (!actualModel) return "unknown";
+  if (modelId === 4) return "auto";
+  const actual = /\bPro\b/i.test(actualModel)
+    ? "pro"
+    : /Flash[- ]Lite/i.test(actualModel)
+      ? "lite"
+      : /\bFlash\b/i.test(actualModel)
+        ? "flash"
+        : "unknown";
+  const expected = modelId === 3 ? "pro" : modelId === 6 ? "lite" : "flash";
+  return actual === "unknown" ? "unknown" : actual === expected ? "matched" : "fallback";
+}
+
+function routeMetadata(modelId, actualModel) {
+  return { upstream_model: actualModel || null, route_status: routeStatus(modelId, actualModel) };
+}
+
+async function buildRequestBody(cfg, prompt, modelId, thinkMode, fileRefs, extra) {
+  let body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
+  if (cfg.cookie) {
+    const tokens = await getPageTokens(cfg);
+    if (tokens.at) body += "&at=" + encodeURIComponent(tokens.at);
+  }
+  return body;
+}
+
 /** 非流式生成(带重试)。返回最终的响应文本。 */
-async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
+async function generateResult(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
   await refreshGeminiBl(cfg);
-  const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
+  const body = await buildRequestBody(cfg, prompt, modelId, thinkMode, fileRefs, extra);
   const url = getUrl(cfg);
   const headers = await buildHeaders(cfg);
   let lastErr;
@@ -726,10 +779,17 @@ async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
       });
       const raw = await resp.text();
       const text = extractResponseText(raw);
+      const actualModel = extractActualModel(raw);
       if (!resp.ok || !text) {
         log(cfg, `upstream status=${resp.status} rawLen=${raw.length} parsedLen=${text.length} snippet=${JSON.stringify(raw.slice(0, 200))}`);
       }
-      return text;
+      return {
+        text,
+        actualModel,
+        status: resp.status,
+        contentType: resp.headers.get("content-type"),
+        rawLength: raw.length,
+      };
     } catch (e) {
       lastErr = e;
       if (attempt < cfg.retry_attempts - 1) {
@@ -741,13 +801,17 @@ async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
   throw lastErr;
 }
 
+async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
+  return (await generateResult(cfg, prompt, modelId, thinkMode, extra, fileRefs)).text;
+}
+
 /**
  * 流式生成。每步 yield 一段文本增量(本次新追加的后缀)。
  * 只在尚未 yield 过任何内容时才重试,以避免重复输出。
  */
-async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
+async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs, onRoute) {
   await refreshGeminiBl(cfg);
-  const body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
+  const body = await buildRequestBody(cfg, prompt, modelId, thinkMode, fileRefs, extra);
   const url = getUrl(cfg);
   const headers = await buildHeaders(cfg);
   let lastErr;
@@ -763,7 +827,10 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
         socket: cfg.upstream_socket,
       });
       if (!resp.body) {
-        const text = extractResponseText(await resp.text());
+        const raw = await resp.text();
+        const actualModel = extractActualModel(raw);
+        if (actualModel && onRoute) onRoute(routeMetadata(modelId, actualModel));
+        const text = extractResponseText(raw);
         if (text) {
           yielded = true;
           yield text;
@@ -775,7 +842,13 @@ async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs)
       let buf = "";
       let prev = "";
       let started = false; // 是否已 yield 过非空内容(用于裁掉开头的空白)
+      let actualModel = "";
       const consumeLine = function* (line) {
+        const found = extractActualModelFromLine(line);
+        if (found && found !== actualModel) {
+          actualModel = found;
+          if (onRoute) onRoute(routeMetadata(modelId, actualModel));
+        }
         for (const t of extractTextsFromLine(line)) {
           if (t.length > prev.length) {
             // 每段增量:去掉残留标记,但流式过程中不裁剪内部空白,
@@ -1467,12 +1540,14 @@ async function handleChat(req, cfg) {
     return sseResponse(async (write) => {
       let got = false;
       let errMsg = "";
+      let route = routeMetadata(rm.modeId, "");
       const chunk = (delta, finish) => write(`data: ${JSON.stringify({
         id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
+        ...route,
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs)) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs, (meta) => { route = meta; })) {
           got = true;
           chunk({ content: delta }, null);
         }
@@ -1493,9 +1568,11 @@ async function handleChat(req, cfg) {
     });
   }
 
+  let result;
   let text;
   try {
-    text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
+    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
+    text = result.text;
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
   }
@@ -1521,6 +1598,7 @@ async function handleChat(req, cfg) {
         : { role: "assistant", content: text || "" };
       write(`data: ${JSON.stringify({
         id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
+        ...routeMetadata(rm.modeId, result.actualModel),
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
       write("data: [DONE]\n\n");
@@ -1529,6 +1607,7 @@ async function handleChat(req, cfg) {
 
   return jsonResponse({
     id: cid, object: "chat.completion", created: nowSec(), model: rm.name,
+    ...routeMetadata(rm.modeId, result.actualModel),
     choices: [{ index: 0, message: msg, finish_reason: finish }],
     usage: {
       prompt_tokens: tokenEst(prompt),
@@ -1605,9 +1684,11 @@ async function handleResponses(req, cfg) {
   const prompt = prompt0 + droppedNote;
   if (!prompt.trim()) return jsonResponse({ error: { message: "empty input" } }, 400);
 
+  let result;
   let text;
   try {
-    text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
+    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
+    text = result.text;
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
   }
@@ -1635,7 +1716,8 @@ async function handleResponses(req, cfg) {
 
   if (req.stream) {
     return sseResponse(async (write) => {
-      write(`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: rid, object: "response", status: "in_progress", model: rm.name, output: [] } })}\n\n`);
+      const route = routeMetadata(rm.modeId, result.actualModel);
+      write(`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: rid, object: "response", status: "in_progress", model: rm.name, ...route, output: [] } })}\n\n`);
       for (const item of output) {
         if (item.type === "function_call") {
           write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: "response.function_call_arguments.done", item_id: item.id, call_id: item.call_id, name: item.name, arguments: item.arguments })}\n\n`);
@@ -1645,12 +1727,12 @@ async function handleResponses(req, cfg) {
           });
         }
       }
-      const respObj = { id: rid, object: "response", status: "completed", model: rm.name, output, usage };
+      const respObj = { id: rid, object: "response", status: "completed", model: rm.name, ...route, output, usage };
       write(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: respObj })}\n\n`);
     });
   }
 
-  return jsonResponse({ id: rid, object: "response", created_at: nowSec(), status: "completed", model: rm.name, output, usage });
+  return jsonResponse({ id: rid, object: "response", created_at: nowSec(), status: "completed", model: rm.name, ...routeMetadata(rm.modeId, result.actualModel), output, usage });
 }
 
 // POST /v1beta/models/{model}:generateContent | :streamGenerateContent
@@ -1671,25 +1753,30 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
   if (stream && !hasTools) {
     return sseResponse(async (write) => {
       let fullText = "";
+      let route = routeMetadata(rm.modeId, "");
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs)) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs, (meta) => { route = meta; })) {
           if (!delta) continue;
           fullText += delta;
-          write(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: delta }], role: "model" }, index: 0 }], modelVersion: rm.name })}\n\n`);
+          write(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: delta }], role: "model" }, index: 0 }], modelVersion: rm.name, upstreamModel: route.upstream_model, routeStatus: route.route_status })}\n\n`);
         }
       } finally {
         write(`data: ${JSON.stringify({
           candidates: [{ finishReason: "STOP", index: 0 }],
           usageMetadata: { promptTokenCount: tokenEst(prompt), candidatesTokenCount: tokenEst(fullText), totalTokenCount: tokenEst(prompt) + tokenEst(fullText) },
           modelVersion: rm.name,
+          upstreamModel: route.upstream_model,
+          routeStatus: route.route_status,
         })}\n\n`);
       }
     });
   }
 
+  let result;
   let text;
   try {
-    text = await generate(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
+    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
+    text = result.text;
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
   }
@@ -1712,6 +1799,8 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
     candidates: [{ content: { parts: responseParts, role: "model" }, finishReason: "STOP", index: 0 }],
     usageMetadata: { promptTokenCount: tokenEst(prompt), candidatesTokenCount: tokenEst(text), totalTokenCount: tokenEst(prompt) + tokenEst(text) },
     modelVersion: rm.name,
+    upstreamModel: result.actualModel || null,
+    routeStatus: routeStatus(rm.modeId, result.actualModel),
   };
 
   if (stream) {
@@ -1720,70 +1809,87 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
   return jsonResponse(responseObj);
 }
 
-// GET /debug — 排查上游为何为空。从【当前部署环境】实地探测,回显原始状态/片段。
-// 探针 A:裸请求(现行做法);探针 B:先抓访客 cookie + at token 再请求。
-// 对比两者即可判断:是 IP 被拦(都空)、还是缺会话(B 能通 → 可自动修)。
+// GET /debug: compare a configured-Cookie Pro request with the same guest request.
+function cookieRouteSummary(cfg, proRoute, pageTokenFound) {
+  const verified = proRoute && proRoute.route_status === "matched";
+  const status = !cfg.cookie
+    ? "not_configured"
+    : verified
+      ? "pro_route_verified"
+      : proRoute && proRoute.upstream_model
+        ? "configured_but_pro_unavailable"
+        : "unverified";
+  return {
+    configured: !!cfg.cookie,
+    page_token_found: !!pageTokenFound,
+    status,
+    pro_route_verified: !!verified,
+    actual_model: proRoute ? proRoute.upstream_model : null,
+  };
+}
+
+async function probeModelRoute(cfg, name, detailed = false) {
+  const rm = resolveModel(name, cfg.default_model);
+  const result = await generateResult(cfg, "Reply with one word: PONG", rm.modeId, rm.thinkMode, rm.extra, null);
+  const metadata = routeMetadata(rm.modeId, result.actualModel);
+  const route = {
+    requested_model: name,
+    ...metadata,
+    available: metadata.route_status === "matched" || metadata.route_status === "auto",
+  };
+  return detailed ? {
+    ...route,
+    status: result.status,
+    content_type: result.contentType,
+    raw_length: result.rawLength,
+    parsed: result.text.slice(0, 160),
+  } : route;
+}
+
+async function inspectModelRoutes(cfg) {
+  await refreshGeminiBl(cfg);
+  let pageTokenFound = false;
+  if (cfg.cookie) pageTokenFound = !!(await getPageTokens(cfg)).at;
+  const pairs = await Promise.all(Object.keys(MODELS).map(async (name) => {
+    try {
+      return [name, await probeModelRoute(cfg, name)];
+    } catch (e) {
+      return [name, { requested_model: name, upstream_model: null, route_status: "unknown", available: false, error: String((e && e.message) || e) }];
+    }
+  }));
+  const routes = Object.fromEntries(pairs);
+  const actualModels = [...new Set(Object.values(routes).map((r) => r.upstream_model).filter(Boolean))];
+  return {
+    routes,
+    actual_models: actualModels,
+    cookie: cookieRouteSummary(cfg, routes["gemini-3.1-pro"], pageTokenFound),
+  };
+}
+
 async function handleDebug(cfg) {
   await refreshGeminiBl(cfg);
-  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
-
-  async function probe(guest) {
+  let pageTokenFound = false;
+  if (cfg.cookie) pageTokenFound = !!(await getPageTokens(cfg)).at;
+  const guestCfg = { ...cfg, cookie: "", sapisid: "" };
+  const safeProbe = async (probeCfg) => {
     try {
-      let cookie = cfg.cookie || "";
-      let at = "";
-      let bl = cfg.gemini_bl;
-      let pageStatus = null;
-      let setCookieCount = 0;
-      if (guest && !cookie) {
-        const pr = await httpFetch(`${cfg.gemini_origin}/app`, { headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9" }, timeoutMs: 30000, socket: cfg.upstream_socket });
-        pageStatus = pr.status;
-        const sc = pr.headers.getSetCookie ? pr.headers.getSetCookie() : [];
-        setCookieCount = sc.length;
-        cookie = sc.map((c) => c.split(";")[0]).filter(Boolean).join("; ");
-        const html = await pr.text();
-        at = (/"SNlM0e":"([^"]+)"/.exec(html) || [])[1] || "";
-        const blm = extractGeminiBl(html);
-        if (blm) bl = blm;
-      }
-      const headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://gemini.google.com",
-        "Referer": "https://gemini.google.com/app",
-        "X-Same-Domain": "1",
-        "User-Agent": UA,
-        "Accept-Language": "en-US,en;q=0.9",
-      };
-      if (cookie) headers["Cookie"] = cookie;
-      if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
-      let body = buildPayload("Reply with one word: PONG", 1, 4, null, null);
-      if (at) body += "&at=" + encodeURIComponent(at);
-      const resp = await httpFetch(getUrl({ gemini_bl: bl, gemini_origin: cfg.gemini_origin }), { method: "POST", headers, body, timeoutMs: 60000, socket: cfg.upstream_socket });
-      const raw = await resp.text();
-      return {
-        status: resp.status,
-        contentType: resp.headers.get("content-type"),
-        rawLength: raw.length,
-        parsed: extractResponseText(raw).slice(0, 160),
-        rawSnippet: raw.slice(0, 500),
-        usedCookie: !!cookie,
-        usedAt: !!at,
-        blUsed: bl,
-        pageStatus,
-        setCookieCount,
-      };
+      return await probeModelRoute(probeCfg, "gemini-3.1-pro", true);
     } catch (e) {
-      return { error: String((e && e.message) || e) };
+      return { upstream_model: null, route_status: "unknown", error: String((e && e.message) || e) };
     }
-  }
+  };
 
+  const [configuredProbe, guestProbe] = await Promise.all([safeProbe(cfg), safeProbe(guestCfg)]);
   return jsonResponse({
-    note: "上游已改用 socket(cloudflare:sockets)优先、fetch 兜底。socket.available=false 表示运行时没有该模块、退回 fetch。A=bare, B=guest. 若 status 仍是 429,说明 socket 出口同样被 Google 限流 -> 用 GEMINI_ORIGIN 中转或换非数据中心 IP。",
+    note: "A_configured requests Pro with the configured Cookie and page token; B_guest requests the same route without it. Compare upstream_model and route_status to verify whether Pro was actually granted.",
     bl: cfg.gemini_bl,
     geminiOrigin: cfg.gemini_origin,
     hasCookie: !!cfg.cookie,
+    cookie: cookieRouteSummary(cfg, configuredProbe, pageTokenFound),
     socket: { configEnabled: cfg.upstream_socket, available: !!(await resolveConnect()) },
-    A_bare: await probe(false),
-    B_guest: await probe(true),
+    A_configured: configuredProbe,
+    A_bare: configuredProbe,
+    B_guest: guestProbe,
   });
 }
 
@@ -1811,14 +1917,37 @@ export default {
     try {
       if (method === "GET") {
         if (path === "/v1/models") {
+          const live = parseBool(url.searchParams.get("live"), false);
+          const inspection = live ? await inspectModelRoutes(cfg) : null;
           return jsonResponse({
             object: "list",
-            data: Object.entries(MODELS).map(([n, c]) => ({ id: n, object: "model", created: 1700000000, owned_by: "google", description: c.desc })),
+            dynamic: live,
+            actual_models: inspection ? inspection.actual_models : undefined,
+            cookie: inspection ? inspection.cookie : undefined,
+            data: Object.entries(MODELS).map(([n, c]) => ({
+              id: n,
+              object: "model",
+              created: 1700000000,
+              owned_by: "google",
+              description: c.desc,
+              ...(inspection ? inspection.routes[n] : {}),
+            })),
           });
         }
         if (path.startsWith("/v1beta/models")) {
+          const live = parseBool(url.searchParams.get("live"), false);
+          const inspection = live ? await inspectModelRoutes(cfg) : null;
           return jsonResponse({
-            models: Object.entries(MODELS).map(([n, c]) => ({ name: `models/${n}`, displayName: n, description: c.desc, supportedGenerationMethods: ["generateContent", "streamGenerateContent"] })),
+            dynamic: live,
+            actualModels: inspection ? inspection.actual_models : undefined,
+            cookie: inspection ? inspection.cookie : undefined,
+            models: Object.entries(MODELS).map(([n, c]) => ({
+              name: `models/${n}`,
+              displayName: n,
+              description: c.desc,
+              supportedGenerationMethods: ["generateContent", "streamGenerateContent"],
+              ...(inspection ? inspection.routes[n] : {}),
+            })),
           });
         }
         if (path === "/") {
@@ -1866,7 +1995,7 @@ export default {
 // 导出给本地测试用(Workers 运行时会忽略)。
 export {
   MODELS, SLOT, resolveModel, getConfig, buildPayload, getUrl, buildHeaders, cleanText,
-  extractTextsFromLine, extractResponseText, generate, generateStream,
+  extractTextsFromLine, extractResponseText, extractActualModel, routeStatus, generate, generateResult, generateStream,
   messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
   makeSapisidHash, parseImageUrl, extractGeminiBl, getPageTokens, uploadImage, resolveImages,
   __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,

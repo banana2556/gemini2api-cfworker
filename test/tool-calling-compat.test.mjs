@@ -3,15 +3,17 @@ import test from "node:test";
 
 import {
   MODELS,
+  extractActualModel,
   extractGeminiBl,
   messagesToPrompt,
   parseGoogleFunctionCalls,
   parseToolCalls,
   resolveModel,
+  routeStatus,
   toOpenAIStreamToolCallDeltas,
 } from "../worker.js";
 
-test("Flash model IDs use 3.6", () => {
+test("existing Flash aliases remain stable", () => {
   const models = [
     "gemini-3.6-flash",
     "gemini-3.6-flash-lite",
@@ -28,6 +30,18 @@ test("Gemini build is extracted from the app page", () => {
     extractGeminiBl('<script>"cfb2h":"boq_assistant-bard-web-server_20260806.01_p0"</script>'),
     "boq_assistant-bard-web-server_20260806.01_p0",
   );
+});
+
+test("actual upstream model and fallback routing are extracted from StreamGenerate", () => {
+  const inner = new Array(43).fill(null);
+  inner[42] = "3.5 Flash-Lite";
+  const raw = JSON.stringify([["wrb.fr", "rpc", JSON.stringify(inner)]]);
+
+  assert.equal(extractActualModel(raw), "3.5 Flash-Lite");
+  assert.equal(routeStatus(6, "3.5 Flash-Lite"), "matched");
+  assert.equal(routeStatus(3, "3.5 Flash-Lite"), "fallback");
+  assert.equal(routeStatus(3, "3.1 Pro"), "matched");
+  assert.equal(routeStatus(4, "3.5 Flash-Lite"), "auto");
 });
 
 const tools = [
