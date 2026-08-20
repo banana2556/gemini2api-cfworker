@@ -52,9 +52,9 @@ test("current Gemini Web route includes model ID, mode, and thinking level", () 
 test("raw Cookie and gemini-auth JSON preserve account metadata", async () => {
   const raw = "NID=534=value=with=equals; SAPISID=sapi/value; __Secure-1PSID=session; S=a=b";
   const parsed = parseAuthPayload(raw, true);
-  assert.equal(parsed.cookie, "SAPISID=sapi/value; __Secure-1PSID=session");
+  assert.equal(parsed.cookie, "SAPISID=sapi/value; NID=534=value=with=equals; __Secure-1PSID=session");
   assert.equal(parsed.sapisid, "sapi/value");
-  assert.equal(parsed.removed_cookie_count, 2);
+  assert.equal(parsed.removed_cookie_count, 1);
 
   const cfg = getConfig({
     GEMINI_COOKIE: JSON.stringify({

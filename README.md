@@ -12,7 +12,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 - Image input via Scotty upload (requires cookie)
 - Raw TCP socket upstream to bypass Cloudflare egress 429
 - Actual upstream model reporting and Cookie/Pro route verification
-- Built-in web console for models, masked Cookie health/import, and Playground
+- Built-in web console for models, masked Cookie health/import/refresh, and Playground
 - Built-in retry, timeout, and debug probe endpoint
 
 ## Quick Start
@@ -143,6 +143,7 @@ curl "https://your-worker.workers.dev/v1beta/models/gemini-3.6-flash:generateCon
 | `GET` | `/health` | Health JSON (version + current `GEMINI_BL` + model list) |
 | `GET` | `/admin/status` | Masked configuration/Cookie status; `?verify=1` probes Pro, `?live=1` probes all aliases |
 | `PUT` | `/admin/cookie` | Persist a raw Cookie or Cookie Sync JSON (management key required) |
+| `POST` | `/admin/cookie/refresh` | Validate the login and persist approved values returned by Google's `Set-Cookie` rotation |
 | `DELETE` | `/admin/cookie` | Remove the dashboard override and fall back to `GEMINI_COOKIE` |
 | `GET` | `/v1/models` | List stable aliases; add `?live=1` for actual upstream routes |
 | `POST` | `/v1/chat/completions` | Chat completions (OpenAI format) |
@@ -185,9 +186,16 @@ The importer accepts the upstream Cookie Sync extension's JSON fields
 (`cookie`, `sapisid`, `auth_user`, `xsrf_token`, `gemini_bl`). Page-token cache
 entries are isolated by a cryptographic Cookie fingerprint, so replacing a
 Cookie or switching Google accounts cannot reuse the previous account's XSRF
-token. Raw browser Cookie pastes are normalized to authentication/session
-fields before forwarding; oversized preference, search, billing, `NID`, and
-`COMPASS` fields are not stored or sent upstream.
+token. Raw browser Cookie pastes are normalized to approved authentication and
+anti-abuse fields, including `AEC`, `NID`, and `COMPASS`; unrelated preference,
+search, and billing fields are not stored or sent upstream.
+
+The console's **Refresh Cookie** action requests Gemini's signed-in app page,
+merges only approved `Set-Cookie` rotations, and saves the result as the
+`COOKIE_STORE` override. Its status is `refreshed`, `no_rotation`, or
+`reauth_required`. Rotation can extend a valid session, but it cannot recreate
+an expired Google login; `reauth_required` means the Cookie must be exported
+from the browser again.
 
 ## Troubleshooting
 

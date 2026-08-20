@@ -3,9 +3,12 @@ import test from "node:test";
 
 import worker from "../worker.js";
 
+const internals = globalThis.__GEMINI_WORKER_TEST__;
+
 function memoryCookieStore() {
   let record = null;
   return {
+    peek() { return record; },
     idFromName() { return "settings"; },
     get() {
       return {
@@ -108,8 +111,8 @@ test("Cookie import persists only behind an admin key and never returns the raw 
   const data = await status.json();
   assert.equal(data.cookie.source, "dashboard");
   assert.equal(data.cookie.structurally_valid, true);
-  assert.equal(data.cookie.cookie_count, 2);
-  assert.equal(data.cookie.removed_cookie_count, 1);
+  assert.equal(data.cookie.cookie_count, 3);
+  assert.equal(data.cookie.removed_cookie_count, 0);
   assert.equal(data.cookie.session_cookie, "__Secure-1PSID");
   assert.equal(status.headers.get("access-control-allow-origin"), null);
   assert.doesNotMatch(JSON.stringify(data), /sapi\/value|session-value/);
@@ -119,6 +122,107 @@ test("Cookie import persists only behind an admin key and never returns the raw 
     headers: { "X-Admin-Key": "admin-test-key" },
   }), env);
   assert.equal(removed.status, 200);
+});
+
+test("Cookie rotation merges approved values and ignores unrelated Set-Cookie fields", () => {
+  const headers = new Headers();
+  headers.append("Set-Cookie", "SIDCC=rotated-cc; Path=/; Secure; HttpOnly");
+  headers.append("Set-Cookie", "NID=rotated-nid; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/");
+  headers.append("Set-Cookie", "UNRELATED=ignore-me; Path=/");
+
+  const merged = internals.mergeRotatedCookies(
+    "SAPISID=sapi; SID=session; SIDCC=old-cc; NID=old-nid; AEC=untouched",
+    internals.getSetCookieValues(headers),
+  );
+
+  assert.deepEqual(merged.changed_cookie_names, ["SIDCC", "NID"]);
+  assert.equal(merged.ignored_cookie_count, 1);
+  assert.match(merged.cookie, /SID=session/);
+  assert.match(merged.cookie, /SAPISID=sapi/);
+  assert.match(merged.cookie, /SIDCC=rotated-cc/);
+  assert.match(merged.cookie, /NID=rotated-nid/);
+  assert.match(merged.cookie, /AEC=untouched/);
+  assert.doesNotMatch(merged.cookie, /old-cc|old-nid|ignore-me|UNRELATED/);
+
+  const combined = internals.getSetCookieValues({
+    get() {
+      return "NID=next; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/, SIDCC=next-cc; Path=/";
+    },
+  });
+  assert.equal(combined.length, 2);
+});
+
+test("authenticated Cookie refresh persists rotations without exposing values and rejects expired login", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    ADMIN_KEY: "admin-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const adminHeaders = { "X-Admin-Key": "admin-test-key" };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { ...adminHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session; SIDCC=old-cc; NID=old-nid" }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async () => {
+      const headers = new Headers({ "Content-Type": "text/html" });
+      headers.append("Set-Cookie", "SIDCC=rotated-cc; Path=/; Secure; HttpOnly");
+      headers.append("Set-Cookie", "NID=rotated-nid; Path=/; Secure");
+      headers.append("Set-Cookie", "UNRELATED=ignore-me; Path=/");
+      return new Response('{"SNlM0e":"fresh-at","cfb2h":"boq_assistant-bard-web-server_test"}', { headers });
+    };
+
+    const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: adminHeaders,
+    }), env);
+    const refreshedText = await refreshed.text();
+    const refreshedData = JSON.parse(refreshedText);
+    assert.equal(refreshed.status, 200);
+    assert.equal(refreshedData.status, "refreshed");
+    assert.deepEqual(refreshedData.changed_cookie_names, ["SIDCC", "NID"]);
+    assert.ok(refreshedData.cookie.refreshed_at);
+    assert.doesNotMatch(refreshedText, /rotated-cc|rotated-nid|ignore-me/);
+    assert.match(store.peek().cookie, /SIDCC=rotated-cc/);
+    assert.match(store.peek().cookie, /NID=rotated-nid/);
+    assert.doesNotMatch(store.peek().cookie, /UNRELATED|ignore-me/);
+    assert.equal(store.peek().xsrf_token, "fresh-at");
+
+    const validRecord = structuredClone(store.peek());
+    globalThis.fetch = async () => {
+      const headers = new Headers({ "Set-Cookie": "SIDCC=rotated-cc; Path=/" });
+      return new Response('{"SNlM0e":"fresh-at"}', { headers });
+    };
+    const unchanged = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: adminHeaders,
+    }), env);
+    assert.equal((await unchanged.json()).status, "no_rotation");
+    assert.deepEqual(store.peek(), validRecord);
+
+    globalThis.fetch = async () => new Response("<html>Sign in</html>", {
+      headers: { "Set-Cookie": "SIDCC=must-not-save; Path=/" },
+    });
+    const expired = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: adminHeaders,
+    }), env);
+    const expiredText = await expired.text();
+    const expiredData = JSON.parse(expiredText);
+    assert.equal(expired.status, 200);
+    assert.equal(expiredData.status, "reauth_required");
+    assert.doesNotMatch(expiredText, /must-not-save|rotated-cc|rotated-nid/);
+    assert.deepEqual(store.peek(), validRecord);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("management is disabled when no admin or API key exists", async () => {

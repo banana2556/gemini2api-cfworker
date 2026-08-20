@@ -40,7 +40,7 @@
  * 时才会真正路由到 Pro,否则回退到 Flash。
  */
 
-const VERSION = "1.3.1-worker";
+const VERSION = "1.4.0-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -170,10 +170,12 @@ const SESSION_COOKIE_NAMES = ["__Secure-1PSID", "__Secure-3PSID", "SID"];
 const MAX_COOKIE_BYTES = 64 * 1024;
 const FORWARDED_COOKIE_NAMES = [
   "SID", "HSID", "SSID", "APISID", "SAPISID", "LSID", "OSID", "SIDCC",
+  "AEC", "NID", "COMPASS",
   "__Secure-1PAPISID", "__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-1PSIDRTS", "__Secure-1PSIDCC",
   "__Secure-3PAPISID", "__Secure-3PSID", "__Secure-3PSIDTS", "__Secure-3PSIDRTS", "__Secure-3PSIDCC",
   "__Secure-OSID", "__Host-1PLSID", "__Host-3PLSID",
 ];
+const FORWARDED_COOKIE_SET = new Set(FORWARDED_COOKIE_NAMES);
 
 function parseCookiePairs(cookie) {
   const pairs = new Map();
@@ -185,6 +187,72 @@ function parseCookiePairs(cookie) {
     if (name && value) pairs.set(name, value);
   }
   return pairs;
+}
+
+function serializeCookiePairs(pairs) {
+  return FORWARDED_COOKIE_NAMES
+    .filter((name) => pairs.has(name))
+    .map((name) => `${name}=${pairs.get(name)}`)
+    .join("; ");
+}
+
+function getSetCookieValues(headers) {
+  if (!headers) return [];
+  let values = [];
+  if (typeof headers.getSetCookie === "function") {
+    values = headers.getSetCookie() || [];
+  }
+  if (!values.length) {
+    const combined = headers.get && headers.get("set-cookie");
+    if (combined) values = [combined];
+  }
+  return values.flatMap((value) =>
+    String(value).split(/,(?=\s*[!#$%&'*+\-.^_`|~0-9A-Za-z]+=)/).map((part) => part.trim()).filter(Boolean)
+  );
+}
+
+function mergeRotatedCookies(cookie, setCookieValues) {
+  const pairs = parseCookiePairs(cookie);
+  const changed = new Set();
+  let ignoredCookieCount = 0;
+
+  for (const line of setCookieValues || []) {
+    const parts = String(line || "").split(";");
+    const first = parts.shift() || "";
+    const i = first.indexOf("=");
+    if (i <= 0) continue;
+    const name = first.slice(0, i).trim();
+    const value = first.slice(i + 1).trim();
+    if (!FORWARDED_COOKIE_SET.has(name)) {
+      ignoredCookieCount += 1;
+      continue;
+    }
+
+    let remove = !value;
+    for (const attribute of parts) {
+      const j = attribute.indexOf("=");
+      const key = (j < 0 ? attribute : attribute.slice(0, j)).trim().toLowerCase();
+      const attrValue = j < 0 ? "" : attribute.slice(j + 1).trim();
+      if (key === "max-age" && Number(attrValue) <= 0) remove = true;
+      if (key === "expires") {
+        const expiresAt = Date.parse(attrValue);
+        if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) remove = true;
+      }
+    }
+
+    if (remove) {
+      if (pairs.delete(name)) changed.add(name);
+    } else if (pairs.get(name) !== value) {
+      pairs.set(name, value);
+      changed.add(name);
+    }
+  }
+
+  return {
+    cookie: serializeCookiePairs(pairs),
+    changed_cookie_names: [...changed],
+    ignored_cookie_count: ignoredCookieCount,
+  };
 }
 
 function parseAuthPayload(input, strict = false) {
@@ -205,7 +273,7 @@ function parseAuthPayload(input, strict = false) {
     .trim();
   const pairs = parseCookiePairs(rawCookie);
   const forwarded = FORWARDED_COOKIE_NAMES.filter((name) => pairs.has(name));
-  const cookie = forwarded.map((name) => `${name}=${pairs.get(name)}`).join("; ");
+  const cookie = serializeCookiePairs(pairs);
   const removedCookieCount = Math.max(0, pairs.size - forwarded.length);
   const embeddedSapisid = pairs.get("SAPISID") || "";
   const explicitSapisid = String(payload.sapisid ?? payload.SAPISID ?? "").trim();
@@ -248,6 +316,7 @@ function cookieSummary(cfg) {
     configured: !!cfg.cookie,
     source: cfg.cookie_source || "none",
     updated_at: cfg.cookie_updated_at || null,
+    refreshed_at: cfg.cookie_refreshed_at || null,
     byte_length: cfg.cookie ? new TextEncoder().encode(cfg.cookie).length : 0,
     cookie_count: pairs.size,
     removed_cookie_count: cfg.removed_cookie_count || 0,
@@ -293,6 +362,7 @@ function getConfig(env) {
       ? (env.GEMINI_COOKIE !== undefined && env.GEMINI_COOKIE !== "" ? "secret" : "inline")
       : "none",
     cookie_updated_at: null,
+    cookie_refreshed_at: null,
     removed_cookie_count: auth.removed_cookie_count,
   };
 }
@@ -309,6 +379,7 @@ function applyStoredAuth(cfg, record) {
     gemini_bl: auth.gemini_bl || cfg.gemini_bl,
     cookie_source: "dashboard",
     cookie_updated_at: record.updated_at || null,
+    cookie_refreshed_at: record.refreshed_at || null,
     removed_cookie_count: record.removed_cookie_count || auth.removed_cookie_count || 0,
   };
 }
@@ -695,6 +766,21 @@ function extractGeminiBl(html) {
   return build ? build[1] : "";
 }
 
+function extractPageTokens(html) {
+  const tokens = {};
+  for (const [key, pattern] of [
+    ["push_id", /"qKIAYe":"([^"]+)"/],
+    ["pctx", /"Ylro7b":"([^"]+)"/],
+    ["at", /"SNlM0e":"([^"]+)"/],
+  ]) {
+    const match = pattern.exec(html || "");
+    if (match) tokens[key] = match[1];
+  }
+  const bl = extractGeminiBl(html);
+  if (bl) tokens.bl = bl;
+  return tokens;
+}
+
 async function refreshGeminiBl(cfg) {
   const origin = cfg.gemini_origin || "https://gemini.google.com";
   const now = Date.now();
@@ -791,12 +877,7 @@ async function getPageTokens(cfg) {
   try {
     const resp = await httpFetch(`${origin}${accountPrefix(cfg)}/app`, { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
     const html = await resp.text();
-    for (const [k, re] of [["push_id", /"qKIAYe":"([^"]+)"/], ["pctx", /"Ylro7b":"([^"]+)"/], ["at", /"SNlM0e":"([^"]+)"/]]) {
-      const mm = re.exec(html);
-      if (mm) tokens[k] = mm[1];
-    }
-    const bl = extractGeminiBl(html);
-    if (bl) tokens.bl = bl;
+    Object.assign(tokens, extractPageTokens(html));
   } catch (e) {
     log(cfg, `getPageTokens failed: ${e}`);
   }
@@ -2173,6 +2254,83 @@ async function handleAdminStatus(cfg, env, url) {
   });
 }
 
+async function handleCookieRefresh(cfg, env) {
+  if (!cookieStoreStub(env)) {
+    return privateJsonResponse({
+      error: { message: "COOKIE_STORE 尚未綁定；刷新後的 Cookie 無法持久保存。" },
+    }, 503);
+  }
+  if (!cfg.cookie) {
+    return privateJsonResponse({
+      error: { message: "尚未設定 Cookie；請先從瀏覽器匯入。" },
+    }, 400);
+  }
+
+  const headers = { "User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9" };
+  applyAccountHeaders(headers, cfg);
+  headers.Cookie = cfg.cookie;
+  if (cfg.sapisid) headers.Authorization = await makeSapisidHash(cfg.sapisid);
+
+  const origin = cfg.gemini_origin || "https://gemini.google.com";
+  const response = await httpFetch(`${origin}${accountPrefix(cfg)}/app`, {
+    headers,
+    timeoutMs: 30000,
+    socket: cfg.upstream_socket,
+  });
+  const html = await response.text();
+  const tokens = extractPageTokens(html);
+
+  if (!response.ok || !tokens.at) {
+    return privateJsonResponse({
+      status: "reauth_required",
+      cookie: cookieSummary(cfg),
+      changed_cookie_names: [],
+      message: "Google 已不接受這份登入態；Worker 無法自行重新登入，請從瀏覽器重新匯入 Cookie。",
+    });
+  }
+
+  const merged = mergeRotatedCookies(cfg.cookie, getSetCookieValues(response.headers));
+  if (!merged.changed_cookie_names.length) {
+    return privateJsonResponse({
+      status: "no_rotation",
+      cookie: cookieSummary(cfg),
+      changed_cookie_names: [],
+      ignored_cookie_count: merged.ignored_cookie_count,
+      message: "登入態有效；Google 本次沒有輪替 Cookie。",
+    });
+  }
+
+  const now = new Date().toISOString();
+  const auth = parseAuthPayload({
+    cookie: merged.cookie,
+    sapisid: cfg.sapisid,
+    auth_user: cfg.auth_user,
+    xsrf_token: tokens.at,
+    gemini_bl: tokens.bl || cfg.gemini_bl,
+  }, true);
+  const record = {
+    ...auth,
+    removed_cookie_count: cfg.removed_cookie_count || 0,
+    updated_at: now,
+    refreshed_at: now,
+  };
+  await writeStoredAuth(env, record);
+
+  const refreshedCfg = applyStoredAuth(cfg, record);
+  _pageTokens = {
+    key: await authCacheKey(refreshedCfg),
+    tokens,
+    ts: Date.now(),
+  };
+  return privateJsonResponse({
+    status: "refreshed",
+    cookie: cookieSummary(refreshedCfg),
+    changed_cookie_names: merged.changed_cookie_names,
+    ignored_cookie_count: merged.ignored_cookie_count,
+    message: `已保存 Google 輪替的 ${merged.changed_cookie_names.length} 個 Cookie。`,
+  });
+}
+
 async function handleCookieImport(request, cfg, env) {
   if (!cookieStoreStub(env)) {
     return privateJsonResponse({
@@ -2441,9 +2599,11 @@ function dashboardResponse(cfg) {
               <div><dt>來源</dt><dd id="cookie-source">—</dd></div>
               <div><dt>工作階段</dt><dd id="cookie-session">—</dd></div>
               <div><dt>XSRF token</dt><dd id="cookie-xsrf">—</dd></div>
+              <div><dt>最近刷新</dt><dd id="cookie-refreshed">尚未刷新</dd></div>
               <div><dt>實際 Pro 路由</dt><dd id="cookie-route">尚未探測</dd></div>
             </dl>
             <div class="inline-actions">
+              <button class="button secondary" id="refresh-cookie" type="button">刷新 Cookie</button>
               <button class="button secondary" id="verify-cookie" type="button">驗證 Cookie</button>
               <button class="button danger" id="clear-cookie" type="button">移除面板覆寫</button>
             </div>
@@ -2568,6 +2728,7 @@ function dashboardResponse(cfg) {
       byId("cookie-source").textContent = sourceLabel(cookie && cookie.source);
       byId("cookie-session").textContent = cookie && cookie.session_cookie ? cookie.session_cookie : "缺少";
       byId("cookie-xsrf").textContent = cookie && cookie.xsrf_token_present ? "已匯入" : configured ? "請求時自動抓取" : "—";
+      byId("cookie-refreshed").textContent = cookie && cookie.refreshed_at ? new Date(cookie.refreshed_at).toLocaleString() : "尚未刷新";
       const verification = cookie && cookie.verification;
       byId("cookie-route").textContent = !verification ? "尚未探測" : verification.pro_route_verified ? "已驗證 Pro" : verification.actual_model ? "回到 " + verification.actual_model : "無法確認";
     }
@@ -2633,6 +2794,19 @@ function dashboardResponse(cfg) {
       setBusy(event.currentTarget, true, "驗證中…");
       try { await loadAdmin("verify"); showToast("Cookie 驗證完成", false); }
       catch (error) { showToast(error.message, true); }
+      finally { setBusy(event.currentTarget, false, ""); }
+    });
+
+    byId("refresh-cookie").addEventListener("click", async function (event) {
+      setBusy(event.currentTarget, true, "刷新中…");
+      try {
+        const data = await readJson(await fetch("/admin/cookie/refresh", {
+          method: "POST",
+          headers: requestHeaders(true, false)
+        }));
+        renderCookie(data.cookie);
+        showToast(data.message, data.status === "reauth_required");
+      } catch (error) { showToast(error.message, true); }
       finally { setBusy(event.currentTarget, false, ""); }
     });
 
@@ -2747,7 +2921,7 @@ export default {
     }
 
     if (method === "OPTIONS") {
-      if (adminPath) return new Response(null, { status: 204, headers: { "Allow": "GET, PUT, DELETE, OPTIONS" } });
+      if (adminPath) return new Response(null, { status: 204, headers: { "Allow": "GET, POST, PUT, DELETE, OPTIONS" } });
       return new Response(null, {
         status: 204,
         headers: { ...corsHeaders(), "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "*" },
@@ -2783,6 +2957,7 @@ export default {
         if (path === "/admin/status" && method === "GET") return await handleAdminStatus(cfg, env, url);
         if (path === "/admin/cookie" && method === "PUT") return await handleCookieImport(request, cfg, env);
         if (path === "/admin/cookie" && method === "DELETE") return await handleCookieDelete(cfg, env);
+        if (path === "/admin/cookie/refresh" && method === "POST") return await handleCookieRefresh(cfg, env);
         return privateJsonResponse({ error: { message: "not found" } }, 404);
       }
 
@@ -2876,10 +3051,11 @@ export default {
 if (typeof process !== "undefined" && process.versions && process.versions.node) {
   globalThis.__GEMINI_WORKER_TEST__ = {
     MODELS, SLOT, resolveModel, getConfig, getRequestConfig, parseAuthPayload, cookieSummary, authCacheKey,
+    getSetCookieValues, mergeRotatedCookies,
     buildPayload, getUrl, buildHeaders, cleanText,
     extractTextsFromLine, extractResponseText, extractActualModel, routeStatus, generate, generateResult, generateStream,
     messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
-    makeSapisidHash, parseImageUrl, extractGeminiBl, getPageTokens, uploadImage, resolveImages,
+    makeSapisidHash, parseImageUrl, extractGeminiBl, extractPageTokens, getPageTokens, uploadImage, resolveImages,
     __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,
   };
 }
