@@ -62,9 +62,8 @@ test("browser root serves a CSP-protected console and ignores legacy Cookie secr
   assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
   assert.match(html, /Worker 狀態，一眼看完/);
   assert.match(html, /id="api-key"/);
-  assert.match(html, /id="admin-key"/);
+  assert.doesNotMatch(html, /id="admin-key"|gemini-worker-admin-key|ADMIN_KEY/);
   assert.match(html, /gemini-worker-api-key/);
-  assert.match(html, /gemini-worker-admin-key/);
   assert.doesNotMatch(html, /id="access-key"|gemini-worker-key/);
   assert.doesNotMatch(html, /never-render-this|session-secret/);
   const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)?.[1];
@@ -83,14 +82,14 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
   const env = {
-    ADMIN_KEY: "admin-test-key",
+    API_KEYS: "api-test-key",
     COOKIE_STORE: memoryCookieStore(),
     GEMINI_COOKIE: "SAPISID=legacy-sapi; SID=legacy-session",
   };
   const raw = "NID=534=value=with=equals; SAPISID=sapi/value; __Secure-1PSID=session-value";
   const authHeaders = {
     "Content-Type": "application/json",
-    "X-Admin-Key": "admin-test-key",
+    "X-Admin-Key": "api-test-key",
   };
 
   const denied = await worker.fetch(new Request("https://worker.example/admin/cookie", {
@@ -110,7 +109,7 @@ test("Cookie import persists only in Durable Object and never falls back to a le
   assert.doesNotMatch(importedText, /sapi\/value|session-value/);
 
   const status = await worker.fetch(new Request("https://worker.example/admin/status", {
-    headers: { "X-Admin-Key": "admin-test-key" },
+    headers: { "X-Admin-Key": "api-test-key" },
   }), env);
   const data = await status.json();
   assert.equal(data.cookie.source, "durable_object");
@@ -123,7 +122,7 @@ test("Cookie import persists only in Durable Object and never falls back to a le
 
   const removed = await worker.fetch(new Request("https://worker.example/admin/cookie", {
     method: "DELETE",
-    headers: { "X-Admin-Key": "admin-test-key" },
+    headers: { "X-Admin-Key": "api-test-key" },
   }), env);
   assert.equal(removed.status, 200);
   const removedData = await removed.json();
@@ -169,12 +168,12 @@ test("Cookie rotation merges approved values and ignores unrelated Set-Cookie fi
 test("authenticated Cookie refresh persists rotations without exposing values and rejects expired login", async () => {
   const store = memoryCookieStore();
   const env = {
-    ADMIN_KEY: "admin-test-key",
+    API_KEYS: "api-test-key",
     COOKIE_STORE: store,
     UPSTREAM_SOCKET: "false",
     LOG_REQUESTS: "false",
   };
-  const adminHeaders = { "X-Admin-Key": "admin-test-key" };
+  const adminHeaders = { Authorization: "Bearer api-test-key" };
   const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
     method: "PUT",
     headers: { ...adminHeaders, "Content-Type": "application/json" },
@@ -246,14 +245,14 @@ test("authenticated Cookie refresh persists rotations without exposing values an
 test("scheduled Cookie refresh automatically persists Google rotations", async () => {
   const store = memoryCookieStore();
   const env = {
-    ADMIN_KEY: "admin-test-key",
+    API_KEYS: "api-test-key",
     COOKIE_STORE: store,
     UPSTREAM_SOCKET: "false",
     LOG_REQUESTS: "false",
   };
   const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
     method: "PUT",
-    headers: { "Content-Type": "application/json", "X-Admin-Key": "admin-test-key" },
+    headers: { "Content-Type": "application/json", "X-Admin-Key": "api-test-key" },
     body: JSON.stringify({ auth: "SAPISID=sapi; SID=session; SIDCC=old-cc" }),
   }), env);
   assert.equal(imported.status, 200);
@@ -279,58 +278,121 @@ test("scheduled Cookie refresh automatically persists Google rotations", async (
   }
 });
 
-test("management is disabled when no admin or API key exists", async () => {
+test("management is disabled when no API key exists", async () => {
   const response = await worker.fetch(new Request("https://worker.example/admin/status"), {});
   assert.equal(response.status, 403);
-  assert.match(await response.text(), /管理功能已停用/);
+  assert.match(await response.text(), /請先設定 API_KEYS/);
 });
 
 test("a persisted Cookie requires API_KEYS before generation is exposed", async () => {
-  const env = { ADMIN_KEY: "admin-test-key", COOKIE_STORE: memoryCookieStore() };
+  const store = memoryCookieStore();
   const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
     method: "PUT",
-    headers: { "Content-Type": "application/json", "X-Admin-Key": "admin-test-key" },
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
     body: JSON.stringify({ auth: "SAPISID=sapi; SID=session" }),
-  }), env);
+  }), { API_KEYS: "api-test-key", COOKIE_STORE: store });
   assert.equal(imported.status, 200);
 
   const generated = await worker.fetch(new Request("https://worker.example/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
-  }), env);
+  }), { COOKIE_STORE: store });
   assert.equal(generated.status, 503);
   assert.equal((await generated.json()).error.code, "api_keys_required_with_cookie");
 });
 
-test("ADMIN_KEY is exclusive when it differs from API_KEYS", async () => {
+test("Cookie management uses API_KEYS and ignores ADMIN_KEY", async () => {
   const env = {
     API_KEYS: "api-test-key",
     ADMIN_KEY: "admin-test-key",
     COOKIE_STORE: memoryCookieStore(),
   };
+  const denied = await worker.fetch(new Request("https://worker.example/admin/status", {
+    headers: { Authorization: "Bearer admin-test-key" },
+  }), env);
+  assert.equal(denied.status, 401);
+
   const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
     method: "PUT",
-    headers: { "Content-Type": "application/json", "X-Admin-Key": "admin-test-key" },
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
     body: JSON.stringify({ auth: "SAPISID=sapi; SID=session" }),
   }), env);
   assert.equal(imported.status, 200);
 
-  const deniedStatus = await worker.fetch(new Request("https://worker.example/admin/status", {
-    headers: { Authorization: "Bearer api-test-key" },
-  }), env);
-  const deniedDelete = await worker.fetch(new Request("https://worker.example/admin/cookie", {
-    method: "DELETE",
-    headers: { "X-Admin-Key": "api-test-key" },
-  }), env);
-  assert.equal(deniedStatus.status, 401);
-  assert.equal(deniedDelete.status, 401);
-
   const status = await worker.fetch(new Request("https://worker.example/admin/status", {
-    headers: { "X-Admin-Key": "admin-test-key" },
+    headers: { Authorization: "Bearer api-test-key" },
   }), env);
   assert.equal(status.status, 200);
   assert.equal((await status.json()).cookie.source, "durable_object");
+});
+
+test("anonymous catalog is guest auto routing and does not fetch Gemini", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    throw new Error("guest catalog must not fetch Gemini");
+  };
+  try {
+    const response = await worker.fetch(new Request("https://worker.example/v1/models"), {
+      UPSTREAM_SOCKET: "false",
+      LOG_REQUESTS: "false",
+    });
+    const data = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(data.data.map((model) => model.id), ["gemini-auto", "gemini-auto-thinking"]);
+    assert.equal(fetches, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("anonymous generation uses guest auto routing when Gemini catalog discovery fails", async () => {
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  const generateBodies = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes("otAQ7b") || url.includes("batchexecute")) {
+      throw new Error("guest must not call GetUserStatus");
+    }
+    if (url.includes("/app")) throw new Error("app unavailable");
+    if (url.includes("StreamGenerate")) {
+      generateBodies.push(init.body);
+      const inner = new Array(43).fill(null);
+      inner[4] = [[null, ["hello guest auto"]]];
+      inner[42] = "3.5 Flash-Lite";
+      const line = JSON.stringify([["wrb.fr", "rpc", JSON.stringify(inner)]]);
+      return new Response(`)]}'\n\n${line.length}\n${line}\n`, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  try {
+    const response = await worker.fetch(new Request("https://worker.example/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gemini-3.6-flash-thinking",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    }), { UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false", RETRY_ATTEMPTS: "1" });
+    const data = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(data.model, "gemini-auto-thinking");
+    assert.equal(data.route_status, "auto");
+    assert.equal(data.upstream_model, "3.5 Flash-Lite");
+    const outer = JSON.parse(new URLSearchParams(generateBodies[0]).get("f.req"));
+    const payload = JSON.parse(outer[1]);
+    assert.equal(payload[79], 4);
+    assert.equal(payload[80], 2);
+    assert.equal(payload[64], null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("Cookie-store failures fail closed while public health bypasses stored credentials", async () => {

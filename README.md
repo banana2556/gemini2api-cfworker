@@ -13,6 +13,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 - Raw TCP socket upstream to bypass Cloudflare egress 429
 - Actual upstream model reporting and Cookie/Pro route verification
 - Dynamic model discovery from Gemini Web: Flash-Lite, Flash, and Pro, each with Standard or Extended Thinking
+- Anonymous/guest requests keep working through Gemini's auto-routing model when no Cookie is configured
 - Built-in web console for models, masked Cookie health/import/refresh, and Playground
 - Automatic persisted Cookie rotation every six hours through a Cloudflare Cron Trigger
 - Built-in retry, timeout, and debug probe endpoint
@@ -34,14 +35,12 @@ migration, and Cron Trigger from `wrangler.toml`.
 npx wrangler deploy
 ```
 
-Protect API calls first, then optionally use a separate Cookie-management key:
+Protect API calls and the console with the same key:
 
 ```bash
 npx wrangler secret put API_KEYS
-npx wrangler secret put ADMIN_KEY
 ```
 
-`ADMIN_KEY` may be omitted to let Cookie management reuse an `API_KEYS` value.
 Once a Gemini Cookie is configured, `API_KEYS` is required so the logged-in
 account cannot be consumed anonymously.
 
@@ -56,12 +55,11 @@ read from Worker variables or secrets.
 
 | Variable | Required? | Description | Default |
 |---|---|---|---|
-| `API_KEYS` | With a Cookie | Comma-separated keys or JSON array. May be empty only for anonymous Gemini use | `[]` |
-| `ADMIN_KEY` | No | Exclusive Cookie-management key when set; only when empty does management accept an `API_KEYS` value | `""` |
+| `API_KEYS` | With a Cookie | Comma-separated keys or JSON array used for both API calls and the console. May be empty only for anonymous Gemini use | `[]` |
 | `GEMINI_BL` | No | Fallback Gemini web build number; the current value is detected automatically and cached | `boq_assistant-bard-web-server_...` |
 | `GEMINI_ORIGIN` | No | Upstream origin; point to a relay proxy if 429'd | `https://gemini.google.com` |
 | `UPSTREAM_SOCKET` | No | Prefer raw TCP socket over fetch to upstream | `true` |
-| `DEFAULT_MODEL` | No | Preferred dynamic alias; empty automatically selects the current Flash Standard model | `""` |
+| `DEFAULT_MODEL` | No | Preferred alias; empty selects Flash Standard with a Cookie, or `gemini-auto` when guest | `""` |
 | `RETRY_ATTEMPTS` | No | Max retry count on upstream failure | `3` |
 | `RETRY_DELAY_SEC` | No | Delay between retries (seconds) | `2` |
 | `REQUEST_TIMEOUT_SEC` | No | Per-request timeout (seconds) | `180` |
@@ -73,16 +71,16 @@ web console for image input and logged-in Gemini features. Once the Durable
 Object contains a Cookie, `API_KEYS` becomes mandatory for generation
 endpoints.
 
-> **Security tip:** Keep `API_KEYS` and `ADMIN_KEY` as Worker secrets. The
-> console keeps them separately in the current tab's `sessionStorage`; Gemini
+> **Security tip:** Keep `API_KEYS` as a Worker secret. The
+> console keeps it in the current tab's `sessionStorage`; Gemini
 > Cookie values live only in Durable Object storage and are never returned by a
 > status endpoint. Legacy `GEMINI_COOKIE`, `SAPISID`, `GEMINI_AUTH_USER`, and
 > `GEMINI_XSRF_TOKEN` secrets are ignored by the Worker and may be deleted.
 
 ## Models
 
-`GET /v1/models` calls Gemini Web's current `GetUserStatus` data and builds
-exactly six aliases for the account in use:
+With a configured Cookie, `GET /v1/models` calls Gemini Web's current
+`GetUserStatus` data and builds exactly six aliases for the account in use:
 
 | Base family | Standard | Extended Thinking |
 |---|---|---|
@@ -95,14 +93,25 @@ For example, different rollout cohorts can expose `3.6 Flash` or `3.7 Flash`.
 The catalog is cached for six hours and automatically fetched again after it
 expires or the Durable Object Cookie changes.
 
+Without a Cookie, the Worker does not pretend those families are available.
+It exposes `gemini-auto` and `gemini-auto-thinking`, which use Gemini's guest
+auto-routing mode. Unknown client aliases still work: a `*-thinking` name
+keeps Extended Thinking, and everything else maps to `gemini-auto`.
+
 Standard uses Gemini Web thinking level `1`; Extended Thinking uses level `2`
-for all three families. Level `3` is the separate **Deep Think** feature and is
-not one of these six aliases.
+for all families. Level `3` is the separate **Deep Think** feature and is
+not one of these aliases. Guest auto-routing typically lands on Flash-Lite
+and does not honor a requested Pro/Flash route.
+
+Paid Gemini / Google AI Pro accounts need the web model-select header
+(`x-goog-ext-525001261-jspb`). The Worker now builds it from GetUserStatus
+(primary model ID + account capacity). Without that header, Google keeps the
+UI default — usually Flash — even when Pro is in the catalog.
 
 To probe Gemini and see the model each alias actually routes to, request
 `GET /v1/models?live=1`. Each entry then
 includes `available`, `upstream_model`, and `route_status` (`matched`,
-`fallback`, or `unknown`). Live probing makes one small upstream
+`fallback`, `auto`, or `unknown`). Live probing makes one small upstream
 request per alias, so use it for diagnostics rather than every client startup.
 
 ## Usage Examples
@@ -179,9 +188,8 @@ Clients can authenticate via any of:
 
 If `API_KEYS` is empty and no Cookie is configured, model-generation endpoints
 are open. With any configured Cookie, generation fails closed until `API_KEYS`
-is set. Cookie-management endpoints use only `ADMIN_KEY` when it is configured;
-otherwise they accept a configured API key. Management never accepts a query-
-string key.
+is set. Cookie-management endpoints use the same `API_KEYS` values. Management
+never accepts a query-string key.
 
 ## Cookie verification
 

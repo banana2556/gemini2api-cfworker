@@ -17,9 +17,8 @@
  * 让仓库内 wrangler.toml 建立 COOKIE_STORE Durable Object 与排程。
  *
  * 配置:编辑本文件顶部的 CONFIG 对象。每个键也都可以用同名的 Worker
- * 环境变量 / secret 覆盖(API_KEYS / ADMIN_KEY 建议用 secret,避免提交进仓库):
- *   API_KEYS             逗号分隔的列表或 JSON 数组;使用 Cookie 时必须设置
- *   ADMIN_KEY            面板管理密钥;设置后仅接受此 key,为空时才接受 API_KEYS
+ * 环境变量 / secret 覆盖(API_KEYS 建议用 secret,避免提交进仓库):
+ *   API_KEYS             逗号分隔的列表或 JSON 数组;面板与 API 共用;使用 Cookie 时必须设置
  *   GEMINI_BL            Gemini 网页版构建号(会随时间变化)
  *   GEMINI_ORIGIN        上游源站;部署被 Google 429 限流时,指向干净 IP 的反向代理
  *   UPSTREAM_SOCKET      true/false;true=上游优先用裸 socket(绕开 fetch 的 429)
@@ -34,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.6.0-worker";
+const VERSION = "1.8.0-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -43,11 +42,8 @@ const VERSION = "1.6.0-worker";
 const CONFIG = {
   // 调用方必须携带的密钥(Authorization: Bearer <key> 或 x-api-key: <key>)。
   // 空数组 = 仅匿名 Gemini 模式不鉴权；配置 Cookie 后必须设置。
+  // 面板登入与 Cookie 管理使用同一组 API_KEYS。
   API_KEYS: [],
-
-  // 面板 Cookie 管理密钥。设置后仅接受此 key；留空时才接受 API_KEYS 中任一
-  // key。两者都为空时，面板仍可查看公开信息，但禁止 Cookie 管理操作。
-  ADMIN_KEY: "",
 
   // Gemini 网页版构建号。如果返回开始变空,去 gemini.google.com 页面源码里
   // 找一个新的值("boq_assistant-bard-web-server_...")。
@@ -73,9 +69,11 @@ const CONFIG = {
 };
 
 // ─── 动态模型目录 ─────────────────────────────────────────────────────────
-// MODE_CATEGORY 是 Gemini 协议枚举，不是模型清单：1=Flash、3=Pro、6=Flash-Lite。
-// 实际版本、显示名称和主/子模型 ID 均来自当前帐号的 GetUserStatus 与 /app。
+// MODE_CATEGORY 是 Gemini 协议枚举，不是模型清单：1=Flash、3=Pro、4=Guest auto、6=Flash-Lite。
+// 有 Cookie 时，实际版本、显示名称和主/子模型 ID 来自当前帐号的 GetUserStatus 与 /app。
+// 无 Cookie 时不探测具体家族，改走 guest 自动路由（mode 4）。
 const MODEL_CATEGORIES = [6, 1, 3];
+const GUEST_MODE = 4;
 const MODEL_STATUS_RPC = "otAQ7b";
 const MODEL_CATALOG_TTL_SEC = 6 * 60 * 60;
 let _modelCatalogMemory = { key: "", models: null, expiresAt: 0 };
@@ -112,8 +110,26 @@ function extractRouteVariant(html, primaryId, candidates) {
   return best ? best.id : "";
 }
 
+function computeAccountCapacity(statusPayload) {
+  const tier = Array.isArray(statusPayload?.[16]) ? statusPayload[16] : [];
+  const caps = Array.isArray(statusPayload?.[17]) ? statusPayload[17] : [];
+  if (tier.includes(21)) return { capacity: 1, capacity_field: 13 };
+  if (tier.includes(22)) return { capacity: 2, capacity_field: 13 };
+  if (caps.includes(115)) return { capacity: 4, capacity_field: 12 };
+  if (tier.includes(16) || caps.includes(106)) return { capacity: 3, capacity_field: 12 };
+  if (tier.includes(8) || caps.includes(19)) return { capacity: 2, capacity_field: 12 };
+  return { capacity: 1, capacity_field: 12 };
+}
+
+function buildModelSelectHeader(modelId, mode, capacity = 1, capacityField = 12) {
+  if (!modelId) return "";
+  const tail = capacityField === 13 ? `null,${capacity}` : String(Number(capacity) || 1);
+  return `[1,null,null,null,"${modelId}",null,null,0,[4,5,6,8],null,null,${tail},null,null,${Number(mode) || 1}]`;
+}
+
 function buildModelCatalog(statusPayload, appHtml) {
   const rows = statusPayload && Array.isArray(statusPayload[15]) ? statusPayload[15] : [];
+  const { capacity, capacity_field } = computeAccountCapacity(statusPayload);
   const models = {};
   for (const category of MODEL_CATEGORIES) {
     const row = rows.find((item) => Array.isArray(item) && item[17] === category);
@@ -130,6 +146,8 @@ function buildModelCatalog(statusPayload, appHtml) {
       thinking_level: 1,
       model: primaryId,
       submodel,
+      capacity,
+      capacity_field,
       desc: `${displayName} · ${description}`,
     };
     models[`${id}-thinking`] = {
@@ -137,6 +155,8 @@ function buildModelCatalog(statusPayload, appHtml) {
       thinking_level: 2,
       model: primaryId,
       submodel,
+      capacity,
+      capacity_field,
       desc: `${displayName} · Extended thinking`,
     };
   }
@@ -144,9 +164,32 @@ function buildModelCatalog(statusPayload, appHtml) {
   return models;
 }
 
-function defaultModelName(models, preferred = "") {
-  if (preferred && models[preferred]) return preferred;
-  return Object.keys(models).find((name) => models[name].mode === 1 && models[name].thinking_level === 1)
+function guestModelCatalog() {
+  return {
+    "gemini-auto": {
+      mode: GUEST_MODE,
+      thinking_level: 1,
+      model: "",
+      submodel: "",
+      desc: "Gemini · Guest auto routing",
+    },
+    "gemini-auto-thinking": {
+      mode: GUEST_MODE,
+      thinking_level: 2,
+      model: "",
+      submodel: "",
+      desc: "Gemini · Guest auto routing · Extended thinking",
+    },
+  };
+}
+
+function defaultModelName(models, preferred = "", thinkingLevel = null) {
+  if (preferred && models[preferred] && (thinkingLevel == null || models[preferred].thinking_level === thinkingLevel)) {
+    return preferred;
+  }
+  const level = thinkingLevel == null ? 1 : thinkingLevel;
+  return Object.keys(models).find((name) => models[name].mode === 1 && models[name].thinking_level === level)
+    || Object.keys(models).find((name) => models[name].thinking_level === level)
     || Object.keys(models)[0]
     || "";
 }
@@ -163,7 +206,9 @@ function modelNameForCategory(models, category, thinkingLevel = 1) {
 function resolveModel(modelName, def, models) {
   let cfg = models[modelName];
   if (!cfg) {
-    modelName = defaultModelName(models, def);
+    const level = /thinking|deep.?think/i.test(String(modelName || "")) ? 2 : 1;
+    const preferred = models[def] && models[def].thinking_level === level ? def : "";
+    modelName = defaultModelName(models, preferred, level);
     cfg = models[modelName];
   }
   if (!cfg) return { error: "Gemini model catalog is empty" };
@@ -172,6 +217,7 @@ function resolveModel(modelName, def, models) {
     modeId: cfg.mode,
     thinkingLevel: cfg.thinking_level,
     extra: cfg.submodel ? { 64: cfg.submodel, 75: cfg.mode } : null,
+    header: buildModelSelectHeader(cfg.model, cfg.mode, cfg.capacity, cfg.capacity_field),
   };
 }
 
@@ -384,7 +430,6 @@ function getConfig(env) {
     log_requests: parseBool(envOr(env, "LOG_REQUESTS", CONFIG.LOG_REQUESTS), true),
     enable_debug: parseBool(envOr(env, "ENABLE_DEBUG", CONFIG.ENABLE_DEBUG), true),
     api_keys: parseApiKeys(envOr(env, "API_KEYS", CONFIG.API_KEYS)),
-    admin_key: String(envOr(env, "ADMIN_KEY", CONFIG.ADMIN_KEY) || ""),
     cookie: "",
     sapisid: "",
     auth_user: null,
@@ -607,7 +652,7 @@ function getUrl(cfg) {
   );
 }
 
-async function buildHeaders(cfg) {
+async function buildHeaders(cfg, modelHeader) {
   const headers = {
     "Content-Type": "application/x-www-form-urlencoded",
     "Origin": "https://gemini.google.com",
@@ -618,6 +663,11 @@ async function buildHeaders(cfg) {
   applyAccountHeaders(headers, cfg);
   if (cfg.cookie) headers["Cookie"] = cfg.cookie;
   if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
+  if (modelHeader) {
+    headers["x-goog-ext-525001261-jspb"] = modelHeader;
+    headers["x-goog-ext-73010989-jspb"] = "[0]";
+    headers["x-goog-ext-73010990-jspb"] = "[0]";
+  }
   return headers;
 }
 
@@ -924,6 +974,7 @@ async function fetchModelCatalog(cfg, key) {
 }
 
 async function getModelCatalog(cfg, force = false) {
+  if (!cfg.cookie) return guestModelCatalog();
   const key = await authCacheKey(cfg);
   const now = Date.now();
   let stale = _modelCatalogMemory.key === key ? _modelCatalogMemory.models : null;
@@ -967,7 +1018,8 @@ async function getModelCatalog(cfg, force = false) {
       log(cfg, `model catalog refresh failed; using stale catalog: ${e}`);
       return stale;
     }
-    throw e;
+    log(cfg, `model catalog refresh failed; using guest auto routing: ${e}`);
+    return guestModelCatalog();
   }
 }
 
@@ -1162,7 +1214,7 @@ function extractActualModel(raw) {
 
 function routeStatus(modelId, actualModel) {
   if (!actualModel) return "unknown";
-  if (modelId === 4) return "auto";
+  if (modelId === GUEST_MODE) return "auto";
   const actual = /\bPro\b/i.test(actualModel)
     ? "pro"
     : /Flash[- ]Lite/i.test(actualModel)
@@ -1188,11 +1240,11 @@ async function buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, e
 }
 
 /** 非流式生成(带重试)。返回最终的响应文本。 */
-async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRefs) {
+async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, modelHeader) {
   await refreshGeminiBl(cfg);
   const body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
   const url = getUrl(cfg);
-  const headers = await buildHeaders(cfg);
+  const headers = await buildHeaders(cfg, modelHeader);
   let lastErr;
   for (let attempt = 0; attempt < cfg.retry_attempts; attempt++) {
     try {
@@ -1227,19 +1279,19 @@ async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRe
   throw lastErr;
 }
 
-async function generate(cfg, prompt, modelId, thinkingLevel, extra, fileRefs) {
-  return (await generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRefs)).text;
+async function generate(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, modelHeader) {
+  return (await generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, modelHeader)).text;
 }
 
 /**
  * 流式生成。每步 yield 一段文本增量(本次新追加的后缀)。
  * 只在尚未 yield 过任何内容时才重试,以避免重复输出。
  */
-async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, onRoute) {
+async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader) {
   await refreshGeminiBl(cfg);
   const body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
   const url = getUrl(cfg);
-  const headers = await buildHeaders(cfg);
+  const headers = await buildHeaders(cfg, modelHeader);
   let lastErr;
   let yielded = false;
 
@@ -1920,14 +1972,15 @@ function authorized(request, url, cfg) {
 }
 
 function adminAuthorized(request, cfg) {
-  const validKeys = cfg.admin_key ? [cfg.admin_key] : (cfg.api_keys || []);
-  if (!validKeys.length) return false;
+  const keys = cfg.api_keys || [];
+  if (!keys.length) return false;
   const auth = request.headers.get("authorization") || "";
   const candidates = [
+    request.headers.get("x-api-key"),
     request.headers.get("x-admin-key"),
     auth.startsWith("Bearer ") ? auth.slice(7) : null,
   ];
-  return candidates.some((key) => key && validKeys.some((valid) => timingSafeEqual(key, valid)));
+  return candidates.some((key) => key && keys.some((valid) => timingSafeEqual(key, valid)));
 }
 
 /**
@@ -1996,7 +2049,7 @@ async function handleChat(req, cfg) {
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; })) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; }, rm.header)) {
           got = true;
           chunk({ content: delta }, null);
         }
@@ -2020,7 +2073,7 @@ async function handleChat(req, cfg) {
   let result;
   let text;
   try {
-    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs);
+    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, rm.header);
     text = result.text;
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
@@ -2137,7 +2190,7 @@ async function handleResponses(req, cfg) {
   let result;
   let text;
   try {
-    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs);
+    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, rm.header);
     text = result.text;
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
@@ -2206,7 +2259,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
       let fullText = "";
       let route = routeMetadata(rm.modeId, "");
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; })) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; }, rm.header)) {
           if (!delta) continue;
           fullText += delta;
           write(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: delta }], role: "model" }, index: 0 }], modelVersion: rm.name, upstreamModel: route.upstream_model, routeStatus: route.route_status })}\n\n`);
@@ -2226,7 +2279,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
   let result;
   let text;
   try {
-    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs);
+    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, rm.header);
     text = result.text;
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
@@ -2282,7 +2335,7 @@ function cookieRouteSummary(cfg, proRoute, pageTokenFound) {
 async function probeModelRoute(cfg, name, detailed = false, models = null) {
   models = models || await getModelCatalog(cfg);
   const rm = resolveModel(name, cfg.default_model, models);
-  const result = await generateResult(cfg, "Reply with one word: PONG", rm.modeId, rm.thinkingLevel, rm.extra, null);
+  const result = await generateResult(cfg, "Reply with one word: PONG", rm.modeId, rm.thinkingLevel, rm.extra, null, rm.header);
   const metadata = routeMetadata(rm.modeId, result.actualModel);
   const route = {
     requested_model: name,
@@ -2329,7 +2382,8 @@ async function handleDebug(cfg) {
   const safeProbe = async (probeCfg) => {
     try {
       const models = await getModelCatalog(probeCfg);
-      return await probeModelRoute(probeCfg, modelNameForCategory(models, 3), true, models);
+      const name = probeCfg.cookie ? modelNameForCategory(models, 3) : defaultModelName(models);
+      return await probeModelRoute(probeCfg, name, true, models);
     } catch (e) {
       return { upstream_model: null, route_status: "unknown", error: String((e && e.message) || e) };
     }
@@ -2337,7 +2391,7 @@ async function handleDebug(cfg) {
 
   const [configuredProbe, guestProbe] = await Promise.all([safeProbe(cfg), safeProbe(guestCfg)]);
   return jsonResponse({
-    note: "A_configured requests Pro with the configured Cookie and page token; B_guest requests the same route without it. Compare upstream_model and route_status to verify whether Pro was actually granted.",
+    note: "A_configured requests Pro with the configured Cookie and page token; B_guest requests gemini-auto without it. Compare upstream_model and route_status to verify whether Pro was actually granted.",
     bl: cfg.gemini_bl,
     geminiOrigin: cfg.gemini_origin,
     hasCookie: !!cfg.cookie,
@@ -2569,7 +2623,7 @@ function dashboardResponse(cfg) {
     .brand-copy { display: grid; gap: 1px; }
     .brand-copy strong { font-size: .98rem; letter-spacing: -.01em; }
     .brand-copy span { color: #b9c9cf; font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
-    .access { margin-left: auto; display: grid; grid-template-columns: repeat(2, minmax(120px, 220px)) auto; align-items: end; gap: 8px; }
+    .access { margin-left: auto; display: grid; grid-template-columns: minmax(160px, 280px) auto; align-items: end; gap: 8px; }
     .access label { display: grid; gap: 5px; color: #c6d3d8; font-size: .75rem; }
     .access input { width: 100%; min-height: 38px; border: 1px solid #4b616a; border-radius: 9px; padding: 0 11px; color: #fff; background: #22343c; font-size: 1rem; }
     main { display: block; }
@@ -2650,7 +2704,7 @@ function dashboardResponse(cfg) {
     @media (max-width: 760px) {
       .shell { width: 100%; margin: 0; border-radius: 0; }
       .topbar { align-items: stretch; flex-direction: column; gap: 14px; padding: 18px 20px; }
-      .access { width: 100%; margin-left: 0; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+      .access { width: 100%; margin-left: 0; grid-template-columns: minmax(0, 1fr); }
       .access .button { grid-column: 1 / -1; }
       .hero { padding-top: 42px; }
       h1 { font-size: 3rem; }
@@ -2695,10 +2749,7 @@ function dashboardResponse(cfg) {
       </a>
       <div class="access">
         <label for="api-key">API 金鑰
-          <input id="api-key" type="password" autocomplete="off" placeholder="模型與 Playground">
-        </label>
-        <label for="admin-key">Admin 金鑰
-          <input id="admin-key" type="password" autocomplete="off" placeholder="留空則沿用 API 金鑰">
+          <input id="api-key" type="password" autocomplete="off" placeholder="面板與 API">
         </label>
         <button class="button secondary" id="connect-key" type="button">套用</button>
       </div>
@@ -2735,7 +2786,7 @@ function dashboardResponse(cfg) {
           <div class="status-panel">
             <h3>目前登入鏈</h3>
             <p>先做結構檢查，再用 Pro 路由探測驗證這份登入態是否真的被上游接受。</p>
-            <div class="cookie-state"><strong id="cookie-state">需要管理金鑰</strong><span id="cookie-detail">輸入金鑰後讀取，不會顯示 Cookie 值。</span></div>
+            <div class="cookie-state"><strong id="cookie-state">需要 API 金鑰</strong><span id="cookie-detail">輸入金鑰後讀取，不會顯示 Cookie 值。</span></div>
             <dl class="facts">
               <div><dt>來源</dt><dd id="cookie-source">—</dd></div>
               <div><dt>工作階段</dt><dd id="cookie-session">—</dd></div>
@@ -2759,7 +2810,7 @@ function dashboardResponse(cfg) {
               <small>至少需要 SAPISID，以及 SID、__Secure-1PSID、__Secure-3PSID 其中之一。</small>
             </div>
             <button class="button" id="import-cookie" type="submit">持久匯入</button>
-            <p class="security-note">API 呼叫使用 <code>API_KEYS</code>；Cookie 管理使用 <code>ADMIN_KEY</code>，只有未設定 Admin key 時才接受 API key。持久資料由 <code>COOKIE_STORE</code> Durable Object 保存。</p>
+            <p class="security-note">API 呼叫與 Cookie 管理都使用 <code>API_KEYS</code>。持久資料由 <code>COOKIE_STORE</code> Durable Object 保存。</p>
           </form>
         </div>
       </section>
@@ -2790,7 +2841,6 @@ function dashboardResponse(cfg) {
     const BOOT = ${boot};
     const byId = function (id) { return document.getElementById(id); };
     let apiKey = sessionStorage.getItem("gemini-worker-api-key") || "";
-    let adminKey = sessionStorage.getItem("gemini-worker-admin-key") || "";
     let toastTimer;
 
     function showToast(message, error) {
@@ -2801,14 +2851,10 @@ function dashboardResponse(cfg) {
       toastTimer = setTimeout(function () { toast.className = "toast"; }, 4200);
     }
 
-    function requestHeaders(admin, json) {
+    function requestHeaders(json) {
       const headers = {};
-      const key = admin ? (adminKey || apiKey) : apiKey;
       if (json) headers["Content-Type"] = "application/json";
-      if (key) {
-        headers.Authorization = "Bearer " + key;
-        if (admin) headers["X-Admin-Key"] = key;
-      }
+      if (apiKey) headers.Authorization = "Bearer " + apiKey;
       return headers;
     }
 
@@ -2897,13 +2943,13 @@ function dashboardResponse(cfg) {
 
     async function loadAdmin(mode) {
       const suffix = mode === "verify" ? "?verify=1" : "";
-      const data = await readJson(await fetch("/admin/status" + suffix, { headers: requestHeaders(true, false) }));
+      const data = await readJson(await fetch("/admin/status" + suffix, { headers: requestHeaders(false) }));
       renderCookie(data.cookie);
       return data;
     }
 
     async function loadModels(live) {
-      const data = await readJson(await fetch("/v1/models" + (live ? "?live=1" : ""), { headers: requestHeaders(false, false) }));
+      const data = await readJson(await fetch("/v1/models" + (live ? "?live=1" : ""), { headers: requestHeaders(false) }));
       renderModels(data.data || []);
       return data;
     }
@@ -2916,11 +2962,8 @@ function dashboardResponse(cfg) {
 
     byId("connect-key").addEventListener("click", async function () {
       apiKey = byId("api-key").value.trim();
-      adminKey = byId("admin-key").value.trim();
       if (apiKey) sessionStorage.setItem("gemini-worker-api-key", apiKey);
       else sessionStorage.removeItem("gemini-worker-api-key");
-      if (adminKey) sessionStorage.setItem("gemini-worker-admin-key", adminKey);
-      else sessionStorage.removeItem("gemini-worker-admin-key");
       try {
         await loadModels(false);
         await loadAdmin("");
@@ -2952,7 +2995,7 @@ function dashboardResponse(cfg) {
       try {
         const data = await readJson(await fetch("/admin/cookie/refresh", {
           method: "POST",
-          headers: requestHeaders(true, false)
+          headers: requestHeaders(false)
         }));
         renderCookie(data.cookie);
         if (data.status !== "reauth_required") await loadModels(false);
@@ -2970,7 +3013,7 @@ function dashboardResponse(cfg) {
       try {
         const data = await readJson(await fetch("/admin/cookie", {
           method: "PUT",
-          headers: requestHeaders(true, true),
+          headers: requestHeaders(true),
           body: JSON.stringify({ auth: value })
         }));
         byId("cookie-input").value = "";
@@ -2985,7 +3028,7 @@ function dashboardResponse(cfg) {
       if (!confirm("移除 Durable Object 中的登入 Cookie，讓 Worker 回到未登入狀態？")) return;
       setBusy(event.currentTarget, true, "移除中…");
       try {
-        const data = await readJson(await fetch("/admin/cookie", { method: "DELETE", headers: requestHeaders(true, false) }));
+        const data = await readJson(await fetch("/admin/cookie", { method: "DELETE", headers: requestHeaders(false) }));
         renderCookie(data.cookie);
         await loadModels(false);
         showToast(data.message, false);
@@ -3004,7 +3047,7 @@ function dashboardResponse(cfg) {
       try {
         const data = await readJson(await fetch("/v1/chat/completions", {
           method: "POST",
-          headers: requestHeaders(false, true),
+          headers: requestHeaders(true),
           body: JSON.stringify({
             model: byId("play-model").value,
             messages: [{ role: "user", content: byId("play-prompt").value }],
@@ -3031,12 +3074,11 @@ function dashboardResponse(cfg) {
     });
 
     byId("api-key").value = apiKey;
-    byId("admin-key").value = adminKey;
     byId("base-url").textContent = location.origin + "/v1";
     renderModels(BOOT.models);
     loadHealth();
     loadModels(false).catch(function (error) { if (apiKey) showToast(error.message, true); });
-    if (adminKey || apiKey) loadAdmin("").catch(function (error) { showToast(error.message, true); });
+    if (apiKey) loadAdmin("").catch(function (error) { showToast(error.message, true); });
   </script>
 </body>
 </html>`;
@@ -3083,11 +3125,11 @@ export default {
     }
 
     if (adminPath) {
-      if (!cfg.admin_key && !(cfg.api_keys || []).length) {
-        return privateJsonResponse({ error: { message: "管理功能已停用；請先設定 ADMIN_KEY 或 API_KEYS。" } }, 403);
+      if (!(cfg.api_keys || []).length) {
+        return privateJsonResponse({ error: { message: "管理功能已停用；請先設定 API_KEYS。" } }, 403);
       }
       if (!adminAuthorized(request, cfg)) {
-        return privateJsonResponse({ error: { message: "管理金鑰無效" } }, 401);
+        return privateJsonResponse({ error: { message: "API 金鑰無效" } }, 401);
       }
     }
 
@@ -3218,8 +3260,9 @@ export default {
 // entrypoint，因此仅在 Node 环境挂到 globalThis，不进入线上导出表。
 if (typeof process !== "undefined" && process.versions && process.versions.node) {
   globalThis.__GEMINI_WORKER_TEST__ = {
-    MODEL_CATEGORIES, SLOT, modelAlias, extractRpcPayload, extractRouteVariant, buildModelCatalog,
-    defaultModelName, modelNameForCategory, resolveModel, getConfig, getRequestConfig, applyStoredAuth,
+    MODEL_CATEGORIES, GUEST_MODE, SLOT, modelAlias, extractRpcPayload, extractRouteVariant, buildModelCatalog,
+    computeAccountCapacity, buildModelSelectHeader,
+    guestModelCatalog, defaultModelName, modelNameForCategory, resolveModel, getConfig, getRequestConfig, getModelCatalog, applyStoredAuth,
     parseAuthPayload, cookieSummary, authCacheKey,
     getSetCookieValues, mergeRotatedCookies,
     buildPayload, getUrl, buildHeaders, cleanText,

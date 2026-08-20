@@ -17,7 +17,11 @@ const {
   parseAuthPayload,
   parseGoogleFunctionCalls,
   parseToolCalls,
+  guestModelCatalog,
+  defaultModelName,
   resolveModel,
+  computeAccountCapacity,
+  buildModelSelectHeader,
   routeStatus,
   toOpenAIStreamToolCallDeltas,
 } = globalThis.__GEMINI_WORKER_TEST__;
@@ -46,6 +50,18 @@ const appHtml = [
   '[["e6fa609c3fa255c0","9d8ca3786ebdfbea"]]',
 ].join("");
 const models = buildModelCatalog(statusPayload, appHtml);
+
+test("unknown client aliases keep the thinking suffix on guest auto routing", () => {
+  const guest = guestModelCatalog();
+  assert.equal(defaultModelName(guest), "gemini-auto");
+  assert.equal(resolveModel("gemini-3.6-flash", "", guest).name, "gemini-auto");
+  assert.equal(resolveModel("gemini-3.6-flash", "", guest).modeId, 4);
+  assert.equal(resolveModel("gemini-3.6-flash", "", guest).thinkingLevel, 1);
+  assert.equal(resolveModel("gemini-3.6-flash-thinking", "", guest).name, "gemini-auto-thinking");
+  assert.equal(resolveModel("gemini-3.1-pro-thinking", "", guest).thinkingLevel, 2);
+  assert.equal(resolveModel("gemini-3.1-pro-thinking", "", guest).modeId, 4);
+  assert.equal(resolveModel("gemini-auto-thinking", "", guest).extra, null);
+});
 
 test("GetUserStatus builds exactly three current models with a thinking variant each", () => {
   assert.deepEqual(Object.keys(models), [
@@ -79,6 +95,22 @@ test("standard and extended payloads use current route IDs and independent think
       assert.equal(inner[80], level);
     }
   }
+});
+
+test("Pro model header uses the GetUserStatus primary ID and account capacity", () => {
+  assert.deepEqual(computeAccountCapacity({ 16: [8, 0, 38], 17: [19] }), { capacity: 2, capacity_field: 12 });
+  assert.equal(
+    buildModelSelectHeader("e6fa609c3fa255c0", 3, 2, 12),
+    `[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4,5,6,8],null,null,2,null,null,3]`,
+  );
+
+  const paidPayload = statusPayload.slice();
+  paidPayload[16] = [8, 0, 38];
+  paidPayload[17] = [19];
+  const paid = buildModelCatalog(paidPayload, appHtml);
+  const pro = resolveModel("gemini-3.1-pro", "", paid);
+  assert.equal(pro.header, `[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4,5,6,8],null,null,2,null,null,3]`);
+  assert.equal(resolveModel("gemini-auto", "", guestModelCatalog()).header, "");
 });
 
 test("raw Cookie and gemini-auth JSON preserve account metadata", async () => {
