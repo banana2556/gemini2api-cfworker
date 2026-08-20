@@ -40,7 +40,7 @@
  * 时才会真正路由到 Pro,否则回退到 Flash。
  */
 
-const VERSION = "1.3.0-worker";
+const VERSION = "1.3.1-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -88,16 +88,19 @@ const CONFIG = {
 
 // ─── 模型 ────────────────────────────────────────────────────────────────
 // MODE_CATEGORY 枚举(来自 Gemini 前端 JS):
-//   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
+//   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING,
+//   6=FLASH_LITE, 7=FLASH_PLUS
+// model/submodel 是 2026-08-20 GetUserStatus 与 Gemini Web 实际选中的路由。
+// 仅传 mode 会被降级；StreamGenerate 还必须携带主模型与子模型 ID。
 const MODELS = {
-  "gemini-3.7-flash": { mode: 1, think: 4, desc: "Latest all-around model (Gemini 3.7 Flash)" },
-  "gemini-3.6-flash": { mode: 1, think: 4, desc: "All-around model (Gemini 3.6 Flash)" },
-  "gemini-3.6-flash-thinking": { mode: 2, think: 0, desc: "Deep thinking mode, longest output (~20k chars)" },
-  "gemini-3.1-pro": { mode: 3, think: 4, desc: "Pro model (requires cookie for real routing)" },
-  "gemini-3.1-pro-enhanced": { mode: 3, think: 4, extra: { 31: 2, 80: 3 }, desc: "Pro with enhanced output (experimental)" },
-  "gemini-auto": { mode: 4, think: 4, desc: "Auto model selection" },
-  "gemini-3.6-flash-thinking-lite": { mode: 5, think: 0, desc: "Dynamic thinking with adaptive depth" },
-  "gemini-3.6-flash-lite": { mode: 6, think: 4, desc: "Lightweight fast model" },
+  "gemini-3.7-flash": { mode: 1, think: 1, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", submode: 1, desc: "Latest all-around model (Gemini 3.7 Flash)" },
+  "gemini-3.6-flash": { mode: 1, think: 1, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", submode: 1, desc: "All-around model (Gemini 3.6 Flash)" },
+  "gemini-3.6-flash-thinking": { mode: 2, think: 2, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", desc: "Deep thinking mode, longest output (~20k chars)" },
+  "gemini-3.1-pro": { mode: 3, think: 1, model: "9d8ca3786ebdfbea", submodel: "e6fa609c3fa255c0", submode: 3, desc: "Pro model (requires cookie for real routing)" },
+  "gemini-3.1-pro-enhanced": { mode: 3, think: 3, model: "9d8ca3786ebdfbea", submodel: "e6fa609c3fa255c0", submode: 3, extra: { 31: 2 }, desc: "Pro with enhanced output (experimental)" },
+  "gemini-auto": { mode: 4, think: 1, desc: "Auto model selection" },
+  "gemini-3.6-flash-thinking-lite": { mode: 5, think: 1, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", desc: "Dynamic thinking with adaptive depth" },
+  "gemini-3.6-flash-lite": { mode: 6, think: 1, model: "cf41b0e0dd7d53e5", submodel: "8c46e95b1a07cecc", submode: 6, desc: "Lightweight fast model" },
 };
 
 /**
@@ -124,7 +127,12 @@ function resolveModel(modelName, def) {
     name: modelName,
     modeId: cfg.mode,
     thinkMode: thinkOverride !== null ? thinkOverride : cfg.think,
-    extra: cfg.extra || null,
+    extra: cfg.model ? {
+      59: cfg.model,
+      ...(cfg.submodel ? { 64: cfg.submodel } : {}),
+      ...(cfg.submode ? { 75: cfg.submode } : {}),
+      ...(cfg.extra || {}),
+    } : (cfg.extra || null),
   };
 }
 
@@ -407,15 +415,6 @@ function randHex(n) {
   return s.slice(0, n);
 }
 
-function uuid() {
-  if (globalThis.crypto && globalThis.crypto.randomUUID) return globalThis.crypto.randomUUID();
-  const b = randomBytes(16);
-  b[6] = (b[6] & 0x0f) | 0x40;
-  b[8] = (b[8] & 0x3f) | 0x80;
-  const h = [...b].map((x) => x.toString(16).padStart(2, "0"));
-  return `${h.slice(0, 4).join("")}-${h.slice(4, 6).join("")}-${h.slice(6, 8).join("")}-${h.slice(8, 10).join("")}-${h.slice(10, 16).join("")}`;
-}
-
 /** SAPISIDHASH 鉴权头(对 "<ts> <sapisid> <origin>" 做 SHA-1)。 */
 async function makeSapisidHash(sapisid) {
   const ts = nowSec();
@@ -446,7 +445,7 @@ const SLOT = {
   PROMPT: 0, LANG: 1, META: 2, FLAGS_6: 6, FLAGS_7: 7,
   FLAGS_10: 10, FLAGS_11: 11, THINK_MODE: 17, FLAGS_18: 18,
   FLAGS_27: 27, FLAGS_30: 30, FLAGS_41: 41, FLAGS_53: 53,
-  SESSION_ID: 59, FLAGS_61: 61, FLAGS_68: 68, MODEL_ID: 79,
+  MODEL_ID: 59, FLAGS_61: 61, FLAGS_68: 68, MODE: 79, THINK_LEVEL: 80,
 };
 
 function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
@@ -471,10 +470,10 @@ function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
   inner[SLOT.FLAGS_30] = [4];
   inner[SLOT.FLAGS_41] = [2];
   inner[SLOT.FLAGS_53] = 0;
-  inner[SLOT.SESSION_ID] = uuid();
   inner[SLOT.FLAGS_61] = [];
   inner[SLOT.FLAGS_68] = 1;
-  inner[SLOT.MODEL_ID] = modelId;
+  inner[SLOT.MODE] = modelId;
+  if (thinkMode >= 1 && thinkMode <= 3) inner[SLOT.THINK_LEVEL] = thinkMode;
   if (extra) {
     for (const k of Object.keys(extra)) inner[Number(k)] = extra[k];
   }

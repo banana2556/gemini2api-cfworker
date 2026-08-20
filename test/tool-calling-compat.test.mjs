@@ -7,6 +7,7 @@ const {
   MODELS,
   authCacheKey,
   buildHeaders,
+  buildPayload,
   extractActualModel,
   extractGeminiBl,
   getConfig,
@@ -34,6 +35,18 @@ test("existing Flash aliases remain stable", () => {
 
 test("upstream Gemini 3.7 Flash alias is available", () => {
   assert.equal(resolveModel("gemini-3.7-flash", "gemini-3.6-flash").name, "gemini-3.7-flash");
+});
+
+test("current Gemini Web route includes model ID, mode, and thinking level", () => {
+  const rm = resolveModel("gemini-3.1-pro", "gemini-3.6-flash");
+  const outer = JSON.parse(new URLSearchParams(buildPayload("PING", rm.modeId, rm.thinkMode, null, rm.extra)).get("f.req"));
+  const inner = JSON.parse(outer[1]);
+
+  assert.equal(inner[59], "9d8ca3786ebdfbea");
+  assert.equal(inner[64], "e6fa609c3fa255c0");
+  assert.equal(inner[75], 3);
+  assert.equal(inner[79], 3);
+  assert.equal(inner[80], 1);
 });
 
 test("raw Cookie and gemini-auth JSON preserve account metadata", async () => {
