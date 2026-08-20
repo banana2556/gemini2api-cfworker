@@ -47,6 +47,15 @@ test("current Gemini Web route includes model ID, mode, and thinking level", () 
   assert.equal(inner[75], 3);
   assert.equal(inner[79], 3);
   assert.equal(inner[80], 1);
+
+  const extended = resolveModel("gemini-3.1-pro-enhanced", "gemini-3.6-flash");
+  const extendedOuter = JSON.parse(new URLSearchParams(buildPayload("PING", extended.modeId, extended.thinkMode, null, extended.extra)).get("f.req"));
+  const extendedInner = JSON.parse(extendedOuter[1]);
+  assert.deepEqual(extendedInner[17], [[3]]);
+  assert.equal(extendedInner[31], 2);
+  assert.equal(extendedInner[64], "e6fa609c3fa255c0");
+  assert.equal(extendedInner[79], 3);
+  assert.equal(extendedInner[80], 3);
 });
 
 test("raw Cookie and gemini-auth JSON preserve account metadata", async () => {

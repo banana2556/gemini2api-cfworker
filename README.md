@@ -13,6 +13,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 - Raw TCP socket upstream to bypass Cloudflare egress 429
 - Actual upstream model reporting and Cookie/Pro route verification
 - Built-in web console for models, masked Cookie health/import/refresh, and Playground
+- Automatic persisted Cookie rotation every six hours through a Cloudflare Cron Trigger
 - Built-in retry, timeout, and debug probe endpoint
 
 ## Quick Start
@@ -21,7 +22,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/banana2556/gemini2api-cfworker)
 
-Click the button above, or paste `worker.js` directly into **Cloudflare Dashboard > Workers & Pages > Create > Quick Edit > Deploy**. The console and environment-secret Cookie work in either case. Persistent Cookie import additionally needs the `COOKIE_STORE` Durable Object binding from `wrangler.toml`; without it, the console refuses the write and keeps using `GEMINI_COOKIE`.
+Click the button above, or paste `worker.js` directly into **Cloudflare Dashboard > Workers & Pages > Create > Quick Edit > Deploy**. The console and environment-secret Cookie work in either case. Persistent Cookie import and six-hour automatic refresh additionally need the `COOKIE_STORE` Durable Object binding and Cron Trigger from `wrangler.toml`; without them, the console refuses persistent writes and keeps using `GEMINI_COOKIE`.
 
 ### Wrangler CLI
 
@@ -80,7 +81,7 @@ Gemini features.
 | `gemini-3.6-flash` | Fast | All-around model |
 | `gemini-3.6-flash-thinking` | Thinking | Deep thinking, longest output (~20k chars) |
 | `gemini-3.1-pro` | Pro | Pro model (requires cookie) |
-| `gemini-3.1-pro-enhanced` | Pro+ | Pro with enhanced output (experimental) |
+| `gemini-3.1-pro-enhanced` | Pro Extended | Verified mapping to Gemini Web's **Extended Thinking** option (`thinking level = 3`) |
 | `gemini-auto` | Auto | Auto model selection |
 | `gemini-3.6-flash-thinking-lite` | Dynamic | Dynamic thinking with adaptive depth |
 | `gemini-3.6-flash-lite` | Lite | Lightweight fast model |
@@ -190,12 +191,12 @@ token. Raw browser Cookie pastes are normalized to approved authentication and
 anti-abuse fields, including `AEC`, `NID`, and `COMPASS`; unrelated preference,
 search, and billing fields are not stored or sent upstream.
 
-The console's **Refresh Cookie** action requests Gemini's signed-in app page,
-merges only approved `Set-Cookie` rotations, and saves the result as the
-`COOKIE_STORE` override. Its status is `refreshed`, `no_rotation`, or
-`reauth_required`. Rotation can extend a valid session, but it cannot recreate
-an expired Google login; `reauth_required` means the Cookie must be exported
-from the browser again.
+The console's **Refresh Cookie** action and the repository's six-hour Cron
+Trigger request Gemini's signed-in app page, merge only approved `Set-Cookie`
+rotations, and save the result as the `COOKIE_STORE` override. Manual refresh
+returns `refreshed`, `no_rotation`, or `reauth_required`. Rotation can extend a
+valid session, but it cannot recreate an expired Google login;
+`reauth_required` means the Cookie must be exported from the browser again.
 
 ## Troubleshooting
 

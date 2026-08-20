@@ -40,7 +40,7 @@
  * 时才会真正路由到 Pro,否则回退到 Flash。
  */
 
-const VERSION = "1.4.0-worker";
+const VERSION = "1.5.0-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -92,12 +92,14 @@ const CONFIG = {
 //   6=FLASH_LITE, 7=FLASH_PLUS
 // model/submodel 是 2026-08-20 GetUserStatus 与 Gemini Web 实际选中的路由。
 // 仅传 mode 会被降级；StreamGenerate 还必须携带主模型与子模型 ID。
+// 网页「延伸思考」开关的实测元数据为 [e6fa609c3fa255c0, 2, 3]：
+// 同一 Pro 子模型、扩展标记 2、thinking level 3。
 const MODELS = {
   "gemini-3.7-flash": { mode: 1, think: 1, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", submode: 1, desc: "Latest all-around model (Gemini 3.7 Flash)" },
   "gemini-3.6-flash": { mode: 1, think: 1, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", submode: 1, desc: "All-around model (Gemini 3.6 Flash)" },
   "gemini-3.6-flash-thinking": { mode: 2, think: 2, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", desc: "Deep thinking mode, longest output (~20k chars)" },
   "gemini-3.1-pro": { mode: 3, think: 1, model: "9d8ca3786ebdfbea", submodel: "e6fa609c3fa255c0", submode: 3, desc: "Pro model (requires cookie for real routing)" },
-  "gemini-3.1-pro-enhanced": { mode: 3, think: 3, model: "9d8ca3786ebdfbea", submodel: "e6fa609c3fa255c0", submode: 3, extra: { 31: 2 }, desc: "Pro with enhanced output (experimental)" },
+  "gemini-3.1-pro-enhanced": { mode: 3, think: 3, model: "9d8ca3786ebdfbea", submodel: "e6fa609c3fa255c0", submode: 3, extra: { 31: 2 }, desc: "Gemini Web Pro Extended Thinking" },
   "gemini-auto": { mode: 4, think: 1, desc: "Auto model selection" },
   "gemini-3.6-flash-thinking-lite": { mode: 5, think: 1, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", desc: "Dynamic thinking with adaptive depth" },
   "gemini-3.6-flash-lite": { mode: 6, think: 1, model: "cf41b0e0dd7d53e5", submodel: "8c46e95b1a07cecc", submode: 6, desc: "Lightweight fast model" },
@@ -2567,7 +2569,7 @@ function dashboardResponse(cfg) {
       <section class="hero" aria-labelledby="page-title">
         <div class="hero-copy">
           <h1 id="page-title">Worker 狀態，一眼看完。</h1>
-          <p>檢查實際模型路由、管理 Gemini 登入 Cookie，並從同一個位址送出測試請求。Cookie 原文只會送往這個 Worker，不會由狀態 API 回傳。</p>
+          <p>檢查實際模型路由、管理 Gemini 登入 Cookie，並從同一個位址送出測試請求。支援每 6 小時排程刷新 Cookie，原文不會由狀態 API 回傳。</p>
         </div>
         <div class="health-strip" aria-live="polite">
           <div class="datum"><span>Worker</span><strong><i class="dot" id="health-dot"></i><b id="health-state">連線中</b></strong></div>
@@ -2599,6 +2601,7 @@ function dashboardResponse(cfg) {
               <div><dt>來源</dt><dd id="cookie-source">—</dd></div>
               <div><dt>工作階段</dt><dd id="cookie-session">—</dd></div>
               <div><dt>XSRF token</dt><dd id="cookie-xsrf">—</dd></div>
+              <div><dt>自動刷新</dt><dd>每 6 小時（Cron）</dd></div>
               <div><dt>最近刷新</dt><dd id="cookie-refreshed">尚未刷新</dd></div>
               <div><dt>實際 Pro 路由</dt><dd id="cookie-route">尚未探測</dd></div>
             </dl>
@@ -3043,6 +3046,16 @@ export default {
         ? privateJsonResponse({ error: { message: String((e && e.message) || e) } }, 500)
         : jsonResponse({ error: { message: String((e && e.message) || e) } }, 500);
     }
+  },
+
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil((async () => {
+      const cfg = await getRequestConfig(env);
+      if (!cfg.cookie || !cookieStoreStub(env)) return;
+      const response = await handleCookieRefresh(cfg, env);
+      const result = await response.json();
+      log(cfg, `automatic Cookie refresh: ${result.status || result.error?.message || response.status}`);
+    })().catch((e) => log(getConfig(env), `automatic Cookie refresh failed: ${e}`)));
   },
 };
 

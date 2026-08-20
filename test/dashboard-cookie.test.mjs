@@ -225,6 +225,42 @@ test("authenticated Cookie refresh persists rotations without exposing values an
   }
 });
 
+test("scheduled Cookie refresh automatically persists Google rotations", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    ADMIN_KEY: "admin-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "X-Admin-Key": "admin-test-key" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session; SIDCC=old-cc" }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async () => {
+      const headers = new Headers({ "Content-Type": "text/html" });
+      headers.append("Set-Cookie", "SIDCC=automatic-cc; Path=/; Secure; HttpOnly");
+      return new Response('{"SNlM0e":"automatic-at","cfb2h":"boq_assistant-bard-web-server_test"}', { headers });
+    };
+
+    const tasks = [];
+    await worker.scheduled({}, env, { waitUntil(task) { tasks.push(task); } });
+    await Promise.all(tasks);
+
+    assert.match(store.peek().cookie, /SIDCC=automatic-cc/);
+    assert.equal(store.peek().xsrf_token, "automatic-at");
+    assert.ok(store.peek().refreshed_at);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("management is disabled when no admin or API key exists", async () => {
   const response = await worker.fetch(new Request("https://worker.example/admin/status"), {});
   assert.equal(response.status, 403);
