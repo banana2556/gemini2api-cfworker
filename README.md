@@ -12,6 +12,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 - Image input via Scotty upload (requires cookie)
 - Raw TCP socket upstream to bypass Cloudflare egress 429
 - Actual upstream model reporting and Cookie/Pro route verification
+- Built-in web console for models, masked Cookie health/import, and Playground
 - Built-in retry, timeout, and debug probe endpoint
 
 ## Quick Start
@@ -20,7 +21,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/banana2556/gemini2api-cfworker)
 
-Click the button above, or paste `worker.js` directly into **Cloudflare Dashboard > Workers & Pages > Create > Quick Edit > Deploy**.
+Click the button above, or paste `worker.js` directly into **Cloudflare Dashboard > Workers & Pages > Create > Quick Edit > Deploy**. The console and environment-secret Cookie work in either case. Persistent Cookie import additionally needs the `COOKIE_STORE` Durable Object binding from `wrangler.toml`; without it, the console refuses the write and keeps using `GEMINI_COOKIE`.
 
 ### Wrangler CLI
 
@@ -28,15 +29,32 @@ Click the button above, or paste `worker.js` directly into **Cloudflare Dashboar
 npx wrangler deploy
 ```
 
+Protect API calls first, then optionally use a separate Cookie-management key:
+
+```bash
+npx wrangler secret put API_KEYS
+npx wrangler secret put ADMIN_KEY
+```
+
+`ADMIN_KEY` may be omitted to let Cookie management reuse an `API_KEYS` value.
+Once a Gemini Cookie is configured, `API_KEYS` is required so the logged-in
+account cannot be consumed anonymously.
+
+Open the deployed Worker URL in a browser for the console. The checked-in
+Durable Object migration provisions persistent Cookie storage on deployment.
+
 ## Configuration
 
 Edit the `CONFIG` object at the top of `worker.js`, or set Worker environment variables / secrets with the same names (secrets take precedence).
 
 | Variable | Required? | Description | Default |
 |---|---|---|---|
-| `API_KEYS` | No | Comma-separated keys or JSON array. Empty = no auth | `[]` |
+| `API_KEYS` | With a Cookie | Comma-separated keys or JSON array. May be empty only for anonymous Gemini use | `[]` |
+| `ADMIN_KEY` | No | Exclusive Cookie-management key when set; only when empty does management accept an `API_KEYS` value | `""` |
 | `GEMINI_COOKIE` | Conditional | Full cookie string or `{"cookie":"...","sapisid":"..."}`; required for image input and logged-in features | `""` |
 | `SAPISID` | No | Explicit SAPISID (auto-extracted from cookie if omitted) | `""` |
+| `GEMINI_AUTH_USER` | No | Google multi-account index (`0`, `1`, …); imported automatically from `gemini-auth.json` | `""` |
+| `GEMINI_XSRF_TOKEN` | No | Explicit Gemini `SNlM0e`; normally fetched automatically or imported from `gemini-auth.json` | `""` |
 | `GEMINI_BL` | No | Fallback Gemini web build number; the current value is detected automatically and cached | `boq_assistant-bard-web-server_...` |
 | `GEMINI_ORIGIN` | No | Upstream origin; point to a relay proxy if 429'd | `https://gemini.google.com` |
 | `UPSTREAM_SOCKET` | No | Prefer raw TCP socket over fetch to upstream | `true` |
@@ -47,17 +65,19 @@ Edit the `CONFIG` object at the top of `worker.js`, or set Worker environment va
 | `LOG_REQUESTS` | No | Enable request logging | `true` |
 | `ENABLE_DEBUG` | No | Enable `/debug` probe endpoint | `true` |
 
-No variable is required for anonymous text requests. `API_KEYS` is only needed
-when authentication is desired; `GEMINI_COOKIE` is needed for image input or
-other logged-in Gemini features.
+No variable is required for anonymous text requests. If `GEMINI_COOKIE` is
+configured directly or through the console, `API_KEYS` becomes mandatory for
+generation endpoints. A Cookie is needed for image input and other logged-in
+Gemini features.
 
-> **Security tip:** Set `GEMINI_COOKIE` and `API_KEYS` as Worker **secrets** (`wrangler secret put`) to avoid committing them to the repo.
+> **Security tip:** Set `GEMINI_COOKIE`, `API_KEYS`, and `ADMIN_KEY` as Worker **secrets** (`wrangler secret put`) to avoid committing them to the repo. The console keeps API and Admin keys separately in the current tab's `sessionStorage` and never returns the raw Gemini Cookie from a status endpoint.
 
 ## Models
 
 | Model ID | Mode | Description |
 |---|---|---|
-| `gemini-3.6-flash` | Fast | Fast general-purpose model |
+| `gemini-3.7-flash` | Fast | Latest all-around model |
+| `gemini-3.6-flash` | Fast | All-around model |
 | `gemini-3.6-flash-thinking` | Thinking | Deep thinking, longest output (~20k chars) |
 | `gemini-3.1-pro` | Pro | Pro model (requires cookie) |
 | `gemini-3.1-pro-enhanced` | Pro+ | Pro with enhanced output (experimental) |
@@ -119,7 +139,11 @@ curl "https://your-worker.workers.dev/v1beta/models/gemini-3.6-flash:generateCon
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/` | Health check (returns version + current `GEMINI_BL` + model list) |
+| `GET` | `/` | Browser console when `Accept: text/html`; health JSON for API clients |
+| `GET` | `/health` | Health JSON (version + current `GEMINI_BL` + model list) |
+| `GET` | `/admin/status` | Masked configuration/Cookie status; `?verify=1` probes Pro, `?live=1` probes all aliases |
+| `PUT` | `/admin/cookie` | Persist a raw Cookie or Cookie Sync JSON (management key required) |
+| `DELETE` | `/admin/cookie` | Remove the dashboard override and fall back to `GEMINI_COOKIE` |
 | `GET` | `/v1/models` | List stable aliases; add `?live=1` for actual upstream routes |
 | `POST` | `/v1/chat/completions` | Chat completions (OpenAI format) |
 | `POST` | `/v1/responses` | Responses API (Codex CLI) |
@@ -137,11 +161,15 @@ Clients can authenticate via any of:
 - `x-goog-api-key: <key>`
 - `?key=<key>` query parameter
 
-If `API_KEYS` is empty, all endpoints are open (no auth required).
+If `API_KEYS` is empty and no Cookie is configured, model-generation endpoints
+are open. With any configured Cookie, generation fails closed until `API_KEYS`
+is set. Cookie-management endpoints use only `ADMIN_KEY` when it is configured;
+otherwise they accept a configured API key. Management never accepts a query-
+string key.
 
 ## Cookie verification
 
-`hasCookie: true` only means a value was configured. Use `/debug` and check
+`hasCookie: true` only means a value was configured. Use the web console or `/debug` and check
 `cookie.status`:
 
 - `pro_route_verified`: the configured Cookie really routed a Pro request to Pro
@@ -152,6 +180,14 @@ Normal API responses keep the requested alias in `model`/`modelVersion` and
 report the truth separately as `upstream_model`/`upstreamModel` plus routing
 status. Cookie requests also attach
 Gemini's current page token automatically.
+
+The importer accepts the upstream Cookie Sync extension's JSON fields
+(`cookie`, `sapisid`, `auth_user`, `xsrf_token`, `gemini_bl`). Page-token cache
+entries are isolated by a cryptographic Cookie fingerprint, so replacing a
+Cookie or switching Google accounts cannot reuse the previous account's XSRF
+token. Raw browser Cookie pastes are normalized to authentication/session
+fields before forwarding; oversized preference, search, billing, `NID`, and
+`COMPASS` fields are not stored or sent upstream.
 
 ## Troubleshooting
 

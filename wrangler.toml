@@ -2,3 +2,11 @@ name = "gemini2api"
 main = "worker.js"
 compatibility_date = "2024-12-01"
 keep_vars = true
+
+[[durable_objects.bindings]]
+name = "COOKIE_STORE"
+class_name = "CookieStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CookieStore"]

@@ -15,13 +15,17 @@
  *
  * 部署:把这个单文件粘贴到 Cloudflare 后台
  * (Workers & Pages → Create → 粘贴 → Deploy),或执行 `wrangler deploy`。
- * 不需要 wrangler.toml 的 [vars] 或 secrets —— 改下面的 CONFIG 即可。
+ * 核心 API 不需要 wrangler.toml 的 [vars]；若要在网页持久匯入 Cookie，
+ * 则需使用仓库内 wrangler.toml 提供的 COOKIE_STORE Durable Object 绑定。
  *
  * 配置:编辑本文件顶部的 CONFIG 对象。每个键也都可以用同名的 Worker
  * 环境变量 / secret 覆盖(GEMINI_COOKIE / API_KEYS 建议用 secret,避免提交进仓库):
  *   GEMINI_COOKIE        完整 cookie 字符串,或 JSON {"cookie": "...", "sapisid": "..."}
  *   SAPISID              可选,显式指定 SAPISID(否则从 cookie 自动提取)
- *   API_KEYS             逗号分隔的列表或 JSON 数组;为空 = 不鉴权
+ *   API_KEYS             逗号分隔的列表或 JSON 数组;使用 Cookie 时必须设置
+ *   ADMIN_KEY            面板管理密钥;设置后仅接受此 key,为空时才接受 API_KEYS
+ *   GEMINI_AUTH_USER     可选,Google 多帐号索引
+ *   GEMINI_XSRF_TOKEN    可选,显式指定 SNlM0e(否则自动抓取)
  *   GEMINI_BL            Gemini 网页版构建号(会随时间变化)
  *   GEMINI_ORIGIN        上游源站;部署被 Google 429 限流时,指向干净 IP 的反向代理
  *   UPSTREAM_SOCKET      true/false;true=上游优先用裸 socket(绕开 fetch 的 429)
@@ -36,7 +40,7 @@
  * 时才会真正路由到 Pro,否则回退到 Flash。
  */
 
-const VERSION = "1.2.0-worker";
+const VERSION = "1.3.0-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -44,8 +48,12 @@ const VERSION = "1.2.0-worker";
 // ════════════════════════════════════════════════════════════════════════════
 const CONFIG = {
   // 调用方必须携带的密钥(Authorization: Bearer <key> 或 x-api-key: <key>)。
-  // 空数组 = 不鉴权(任何知道地址的人都能调用)。
+  // 空数组 = 仅匿名 Gemini 模式不鉴权；配置 Cookie 后必须设置。
   API_KEYS: [],
+
+  // 面板 Cookie 管理密钥。设置后仅接受此 key；留空时才接受 API_KEYS 中任一
+  // key。两者都为空时，面板仍可查看公开信息，但禁止 Cookie 管理操作。
+  ADMIN_KEY: "",
 
   // Gemini cookie。匿名访问对所有模型都可用,唯独真正的 Pro 路由需要它。
   // 原始 cookie 字符串,例如:
@@ -53,6 +61,8 @@ const CONFIG = {
   // 匿名就留空 ""。(出于安全考虑,建议把它设为 Worker secret。)
   GEMINI_COOKIE: "",
   SAPISID: "", // 可选;留空则自动从上面的 cookie 中提取
+  GEMINI_AUTH_USER: "", // 多 Google 帐号索引，例如 0、1；默认帐号留空
+  GEMINI_XSRF_TOKEN: "", // 可选；上游扩展导出的 SNlM0e
 
   // Gemini 网页版构建号。如果返回开始变空,去 gemini.google.com 页面源码里
   // 找一个新的值("boq_assistant-bard-web-server_...")。
@@ -80,7 +90,8 @@ const CONFIG = {
 // MODE_CATEGORY 枚举(来自 Gemini 前端 JS):
 //   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 const MODELS = {
-  "gemini-3.6-flash": { mode: 1, think: 4, desc: "Fast general-purpose model" },
+  "gemini-3.7-flash": { mode: 1, think: 4, desc: "Latest all-around model (Gemini 3.7 Flash)" },
+  "gemini-3.6-flash": { mode: 1, think: 4, desc: "All-around model (Gemini 3.6 Flash)" },
   "gemini-3.6-flash-thinking": { mode: 2, think: 0, desc: "Deep thinking mode, longest output (~20k chars)" },
   "gemini-3.1-pro": { mode: 3, think: 4, desc: "Pro model (requires cookie for real routing)" },
   "gemini-3.1-pro-enhanced": { mode: 3, think: 4, extra: { 31: 2, 80: 3 }, desc: "Pro with enhanced output (experimental)" },
@@ -147,24 +158,115 @@ function envOr(env, key, fallback) {
   return v !== undefined && v !== null && v !== "" ? v : fallback;
 }
 
+const SESSION_COOKIE_NAMES = ["__Secure-1PSID", "__Secure-3PSID", "SID"];
+const MAX_COOKIE_BYTES = 64 * 1024;
+const FORWARDED_COOKIE_NAMES = [
+  "SID", "HSID", "SSID", "APISID", "SAPISID", "LSID", "OSID", "SIDCC",
+  "__Secure-1PAPISID", "__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-1PSIDRTS", "__Secure-1PSIDCC",
+  "__Secure-3PAPISID", "__Secure-3PSID", "__Secure-3PSIDTS", "__Secure-3PSIDRTS", "__Secure-3PSIDCC",
+  "__Secure-OSID", "__Host-1PLSID", "__Host-3PLSID",
+];
+
+function parseCookiePairs(cookie) {
+  const pairs = new Map();
+  for (const part of String(cookie || "").split(";")) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    const name = part.slice(0, i).trim();
+    const value = part.slice(i + 1).trim();
+    if (name && value) pairs.set(name, value);
+  }
+  return pairs;
+}
+
+function parseAuthPayload(input, strict = false) {
+  let payload = input;
+  if (typeof payload === "string") {
+    const raw = payload.trim();
+    if (raw.startsWith("{")) {
+      try { payload = JSON.parse(raw); } catch (_) { payload = { cookie: raw }; }
+    } else {
+      payload = { cookie: raw };
+    }
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = {};
+
+  const rawCookie = String(payload.cookie ?? payload.GEMINI_COOKIE ?? "")
+    .replace(/^cookie\s*:\s*/i, "")
+    .replace(/[\r\n]+[\t ]*/g, " ")
+    .trim();
+  const pairs = parseCookiePairs(rawCookie);
+  const forwarded = FORWARDED_COOKIE_NAMES.filter((name) => pairs.has(name));
+  const cookie = forwarded.map((name) => `${name}=${pairs.get(name)}`).join("; ");
+  const removedCookieCount = Math.max(0, pairs.size - forwarded.length);
+  const embeddedSapisid = pairs.get("SAPISID") || "";
+  const explicitSapisid = String(payload.sapisid ?? payload.SAPISID ?? "").trim();
+  const sapisid = explicitSapisid || embeddedSapisid;
+  const authUserRaw = payload.auth_user ?? payload.authUser ?? payload.GEMINI_AUTH_USER ?? "";
+  const authUser = authUserRaw === null || authUserRaw === "" ? null : String(authUserRaw).trim();
+  const xsrfToken = String(payload.xsrf_token ?? payload.xsrfToken ?? payload.GEMINI_XSRF_TOKEN ?? "").trim();
+  const geminiBl = String(payload.gemini_bl ?? payload.geminiBl ?? "").trim();
+
+  if (strict) {
+    if (!rawCookie) throw new Error("Cookie 不可為空");
+    if (new TextEncoder().encode(rawCookie).length > MAX_COOKIE_BYTES) throw new Error("Cookie 超過 64 KiB 上限");
+    if (!sapisid) throw new Error("缺少 SAPISID");
+    if (explicitSapisid && embeddedSapisid && !timingSafeEqual(explicitSapisid, embeddedSapisid)) {
+      throw new Error("JSON 內的 sapisid 與 Cookie 中的 SAPISID 不一致");
+    }
+    if (!SESSION_COOKIE_NAMES.some((name) => pairs.has(name))) {
+      throw new Error("缺少登入工作階段 Cookie（__Secure-1PSID、__Secure-3PSID 或 SID）");
+    }
+    if (authUser !== null && !/^\d+$/.test(authUser)) throw new Error("auth_user 必須是非負整數");
+  }
+
+  return {
+    cookie,
+    sapisid,
+    auth_user: authUser,
+    xsrf_token: xsrfToken,
+    gemini_bl: geminiBl,
+    removed_cookie_count: removedCookieCount,
+  };
+}
+
+function cookieSummary(cfg) {
+  const pairs = parseCookiePairs(cfg.cookie);
+  const sessionCookie = SESSION_COOKIE_NAMES.find((name) => pairs.has(name)) || null;
+  const issues = [];
+  if (cfg.cookie && !pairs.has("SAPISID") && !cfg.sapisid) issues.push("missing_sapisid");
+  if (cfg.cookie && !sessionCookie) issues.push("missing_session_cookie");
+  return {
+    configured: !!cfg.cookie,
+    source: cfg.cookie_source || "none",
+    updated_at: cfg.cookie_updated_at || null,
+    byte_length: cfg.cookie ? new TextEncoder().encode(cfg.cookie).length : 0,
+    cookie_count: pairs.size,
+    removed_cookie_count: cfg.removed_cookie_count || 0,
+    sapisid_present: !!cfg.sapisid,
+    session_cookie: sessionCookie,
+    xsrf_token_present: !!cfg.xsrf_token,
+    auth_user: cfg.auth_user,
+    structurally_valid: !!cfg.cookie && !issues.length,
+    issues,
+  };
+}
+
 function getConfig(env) {
   env = env || {};
-  let cookie = envOr(env, "GEMINI_COOKIE", CONFIG.GEMINI_COOKIE) || "";
-  let sapisid = envOr(env, "SAPISID", CONFIG.SAPISID) || "";
-  if (cookie && cookie.trim().startsWith("{")) {
-    // JSON 形式:{"cookie": "...", "sapisid": "..."}
-    try {
-      const o = JSON.parse(cookie);
-      cookie = o.cookie || "";
-      if (!sapisid) sapisid = o.sapisid || "";
-    } catch (_) { /* 当作原始字符串处理 */ }
-  }
-  if (cookie && !sapisid) {
-    const m = /(?:^|;\s*)SAPISID=([^;]+)/.exec(cookie);
-    if (m) sapisid = m[1];
-  }
+  const rawCookie = envOr(env, "GEMINI_COOKIE", CONFIG.GEMINI_COOKIE) || "";
+  const auth = parseAuthPayload(rawCookie);
+  const sapisid = String(envOr(env, "SAPISID", CONFIG.SAPISID) || auth.sapisid || "").trim();
+  const authUserRaw = envOr(env, "GEMINI_AUTH_USER", CONFIG.GEMINI_AUTH_USER);
+  const authUser = authUserRaw === "" || authUserRaw === null || authUserRaw === undefined
+    ? auth.auth_user
+    : String(authUserRaw);
+  const xsrfToken = String(envOr(env, "GEMINI_XSRF_TOKEN", CONFIG.GEMINI_XSRF_TOKEN) || auth.xsrf_token || "");
+  const envGeminiBl = env.GEMINI_BL !== undefined && env.GEMINI_BL !== null && env.GEMINI_BL !== ""
+    ? env.GEMINI_BL
+    : null;
   return {
-    gemini_bl: envOr(env, "GEMINI_BL", CONFIG.GEMINI_BL),
+    gemini_bl: envGeminiBl || auth.gemini_bl || CONFIG.GEMINI_BL,
     gemini_origin: String(envOr(env, "GEMINI_ORIGIN", CONFIG.GEMINI_ORIGIN)).replace(/\/$/, ""),
     upstream_socket: parseBool(envOr(env, "UPSTREAM_SOCKET", CONFIG.UPSTREAM_SOCKET), true),
     default_model: envOr(env, "DEFAULT_MODEL", CONFIG.DEFAULT_MODEL),
@@ -174,9 +276,93 @@ function getConfig(env) {
     log_requests: parseBool(envOr(env, "LOG_REQUESTS", CONFIG.LOG_REQUESTS), true),
     enable_debug: parseBool(envOr(env, "ENABLE_DEBUG", CONFIG.ENABLE_DEBUG), true),
     api_keys: parseApiKeys(envOr(env, "API_KEYS", CONFIG.API_KEYS)),
-    cookie,
+    admin_key: String(envOr(env, "ADMIN_KEY", CONFIG.ADMIN_KEY) || ""),
+    cookie: auth.cookie,
     sapisid,
+    auth_user: authUser === "" || authUser === null || authUser === undefined ? null : String(authUser),
+    xsrf_token: xsrfToken,
+    cookie_source: auth.cookie
+      ? (env.GEMINI_COOKIE !== undefined && env.GEMINI_COOKIE !== "" ? "secret" : "inline")
+      : "none",
+    cookie_updated_at: null,
+    removed_cookie_count: auth.removed_cookie_count,
   };
+}
+
+function applyStoredAuth(cfg, record) {
+  if (!record || !record.cookie) return cfg;
+  const auth = parseAuthPayload(record);
+  return {
+    ...cfg,
+    cookie: auth.cookie,
+    sapisid: auth.sapisid,
+    auth_user: auth.auth_user,
+    xsrf_token: auth.xsrf_token,
+    gemini_bl: auth.gemini_bl || cfg.gemini_bl,
+    cookie_source: "dashboard",
+    cookie_updated_at: record.updated_at || null,
+    removed_cookie_count: record.removed_cookie_count || auth.removed_cookie_count || 0,
+  };
+}
+
+function cookieStoreStub(env) {
+  if (!env || !env.COOKIE_STORE) return null;
+  return env.COOKIE_STORE.get(env.COOKIE_STORE.idFromName("settings"));
+}
+
+async function readStoredAuth(env) {
+  const stub = cookieStoreStub(env);
+  if (!stub) return null;
+  const response = await stub.fetch("https://cookie-store.internal/auth");
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Cookie store read failed (${response.status})`);
+  return response.json();
+}
+
+async function writeStoredAuth(env, record) {
+  const stub = cookieStoreStub(env);
+  if (!stub) throw new Error("COOKIE_STORE Durable Object 尚未綁定");
+  const response = await stub.fetch("https://cookie-store.internal/auth", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(record),
+  });
+  if (!response.ok) throw new Error(`Cookie store write failed (${response.status})`);
+}
+
+async function clearStoredAuth(env) {
+  const stub = cookieStoreStub(env);
+  if (!stub) throw new Error("COOKIE_STORE Durable Object 尚未綁定");
+  const response = await stub.fetch("https://cookie-store.internal/auth", { method: "DELETE" });
+  if (!response.ok) throw new Error(`Cookie store delete failed (${response.status})`);
+}
+
+async function getRequestConfig(env) {
+  const cfg = getConfig(env);
+  return applyStoredAuth(cfg, await readStoredAuth(env));
+}
+
+export class CookieStore {
+  constructor(state) { this.state = state; }
+
+  async fetch(request) {
+    if (request.method === "GET") {
+      const auth = await this.state.storage.get("auth");
+      return auth
+        ? new Response(JSON.stringify(auth), { headers: { "Content-Type": "application/json" } })
+        : new Response(null, { status: 404 });
+    }
+    if (request.method === "PUT") {
+      const auth = await request.json();
+      await this.state.storage.put("auth", auth);
+      return new Response(null, { status: 204 });
+    }
+    if (request.method === "DELETE") {
+      await this.state.storage.delete("auth");
+      return new Response(null, { status: 204 });
+    }
+    return new Response(null, { status: 405 });
+  }
 }
 
 // ─── 小工具 ──────────────────────────────────────────────────────────────────
@@ -296,11 +482,24 @@ function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
   return new URLSearchParams({ "f.req": JSON.stringify(outer) }).toString();
 }
 
+function accountPrefix(cfg) {
+  return cfg.auth_user === null || cfg.auth_user === undefined || cfg.auth_user === ""
+    ? ""
+    : `/u/${cfg.auth_user}`;
+}
+
+function applyAccountHeaders(headers, cfg) {
+  if (cfg.auth_user !== null && cfg.auth_user !== undefined && cfg.auth_user !== "") {
+    headers["X-Goog-AuthUser"] = String(cfg.auth_user);
+  }
+  return headers;
+}
+
 function getUrl(cfg) {
   const reqid = (nowSec() * 1000 + Math.floor(Math.random() * 1000)) % 10000000;
   const origin = cfg.gemini_origin || "https://gemini.google.com";
   return (
-    origin +
+    origin + accountPrefix(cfg) +
     "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate" +
     `?bl=${encodeURIComponent(cfg.gemini_bl)}&hl=en&_reqid=${reqid}&rt=c`
   );
@@ -310,10 +509,11 @@ async function buildHeaders(cfg) {
   const headers = {
     "Content-Type": "application/x-www-form-urlencoded",
     "Origin": "https://gemini.google.com",
-    "Referer": "https://gemini.google.com/app",
+    "Referer": `https://gemini.google.com${accountPrefix(cfg)}/app`,
     "X-Same-Domain": "1",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
   };
+  applyAccountHeaders(headers, cfg);
   if (cfg.cookie) headers["Cookie"] = cfg.cookie;
   if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
   return headers;
@@ -483,6 +683,12 @@ let _pageTokens = { key: "", tokens: null, ts: 0 };
 const GEMINI_BL_CACHE_TTL_SEC = 3600;
 let _geminiBlMemory = { origin: "", value: "", expiresAt: 0 };
 
+async function authCacheKey(cfg) {
+  const raw = [cfg.gemini_origin || "https://gemini.google.com", cfg.auth_user ?? "", cfg.cookie || "", cfg.xsrf_token || ""].join("\n");
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw));
+  return [...new Uint8Array(digest)].slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function extractGeminiBl(html) {
   const cfb2h = /"cfb2h":"([^"]+)"/.exec(html || "");
   if (cfb2h && /^boq_assistant-bard-web-server_/.test(cfb2h[1])) return cfb2h[1];
@@ -523,8 +729,10 @@ async function refreshGeminiBl(cfg) {
 
   try {
     const headers = { "User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9" };
+    applyAccountHeaders(headers, cfg);
     if (cfg.cookie) headers.Cookie = cfg.cookie;
-    const resp = await httpFetch(origin + "/app", { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
+    if (cfg.sapisid) headers.Authorization = await makeSapisidHash(cfg.sapisid);
+    const resp = await httpFetch(origin + accountPrefix(cfg) + "/app", { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
     const bl = extractGeminiBl(await resp.text());
     if (bl) {
       const expiresAt = Date.now() + GEMINI_BL_CACHE_TTL_SEC * 1000;
@@ -574,13 +782,15 @@ function parseImageUrl(url) {
 async function getPageTokens(cfg) {
   const now = Date.now();
   const origin = cfg.gemini_origin || "https://gemini.google.com";
-  const key = `${origin}|${cfg.cookie ? "auth" : "guest"}`;
+  const key = await authCacheKey(cfg);
   if (_pageTokens.key === key && _pageTokens.tokens && now - _pageTokens.ts < 600000) return _pageTokens.tokens;
   const headers = { "User-Agent": _UA };
+  applyAccountHeaders(headers, cfg);
   if (cfg.cookie) headers["Cookie"] = cfg.cookie;
-  const tokens = {};
+  if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
+  const tokens = cfg.xsrf_token ? { at: cfg.xsrf_token } : {};
   try {
-    const resp = await httpFetch(`${origin}/app`, { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
+    const resp = await httpFetch(`${origin}${accountPrefix(cfg)}/app`, { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
     const html = await resp.text();
     for (const [k, re] of [["push_id", /"qKIAYe":"([^"]+)"/], ["pctx", /"Ylro7b":"([^"]+)"/], ["at", /"SNlM0e":"([^"]+)"/]]) {
       const mm = re.exec(html);
@@ -755,8 +965,8 @@ function routeMetadata(modelId, actualModel) {
 async function buildRequestBody(cfg, prompt, modelId, thinkMode, fileRefs, extra) {
   let body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
   if (cfg.cookie) {
-    const tokens = await getPageTokens(cfg);
-    if (tokens.at) body += "&at=" + encodeURIComponent(tokens.at);
+    const at = cfg.xsrf_token || (await getPageTokens(cfg)).at;
+    if (at) body += "&at=" + encodeURIComponent(at);
   }
   return body;
 }
@@ -1458,6 +1668,17 @@ function jsonResponse(data, status = 200, extra = {}) {
   });
 }
 
+function privateJsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
 function parseJson(text) {
   try {
     return JSON.parse(text);
@@ -1480,6 +1701,17 @@ function authorized(request, url, cfg) {
     url ? url.searchParams.get("key") : null,
   ];
   return candidates.some((k) => k && keys.some((valid) => timingSafeEqual(k, valid)));
+}
+
+function adminAuthorized(request, cfg) {
+  const validKeys = cfg.admin_key ? [cfg.admin_key] : (cfg.api_keys || []);
+  if (!validKeys.length) return false;
+  const auth = request.headers.get("authorization") || "";
+  const candidates = [
+    request.headers.get("x-admin-key"),
+    auth.startsWith("Bearer ") ? auth.slice(7) : null,
+  ];
+  return candidates.some((key) => key && validKeys.some((valid) => timingSafeEqual(key, valid)));
 }
 
 /**
@@ -1893,28 +2125,668 @@ async function handleDebug(cfg) {
   });
 }
 
+async function safeModelProbe(cfg, name, detailed = false) {
+  try {
+    return await probeModelRoute(cfg, name, detailed);
+  } catch (e) {
+    return {
+      requested_model: name,
+      upstream_model: null,
+      route_status: "unknown",
+      available: false,
+      error: String((e && e.message) || e),
+    };
+  }
+}
+
+async function handleAdminStatus(cfg, env, url) {
+  const verify = parseBool(url.searchParams.get("verify"), false);
+  const live = parseBool(url.searchParams.get("live"), false);
+  let inspection = null;
+  let cookieVerification = null;
+
+  if (live) {
+    inspection = await inspectModelRoutes(cfg);
+    cookieVerification = inspection.cookie;
+  } else if (verify && cfg.cookie) {
+    const pageTokenFound = !!(cfg.xsrf_token || (await getPageTokens(cfg)).at);
+    const proRoute = await safeModelProbe(cfg, "gemini-3.1-pro", true);
+    cookieVerification = cookieRouteSummary(cfg, proRoute, pageTokenFound);
+  }
+
+  return privateJsonResponse({
+    status: "ok",
+    version: VERSION,
+    gemini_bl: cfg.gemini_bl,
+    gemini_origin: cfg.gemini_origin,
+    default_model: cfg.default_model,
+    socket_enabled: cfg.upstream_socket,
+    storage_available: !!cookieStoreStub(env),
+    cookie: {
+      ...cookieSummary(cfg),
+      verification: cookieVerification,
+    },
+    models: Object.entries(MODELS).map(([id, model]) => ({
+      id,
+      description: model.desc,
+      ...(inspection ? inspection.routes[id] : {}),
+    })),
+  });
+}
+
+async function handleCookieImport(request, cfg, env) {
+  if (!cookieStoreStub(env)) {
+    return privateJsonResponse({
+      error: { message: "COOKIE_STORE 尚未綁定；請用 wrangler.toml 部署，或繼續使用 GEMINI_COOKIE Secret。" },
+    }, 503);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (_) {
+    return privateJsonResponse({ error: { message: "請提供 JSON 請求" } }, 400);
+  }
+
+  try {
+    const input = body && Object.prototype.hasOwnProperty.call(body, "auth") ? body.auth : body;
+    const auth = parseAuthPayload(input, true);
+    const record = { ...auth, updated_at: new Date().toISOString() };
+    await writeStoredAuth(env, record);
+    const importedCfg = applyStoredAuth(cfg, record);
+    return privateJsonResponse({
+      status: "imported",
+      cookie: cookieSummary(importedCfg),
+      message: "Cookie 已持久匯入；原文不會由管理 API 回傳。",
+    });
+  } catch (e) {
+    return privateJsonResponse({ error: { message: String((e && e.message) || e) } }, 400);
+  }
+}
+
+async function handleCookieDelete(cfg, env) {
+  try {
+    await clearStoredAuth(env);
+    const fallback = getConfig(env);
+    return privateJsonResponse({
+      status: "deleted",
+      cookie: cookieSummary(fallback),
+      message: fallback.cookie ? "已移除面板覆寫，恢復使用環境 Secret。" : "已移除面板 Cookie。",
+    });
+  } catch (e) {
+    return privateJsonResponse({ error: { message: String((e && e.message) || e) } }, 503);
+  }
+}
+
+function dashboardResponse(cfg) {
+  const nonce = randHex(32);
+  const boot = JSON.stringify({
+    version: VERSION,
+    defaultModel: cfg.default_model,
+    models: Object.entries(MODELS).map(([id, model]) => ({ id, description: model.desc })),
+  }).replace(/</g, "\\u003c");
+
+  const html = `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Gemini Bridge · Worker Console</title>
+  <style nonce="${nonce}">
+    :root {
+      --canvas: #dfe7e9;
+      --paper: #f8faf9;
+      --ink: #152127;
+      --muted: #52636b;
+      --line: #c7d2d6;
+      --line-strong: #92a4ab;
+      --blue: #2456c7;
+      --blue-dark: #163b8d;
+      --blue-soft: #e5ecff;
+      --green: #19704f;
+      --green-soft: #dff3e9;
+      --amber: #8a5700;
+      --amber-soft: #fff0cc;
+      --red: #a32929;
+      --red-soft: #fde6e4;
+      --radius: 14px;
+      --shadow: 0 18px 42px rgba(30, 51, 60, .13);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: var(--canvas);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; min-width: 320px; background: var(--canvas); color: var(--ink); }
+    button, input, textarea, select { font: inherit; }
+    button, select { cursor: pointer; }
+    a { color: inherit; }
+    .skip-link { position: fixed; left: 1rem; top: -5rem; z-index: 20; padding: .7rem 1rem; background: var(--ink); color: #fff; border-radius: 8px; }
+    .skip-link:focus { top: 1rem; }
+    .shell { width: min(1180px, calc(100% - 32px)); margin: 28px auto; background: var(--paper); border-radius: 18px; box-shadow: var(--shadow); overflow: hidden; }
+    .topbar { min-height: 76px; display: flex; align-items: center; gap: 24px; padding: 14px 24px; color: #fff; background: #17252c; }
+    .brand { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; flex: 0 0 auto; }
+    .brand svg { width: 34px; height: 34px; }
+    .brand-copy { display: grid; gap: 1px; }
+    .brand-copy strong { font-size: .98rem; letter-spacing: -.01em; }
+    .brand-copy span { color: #b9c9cf; font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
+    .access { margin-left: auto; display: grid; grid-template-columns: repeat(2, minmax(120px, 220px)) auto; align-items: end; gap: 8px; }
+    .access label { display: grid; gap: 5px; color: #c6d3d8; font-size: .75rem; }
+    .access input { width: 100%; min-height: 38px; border: 1px solid #4b616a; border-radius: 9px; padding: 0 11px; color: #fff; background: #22343c; font-size: 1rem; }
+    main { display: block; }
+    .hero { padding: clamp(38px, 6vw, 76px) clamp(24px, 6vw, 72px) 32px; }
+    .hero-copy { max-width: 760px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { max-width: 14ch; margin-bottom: 18px; font-size: 4.4rem; line-height: .98; letter-spacing: -.04em; text-wrap: balance; }
+    .hero-copy p { max-width: 66ch; margin-bottom: 30px; color: var(--muted); font-size: 1.03rem; line-height: 1.65; }
+    .health-strip { display: grid; grid-template-columns: 1.1fr 1.8fr 1.2fr; border-block: 1px solid var(--line); }
+    .datum { min-width: 0; padding: 16px 18px 16px 0; }
+    .datum + .datum { padding-left: 18px; border-left: 1px solid var(--line); }
+    .datum span { display: block; margin-bottom: 6px; color: var(--muted); font-size: .72rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .datum strong { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: .9rem; font-weight: 650; }
+    .datum code { overflow: hidden; color: var(--ink); font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .82rem; text-overflow: ellipsis; white-space: nowrap; }
+    .dot { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; background: var(--line-strong); box-shadow: 0 0 0 4px rgba(146, 164, 171, .2); }
+    .dot.ok { background: var(--green); box-shadow: 0 0 0 4px rgba(25, 112, 79, .16); }
+    .section-nav { display: flex; gap: 7px; padding: 0 clamp(24px, 6vw, 72px) 30px; overflow-x: auto; }
+    .section-nav a { padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .83rem; font-weight: 650; text-decoration: none; white-space: nowrap; }
+    .section-nav a:hover { color: var(--blue-dark); border-color: #8aa5e8; background: var(--blue-soft); }
+    .surface { padding: clamp(34px, 5vw, 58px) clamp(24px, 6vw, 72px); border-top: 1px solid var(--line); }
+    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
+    .section-head h2 { margin-bottom: 7px; font-size: 2.1rem; line-height: 1.08; letter-spacing: -.03em; }
+    .section-head p { max-width: 64ch; margin-bottom: 0; color: var(--muted); line-height: 1.55; }
+    .button { min-height: 42px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 0; border-radius: 9px; padding: 0 15px; color: #fff; background: var(--blue); font-weight: 700; transition: background-color .18s ease, box-shadow .18s ease, transform .18s ease; }
+    .button:hover { background: var(--blue-dark); box-shadow: 0 8px 18px rgba(36, 86, 199, .2); transform: translateY(-1px); }
+    .button:active { transform: translateY(0); }
+    .button.secondary { border: 1px solid var(--line-strong); color: var(--ink); background: transparent; }
+    .topbar .button.secondary { color: #fff; border-color: #5e737c; }
+    .button.secondary:hover { color: var(--blue-dark); border-color: #7192de; background: var(--blue-soft); box-shadow: none; }
+    .topbar .button.secondary:hover { color: #fff; border-color: #9db3bc; background: #304750; }
+    .button.danger { color: var(--red); border: 1px solid #e0aaa5; background: transparent; }
+    .button.danger:hover { color: #7b1c1c; background: var(--red-soft); box-shadow: none; }
+    .button:disabled { cursor: wait; opacity: .58; transform: none; box-shadow: none; }
+    .model-list { border-block: 1px solid var(--line-strong); }
+    .model-row { display: grid; grid-template-columns: minmax(210px, .85fr) minmax(260px, 1.4fr) 130px; gap: 24px; align-items: center; min-height: 74px; padding: 13px 4px; border-bottom: 1px solid var(--line); }
+    .model-row:last-child { border-bottom: 0; }
+    .model-id { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .86rem; font-weight: 700; overflow-wrap: anywhere; }
+    .model-desc { color: var(--muted); font-size: .9rem; line-height: 1.45; }
+    .badge { width: max-content; display: inline-flex; align-items: center; gap: 7px; border-radius: 999px; padding: 6px 9px; color: var(--muted); background: #e9eef0; font-size: .72rem; font-weight: 750; white-space: nowrap; }
+    .badge.good { color: var(--green); background: var(--green-soft); }
+    .badge.warn { color: var(--amber); background: var(--amber-soft); }
+    .badge.bad { color: var(--red); background: var(--red-soft); }
+    .cookie-layout { display: grid; grid-template-columns: minmax(260px, .75fr) minmax(360px, 1.25fr); gap: clamp(32px, 6vw, 72px); }
+    .status-panel h3, .import-panel h3, .play-form h3, .result-panel h3 { margin-bottom: 9px; font-size: 1.12rem; letter-spacing: -.015em; }
+    .status-panel > p, .import-panel > p { color: var(--muted); line-height: 1.55; }
+    .cookie-state { margin: 26px 0; padding-block: 20px; border-block: 1px solid var(--line); }
+    .cookie-state strong { display: block; margin-bottom: 8px; font-size: 1.35rem; letter-spacing: -.02em; }
+    .cookie-state span { color: var(--muted); font-size: .88rem; }
+    .facts { display: grid; gap: 12px; margin: 0; }
+    .facts div { display: flex; justify-content: space-between; gap: 24px; }
+    .facts dt { color: var(--muted); }
+    .facts dd { margin: 0; font-weight: 700; text-align: right; }
+    .inline-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 24px; }
+    .field { display: grid; gap: 8px; margin-bottom: 17px; }
+    .field label { font-size: .84rem; font-weight: 750; }
+    .field small { color: var(--muted); line-height: 1.5; }
+    textarea, select, .text-input { width: 100%; border: 1px solid var(--line-strong); border-radius: 10px; padding: 12px 13px; color: var(--ink); background: #fff; }
+    textarea { min-height: 148px; resize: vertical; line-height: 1.5; }
+    textarea::placeholder, input::placeholder { color: #718188; opacity: 1; }
+    textarea:focus, select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 3px solid rgba(36, 86, 199, .28); outline-offset: 2px; border-color: var(--blue); }
+    .security-note { margin: 18px 0 0; padding: 13px 15px; border-radius: 10px; color: #374c55; background: #e8eff1; font-size: .82rem; line-height: 1.55; }
+    .play-layout { display: grid; grid-template-columns: minmax(320px, .9fr) minmax(360px, 1.1fr); gap: clamp(28px, 5vw, 56px); align-items: start; }
+    .play-form textarea { min-height: 180px; }
+    .result-panel { min-width: 0; }
+    .result-meta { min-height: 24px; margin-bottom: 9px; color: var(--muted); font-size: .78rem; }
+    .result { min-height: 292px; margin: 0; overflow: auto; border: 1px solid #2a3b43; border-radius: 12px; padding: 18px; color: #dce8eb; background: #17252c; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .85rem; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .result.fresh { animation: result-reveal .38s cubic-bezier(.16, 1, .3, 1); }
+    @keyframes result-reveal { from { clip-path: inset(0 0 18% 0); filter: blur(2px); } to { clip-path: inset(0); filter: blur(0); } }
+    .endpoint { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 24px; padding: 14px 0; border-top: 1px solid var(--line); }
+    .endpoint code { color: var(--blue-dark); font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .86rem; overflow-wrap: anywhere; }
+    .text-button { border: 0; padding: 6px 0; color: var(--blue-dark); background: transparent; font-weight: 750; }
+    .text-button:hover { text-decoration: underline; text-underline-offset: 3px; }
+    .footer { display: flex; justify-content: space-between; gap: 20px; padding: 22px clamp(24px, 6vw, 72px); border-top: 1px solid var(--line); color: var(--muted); font-size: .78rem; }
+    .toast { position: fixed; right: 22px; bottom: 22px; z-index: 30; max-width: min(420px, calc(100vw - 44px)); padding: 13px 16px; border-radius: 10px; color: #fff; background: #17252c; box-shadow: 0 12px 30px rgba(15, 33, 41, .24); transform: translateY(20px); opacity: 0; pointer-events: none; transition: transform .24s cubic-bezier(.16, 1, .3, 1), opacity .2s ease; }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.error { background: #7f2424; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    @media (max-width: 760px) {
+      .shell { width: 100%; margin: 0; border-radius: 0; }
+      .topbar { align-items: stretch; flex-direction: column; gap: 14px; padding: 18px 20px; }
+      .access { width: 100%; margin-left: 0; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+      .access .button { grid-column: 1 / -1; }
+      .hero { padding-top: 42px; }
+      h1 { font-size: 3rem; }
+      .section-head h2 { font-size: 1.8rem; }
+      .health-strip { grid-template-columns: 1fr; }
+      .datum { padding: 14px 0; }
+      .datum + .datum { padding-left: 0; border-left: 0; border-top: 1px solid var(--line); }
+      .section-head { align-items: stretch; flex-direction: column; }
+      .section-head .button { width: 100%; }
+      .model-row { grid-template-columns: 1fr auto; gap: 7px 14px; padding-block: 16px; }
+      .model-desc { grid-column: 1 / -1; }
+      .cookie-layout, .play-layout { grid-template-columns: 1fr; }
+      .import-panel, .result-panel { padding-top: 30px; border-top: 1px solid var(--line); }
+      .footer { flex-direction: column; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <!--
+    THESIS: One operator bench exposes route truth, credential health, and a real request without dashboard clutter.
+    OWN-WORLD: Cool daylight paper, dense ink, cobalt action, ruled data rows, and restrained status color.
+    STORY: Confirm the Worker, inspect models and Cookie health, then prove the route in Playground.
+    FIRST VIEWPORT: Large operational headline over a three-part health rail; section controls remain immediately below.
+    FORM: Single-page operator console, direct functional extension; seed key scoped-worker-console.
+    FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
+  -->
+  <a class="skip-link" href="#content">跳到主要內容</a>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Gemini Bridge 首頁">
+        <svg viewBox="0 0 36 36" aria-hidden="true">
+          <rect x="2" y="2" width="14" height="14" rx="4" fill="#8eb0ff"/>
+          <rect x="20" y="2" width="14" height="14" rx="7" fill="#4fd09b"/>
+          <rect x="2" y="20" width="14" height="14" rx="7" fill="#ffffff"/>
+          <rect x="20" y="20" width="14" height="14" rx="4" fill="#f1bf58"/>
+        </svg>
+        <span class="brand-copy"><strong>Gemini Bridge</strong><span>Worker Console</span></span>
+      </a>
+      <div class="access">
+        <label for="api-key">API 金鑰
+          <input id="api-key" type="password" autocomplete="off" placeholder="模型與 Playground">
+        </label>
+        <label for="admin-key">Admin 金鑰
+          <input id="admin-key" type="password" autocomplete="off" placeholder="留空則沿用 API 金鑰">
+        </label>
+        <button class="button secondary" id="connect-key" type="button">套用</button>
+      </div>
+    </header>
+
+    <main id="content">
+      <section class="hero" aria-labelledby="page-title">
+        <div class="hero-copy">
+          <h1 id="page-title">Worker 狀態，一眼看完。</h1>
+          <p>檢查實際模型路由、管理 Gemini 登入 Cookie，並從同一個位址送出測試請求。Cookie 原文只會送往這個 Worker，不會由狀態 API 回傳。</p>
+        </div>
+        <div class="health-strip" aria-live="polite">
+          <div class="datum"><span>Worker</span><strong><i class="dot" id="health-dot"></i><b id="health-state">連線中</b></strong></div>
+          <div class="datum"><span>Gemini build</span><strong><code id="build-value">讀取中</code></strong></div>
+          <div class="datum"><span>版本</span><strong><code id="version-value">${VERSION}</code></strong></div>
+        </div>
+      </section>
+
+      <nav class="section-nav" aria-label="頁面區段">
+        <a href="#models">模型</a><a href="#cookie">Cookie</a><a href="#playground">Playground</a>
+      </nav>
+
+      <section class="surface" id="models" aria-labelledby="models-title">
+        <div class="section-head">
+          <div><h2 id="models-title">模型與實際路由</h2><p>一般清單顯示穩定別名；即時探測會真的向 Gemini 各送一個短請求，確認上游回到哪個模型。</p></div>
+          <button class="button secondary" id="probe-models" type="button">即時探測</button>
+        </div>
+        <div class="model-list" id="model-list" role="table" aria-label="模型清單"></div>
+      </section>
+
+      <section class="surface" id="cookie" aria-labelledby="cookie-title">
+        <div class="section-head"><div><h2 id="cookie-title">Cookie 狀態與匯入</h2><p>支援完整 Cookie header，以及上游 Cookie Sync 擴充輸出的 <code>gemini-auth.json</code>。</p></div></div>
+        <div class="cookie-layout">
+          <div class="status-panel">
+            <h3>目前登入鏈</h3>
+            <p>先做結構檢查，再用 Pro 路由探測驗證這份登入態是否真的被上游接受。</p>
+            <div class="cookie-state"><strong id="cookie-state">需要管理金鑰</strong><span id="cookie-detail">輸入金鑰後讀取，不會顯示 Cookie 值。</span></div>
+            <dl class="facts">
+              <div><dt>來源</dt><dd id="cookie-source">—</dd></div>
+              <div><dt>工作階段</dt><dd id="cookie-session">—</dd></div>
+              <div><dt>XSRF token</dt><dd id="cookie-xsrf">—</dd></div>
+              <div><dt>實際 Pro 路由</dt><dd id="cookie-route">尚未探測</dd></div>
+            </dl>
+            <div class="inline-actions">
+              <button class="button secondary" id="verify-cookie" type="button">驗證 Cookie</button>
+              <button class="button danger" id="clear-cookie" type="button">移除面板覆寫</button>
+            </div>
+          </div>
+          <form class="import-panel" id="cookie-form">
+            <h3>匯入新的登入態</h3>
+            <p>貼上 raw Cookie，或整份 JSON。匯入成功後輸入框會立即清空。</p>
+            <div class="field">
+              <label for="cookie-input">Cookie / gemini-auth.json</label>
+              <textarea id="cookie-input" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="SAPISID=...; __Secure-1PSID=...; ..."></textarea>
+              <small>至少需要 SAPISID，以及 SID、__Secure-1PSID、__Secure-3PSID 其中之一。</small>
+            </div>
+            <button class="button" id="import-cookie" type="submit">持久匯入</button>
+            <p class="security-note">API 呼叫使用 <code>API_KEYS</code>；Cookie 管理使用 <code>ADMIN_KEY</code>，只有未設定 Admin key 時才接受 API key。持久資料由 <code>COOKIE_STORE</code> Durable Object 保存。</p>
+          </form>
+        </div>
+      </section>
+
+      <section class="surface" id="playground" aria-labelledby="playground-title">
+        <div class="section-head"><div><h2 id="playground-title">Playground</h2><p>使用同一組 OpenAI 相容 API，回覆會同時顯示實際上游模型與路由狀態。</p></div></div>
+        <div class="play-layout">
+          <form class="play-form" id="play-form">
+            <h3>送出測試</h3>
+            <div class="field"><label for="play-model">模型</label><select id="play-model"></select></div>
+            <div class="field"><label for="play-prompt">訊息</label><textarea id="play-prompt" required placeholder="請用一句話確認服務正常。">請只回答：Worker OK</textarea></div>
+            <button class="button" id="send-prompt" type="submit">送出請求</button>
+          </form>
+          <div class="result-panel">
+            <h3>回覆</h3>
+            <div class="result-meta" id="result-meta">尚未送出請求</div>
+            <pre class="result" id="result" tabindex="0">回覆會顯示在這裡。</pre>
+          </div>
+        </div>
+        <div class="endpoint"><code id="base-url">/v1</code><button class="text-button" id="copy-url" type="button">複製 API Base URL</button></div>
+      </section>
+    </main>
+    <footer class="footer"><span>Gemini Bridge ${VERSION}</span><span>Cookie 值永不出現在狀態回應或瀏覽器儲存。</span></footer>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script nonce="${nonce}">
+    const BOOT = ${boot};
+    const byId = function (id) { return document.getElementById(id); };
+    let apiKey = sessionStorage.getItem("gemini-worker-api-key") || "";
+    let adminKey = sessionStorage.getItem("gemini-worker-admin-key") || "";
+    let toastTimer;
+
+    function showToast(message, error) {
+      const toast = byId("toast");
+      toast.textContent = message;
+      toast.className = "toast show" + (error ? " error" : "");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(function () { toast.className = "toast"; }, 4200);
+    }
+
+    function requestHeaders(admin, json) {
+      const headers = {};
+      const key = admin ? (adminKey || apiKey) : apiKey;
+      if (json) headers["Content-Type"] = "application/json";
+      if (key) {
+        headers.Authorization = "Bearer " + key;
+        if (admin) headers["X-Admin-Key"] = key;
+      }
+      return headers;
+    }
+
+    async function readJson(response) {
+      let data = null;
+      try { data = await response.json(); } catch (_) {}
+      if (!response.ok) {
+        const message = data && data.error ? (data.error.message || data.error) : "HTTP " + response.status;
+        throw new Error(message);
+      }
+      return data;
+    }
+
+    function statusBadge(route) {
+      const badge = document.createElement("span");
+      const status = route && route.route_status;
+      badge.className = "badge" + (status === "matched" || status === "auto" ? " good" : status === "fallback" ? " warn" : "");
+      badge.textContent = status === "matched" ? "路由吻合" : status === "auto" ? "自動選擇" : status === "fallback" ? "已回退" : "尚未探測";
+      return badge;
+    }
+
+    function renderModels(models) {
+      const list = byId("model-list");
+      const select = byId("play-model");
+      list.textContent = "";
+      select.textContent = "";
+      models.forEach(function (model) {
+        const row = document.createElement("div");
+        row.className = "model-row";
+        row.setAttribute("role", "row");
+        const id = document.createElement("div");
+        id.className = "model-id";
+        id.setAttribute("role", "cell");
+        id.textContent = model.id;
+        const desc = document.createElement("div");
+        desc.className = "model-desc";
+        desc.setAttribute("role", "cell");
+        desc.textContent = model.upstream_model ? model.description + " · upstream: " + model.upstream_model : model.description;
+        row.append(id, desc, statusBadge(model));
+        list.appendChild(row);
+        const option = document.createElement("option");
+        option.value = model.id;
+        option.textContent = model.id;
+        option.selected = model.id === BOOT.defaultModel;
+        select.appendChild(option);
+      });
+    }
+
+    function sourceLabel(source) {
+      return source === "dashboard" ? "面板持久匯入" : source === "secret" ? "Worker Secret" : source === "inline" ? "程式內設定" : "未設定";
+    }
+
+    function renderCookie(cookie) {
+      const configured = cookie && cookie.configured;
+      byId("cookie-state").textContent = configured ? (cookie.structurally_valid ? "結構完整" : "設定不完整") : "尚未設定 Cookie";
+      byId("cookie-detail").textContent = configured
+        ? String(cookie.cookie_count) + " 個登入欄位，" + String(cookie.byte_length) + " bytes" + (cookie.removed_cookie_count ? "；已移除 " + cookie.removed_cookie_count + " 個非必要欄位。" : "；Cookie 值已遮蔽。")
+        : "匿名文字請求仍可使用；圖片與真正 Pro 路由需要登入態。";
+      byId("cookie-source").textContent = sourceLabel(cookie && cookie.source);
+      byId("cookie-session").textContent = cookie && cookie.session_cookie ? cookie.session_cookie : "缺少";
+      byId("cookie-xsrf").textContent = cookie && cookie.xsrf_token_present ? "已匯入" : configured ? "請求時自動抓取" : "—";
+      const verification = cookie && cookie.verification;
+      byId("cookie-route").textContent = !verification ? "尚未探測" : verification.pro_route_verified ? "已驗證 Pro" : verification.actual_model ? "回到 " + verification.actual_model : "無法確認";
+    }
+
+    async function loadHealth() {
+      try {
+        const data = await readJson(await fetch("/health"));
+        byId("health-dot").className = "dot ok";
+        byId("health-state").textContent = "正常";
+        byId("build-value").textContent = data.gemini_bl || "未取得";
+        byId("version-value").textContent = data.version || BOOT.version;
+      } catch (error) {
+        byId("health-state").textContent = "無法連線";
+        byId("build-value").textContent = error.message;
+      }
+    }
+
+    async function loadAdmin(mode) {
+      const suffix = mode === "verify" ? "?verify=1" : "";
+      const data = await readJson(await fetch("/admin/status" + suffix, { headers: requestHeaders(true, false) }));
+      renderCookie(data.cookie);
+      return data;
+    }
+
+    async function loadLiveModels() {
+      const data = await readJson(await fetch("/v1/models?live=1", { headers: requestHeaders(false, false) }));
+      renderModels(data.data || []);
+      return data;
+    }
+
+    function setBusy(button, busy, text) {
+      if (!button.dataset.label) button.dataset.label = button.textContent;
+      button.disabled = busy;
+      button.textContent = busy ? text : button.dataset.label;
+    }
+
+    byId("connect-key").addEventListener("click", async function () {
+      apiKey = byId("api-key").value.trim();
+      adminKey = byId("admin-key").value.trim();
+      if (apiKey) sessionStorage.setItem("gemini-worker-api-key", apiKey);
+      else sessionStorage.removeItem("gemini-worker-api-key");
+      if (adminKey) sessionStorage.setItem("gemini-worker-admin-key", adminKey);
+      else sessionStorage.removeItem("gemini-worker-admin-key");
+      try {
+        await loadAdmin("");
+        showToast("金鑰已套用，管理狀態已載入", false);
+      } catch (error) {
+        renderCookie(null);
+        byId("cookie-state").textContent = "管理存取未通過";
+        byId("cookie-detail").textContent = error.message;
+        showToast(error.message, true);
+      }
+    });
+
+    byId("probe-models").addEventListener("click", async function (event) {
+      setBusy(event.currentTarget, true, "探測中…");
+      try { await loadLiveModels(); showToast("模型路由探測完成", false); }
+      catch (error) { showToast(error.message, true); }
+      finally { setBusy(event.currentTarget, false, ""); }
+    });
+
+    byId("verify-cookie").addEventListener("click", async function (event) {
+      setBusy(event.currentTarget, true, "驗證中…");
+      try { await loadAdmin("verify"); showToast("Cookie 驗證完成", false); }
+      catch (error) { showToast(error.message, true); }
+      finally { setBusy(event.currentTarget, false, ""); }
+    });
+
+    byId("cookie-form").addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const button = byId("import-cookie");
+      const value = byId("cookie-input").value.trim();
+      if (!value) return;
+      setBusy(button, true, "匯入中…");
+      try {
+        const data = await readJson(await fetch("/admin/cookie", {
+          method: "PUT",
+          headers: requestHeaders(true, true),
+          body: JSON.stringify({ auth: value })
+        }));
+        byId("cookie-input").value = "";
+        renderCookie(data.cookie);
+        showToast(data.message, false);
+      } catch (error) { showToast(error.message, true); }
+      finally { setBusy(button, false, ""); }
+    });
+
+    byId("clear-cookie").addEventListener("click", async function (event) {
+      if (!confirm("移除面板匯入的 Cookie，並恢復環境 Secret？")) return;
+      setBusy(event.currentTarget, true, "移除中…");
+      try {
+        const data = await readJson(await fetch("/admin/cookie", { method: "DELETE", headers: requestHeaders(true, false) }));
+        renderCookie(data.cookie);
+        showToast(data.message, false);
+      } catch (error) { showToast(error.message, true); }
+      finally { setBusy(event.currentTarget, false, ""); }
+    });
+
+    byId("play-form").addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const button = byId("send-prompt");
+      const result = byId("result");
+      const started = performance.now();
+      setBusy(button, true, "等待上游…");
+      result.className = "result";
+      result.textContent = "請求處理中…";
+      try {
+        const data = await readJson(await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers: requestHeaders(false, true),
+          body: JSON.stringify({
+            model: byId("play-model").value,
+            messages: [{ role: "user", content: byId("play-prompt").value }],
+            stream: false
+          })
+        }));
+        const message = data.choices && data.choices[0] && data.choices[0].message;
+        result.textContent = message && message.content ? message.content : JSON.stringify(data, null, 2);
+        const elapsed = (performance.now() - started) / 1000;
+        byId("result-meta").textContent = elapsed.toFixed(1) + "s · upstream " + (data.upstream_model || "unknown") + " · " + (data.route_status || "unknown");
+        void result.offsetWidth;
+        result.className = "result fresh";
+      } catch (error) {
+        result.textContent = "請求失敗：" + error.message + "\\n\\n請確認 API key、Cookie 狀態與上游連線。";
+        byId("result-meta").textContent = "請求失敗";
+        showToast(error.message, true);
+      } finally { setBusy(button, false, ""); }
+    });
+
+    byId("copy-url").addEventListener("click", async function () {
+      const value = location.origin + "/v1";
+      try { await navigator.clipboard.writeText(value); showToast("API Base URL 已複製", false); }
+      catch (_) { showToast("無法存取剪貼簿，請手動複製", true); }
+    });
+
+    byId("api-key").value = apiKey;
+    byId("admin-key").value = adminKey;
+    byId("base-url").textContent = location.origin + "/v1";
+    renderModels(BOOT.models);
+    loadHealth();
+    if (adminKey || apiKey) loadAdmin("").catch(function (error) { showToast(error.message, true); });
+  </script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Referrer-Policy": "no-referrer",
+      "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+    },
+  });
+}
+
 // ─── 路由 ────────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
-    const cfg = getConfig(env);
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+    const adminPath = path.startsWith("/admin/");
+    const publicGet = method === "GET" && (path === "/" || path === "/health");
+    let cfg;
+
+    try {
+      cfg = publicGet ? getConfig(env) : await getRequestConfig(env);
+    } catch (e) {
+      const baseCfg = getConfig(env);
+      log(baseCfg, `Cookie store unavailable; refusing fallback credentials: ${e}`);
+      const error = { error: { code: "cookie_store_unavailable", message: "Cookie 儲存暫時無法讀取；為避免切換到錯誤帳號，本次請求已拒絕。" } };
+      return adminPath ? privateJsonResponse(error, 503) : jsonResponse(error, 503);
+    }
 
     if (method === "OPTIONS") {
+      if (adminPath) return new Response(null, { status: 204, headers: { "Allow": "GET, PUT, DELETE, OPTIONS" } });
       return new Response(null, {
         status: 204,
         headers: { ...corsHeaders(), "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "*" },
       });
     }
 
-    // 鉴权:配置了 API_KEYS 时,除健康检查 "/" 外的所有接口都需要有效 key
+    if (adminPath) {
+      if (!cfg.admin_key && !(cfg.api_keys || []).length) {
+        return privateJsonResponse({ error: { message: "管理功能已停用；請先設定 ADMIN_KEY 或 API_KEYS。" } }, 403);
+      }
+      if (!adminAuthorized(request, cfg)) {
+        return privateJsonResponse({ error: { message: "管理金鑰無效" } }, 401);
+      }
+    }
+
+    if (!adminPath && path !== "/" && path !== "/health" && cfg.cookie && !(cfg.api_keys || []).length) {
+      return jsonResponse({
+        error: {
+          code: "api_keys_required_with_cookie",
+          message: "設定 Cookie 後必須設定 API_KEYS，避免公開使用登入帳號。",
+        },
+      }, 503);
+    }
+
+    // 鉴权:配置了 API_KEYS 时,除公开首页与健康检查外的 API 都需要有效 key
     // (含 /v1/* 与 /v1beta/*,防止 Google 原生端点被绕过白嫖)。
-    if (path !== "/" && !authorized(request, url, cfg)) {
+    if (!adminPath && path !== "/" && path !== "/health" && !authorized(request, url, cfg)) {
       return jsonResponse({ error: { message: "invalid api key" } }, 401);
     }
 
     try {
+      if (adminPath) {
+        if (path === "/admin/status" && method === "GET") return await handleAdminStatus(cfg, env, url);
+        if (path === "/admin/cookie" && method === "PUT") return await handleCookieImport(request, cfg, env);
+        if (path === "/admin/cookie" && method === "DELETE") return await handleCookieDelete(cfg, env);
+        return privateJsonResponse({ error: { message: "not found" } }, 404);
+      }
+
       if (method === "GET") {
         if (path === "/v1/models") {
           const live = parseBool(url.searchParams.get("live"), false);
@@ -1950,9 +2822,15 @@ export default {
             })),
           });
         }
-        if (path === "/") {
-          await refreshGeminiBl(cfg);
-          return jsonResponse({ status: "ok", version: VERSION, gemini_bl: cfg.gemini_bl, models: Object.keys(MODELS) });
+        if (path === "/" || path === "/health") {
+          const wantsHtml = path === "/" && (
+            url.searchParams.get("ui") === "1" ||
+            (url.searchParams.get("ui") !== "0" && (request.headers.get("accept") || "").includes("text/html"))
+          );
+          if (wantsHtml) return dashboardResponse(cfg);
+          const publicCfg = { ...cfg, cookie: "", sapisid: "", xsrf_token: "" };
+          await refreshGeminiBl(publicCfg);
+          return jsonResponse({ status: "ok", version: VERSION, gemini_bl: publicCfg.gemini_bl, models: Object.keys(MODELS) });
         }
         if (path === "/debug") {
           if (!cfg.enable_debug) return jsonResponse({ error: "debug endpoint disabled" }, 403);
@@ -1987,16 +2865,22 @@ export default {
       return jsonResponse({ error: "not found" }, 404);
     } catch (e) {
       log(cfg, `error: ${(e && e.stack) || e}`);
-      return jsonResponse({ error: { message: String((e && e.message) || e) } }, 500);
+      return adminPath
+        ? privateJsonResponse({ error: { message: String((e && e.message) || e) } }, 500)
+        : jsonResponse({ error: { message: String((e && e.message) || e) } }, 500);
     }
   },
 };
 
-// 导出给本地测试用(Workers 运行时会忽略)。
-export {
-  MODELS, SLOT, resolveModel, getConfig, buildPayload, getUrl, buildHeaders, cleanText,
-  extractTextsFromLine, extractResponseText, extractActualModel, routeStatus, generate, generateResult, generateStream,
-  messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
-  makeSapisidHash, parseImageUrl, extractGeminiBl, getPageTokens, uploadImage, resolveImages,
-  __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,
-};
+// Node 测试挂点。Cloudflare 会把具名 export 当成 Durable Object / Worker
+// entrypoint，因此仅在 Node 环境挂到 globalThis，不进入线上导出表。
+if (typeof process !== "undefined" && process.versions && process.versions.node) {
+  globalThis.__GEMINI_WORKER_TEST__ = {
+    MODELS, SLOT, resolveModel, getConfig, getRequestConfig, parseAuthPayload, cookieSummary, authCacheKey,
+    buildPayload, getUrl, buildHeaders, cleanText,
+    extractTextsFromLine, extractResponseText, extractActualModel, routeStatus, generate, generateResult, generateStream,
+    messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
+    makeSapisidHash, parseImageUrl, extractGeminiBl, getPageTokens, uploadImage, resolveImages,
+    __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,
+  };
+}

@@ -1,17 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
+import "../worker.js";
+
+const {
   MODELS,
+  authCacheKey,
+  buildHeaders,
   extractActualModel,
   extractGeminiBl,
+  getConfig,
+  getUrl,
   messagesToPrompt,
+  parseAuthPayload,
   parseGoogleFunctionCalls,
   parseToolCalls,
   resolveModel,
   routeStatus,
   toOpenAIStreamToolCallDeltas,
-} from "../worker.js";
+} = globalThis.__GEMINI_WORKER_TEST__;
 
 test("existing Flash aliases remain stable", () => {
   const models = [
@@ -21,8 +28,46 @@ test("existing Flash aliases remain stable", () => {
     "gemini-3.6-flash-thinking-lite",
   ];
 
-  assert.deepEqual(Object.keys(MODELS).filter((name) => name.includes("flash")).sort(), models.sort());
+  assert.deepEqual(Object.keys(MODELS).filter((name) => name.startsWith("gemini-3.6-flash")).sort(), models.sort());
   for (const model of models) assert.equal(resolveModel(model, "gemini-3.6-flash").name, model);
+});
+
+test("upstream Gemini 3.7 Flash alias is available", () => {
+  assert.equal(resolveModel("gemini-3.7-flash", "gemini-3.6-flash").name, "gemini-3.7-flash");
+});
+
+test("raw Cookie and gemini-auth JSON preserve account metadata", async () => {
+  const raw = "NID=534=value=with=equals; SAPISID=sapi/value; __Secure-1PSID=session; S=a=b";
+  const parsed = parseAuthPayload(raw, true);
+  assert.equal(parsed.cookie, "SAPISID=sapi/value; __Secure-1PSID=session");
+  assert.equal(parsed.sapisid, "sapi/value");
+  assert.equal(parsed.removed_cookie_count, 2);
+
+  const cfg = getConfig({
+    GEMINI_COOKIE: JSON.stringify({
+      cookie: raw,
+      sapisid: "sapi/value",
+      auth_user: 2,
+      xsrf_token: "xsrf-token",
+      gemini_bl: "boq_assistant-bard-web-server_test",
+    }),
+  });
+  assert.equal(cfg.auth_user, "2");
+  assert.equal(cfg.xsrf_token, "xsrf-token");
+  assert.match(getUrl(cfg), /\/u\/2\/_\/BardChatUi/);
+  const headers = await buildHeaders(cfg);
+  assert.equal(headers["X-Goog-AuthUser"], "2");
+  assert.equal(headers.Referer, "https://gemini.google.com/u/2/app");
+});
+
+test("Cookie validation rejects an incomplete login session", () => {
+  assert.throws(() => parseAuthPayload("SAPISID=value", true), /工作階段 Cookie/);
+});
+
+test("page-token cache identity changes with the Cookie", async () => {
+  const a = await authCacheKey(getConfig({ GEMINI_COOKIE: "SAPISID=a; SID=session-a" }));
+  const b = await authCacheKey(getConfig({ GEMINI_COOKIE: "SAPISID=b; SID=session-b" }));
+  assert.notEqual(a, b);
 });
 
 test("Gemini build is extracted from the app page", () => {
