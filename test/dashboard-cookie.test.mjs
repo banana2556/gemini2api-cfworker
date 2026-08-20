@@ -50,7 +50,7 @@ function failingCookieStore() {
   };
 }
 
-test("browser root serves a CSP-protected console without exposing configured Cookie", async () => {
+test("browser root serves a CSP-protected console and ignores legacy Cookie secrets", async () => {
   const secret = "SAPISID=never-render-this; SID=session-secret";
   const response = await worker.fetch(new Request("https://worker.example/", {
     headers: { Accept: "text/html" },
@@ -81,8 +81,12 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   assert.equal((await health.json()).status, "ok");
 });
 
-test("Cookie import persists only behind an admin key and never returns the raw value", async () => {
-  const env = { ADMIN_KEY: "admin-test-key", COOKIE_STORE: memoryCookieStore() };
+test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
+  const env = {
+    ADMIN_KEY: "admin-test-key",
+    COOKIE_STORE: memoryCookieStore(),
+    GEMINI_COOKIE: "SAPISID=legacy-sapi; SID=legacy-session",
+  };
   const raw = "NID=534=value=with=equals; SAPISID=sapi/value; __Secure-1PSID=session-value";
   const authHeaders = {
     "Content-Type": "application/json",
@@ -109,7 +113,7 @@ test("Cookie import persists only behind an admin key and never returns the raw 
     headers: { "X-Admin-Key": "admin-test-key" },
   }), env);
   const data = await status.json();
-  assert.equal(data.cookie.source, "dashboard");
+  assert.equal(data.cookie.source, "durable_object");
   assert.equal(data.cookie.structurally_valid, true);
   assert.equal(data.cookie.cookie_count, 3);
   assert.equal(data.cookie.removed_cookie_count, 0);
@@ -122,25 +126,35 @@ test("Cookie import persists only behind an admin key and never returns the raw 
     headers: { "X-Admin-Key": "admin-test-key" },
   }), env);
   assert.equal(removed.status, 200);
+  const removedData = await removed.json();
+  assert.equal(removedData.cookie.configured, false);
+  assert.equal(removedData.cookie.source, "none");
+  assert.doesNotMatch(JSON.stringify(removedData), /legacy-sapi|legacy-session/);
 });
 
 test("Cookie rotation merges approved values and ignores unrelated Set-Cookie fields", () => {
   const headers = new Headers();
   headers.append("Set-Cookie", "SIDCC=rotated-cc; Path=/; Secure; HttpOnly");
   headers.append("Set-Cookie", "NID=rotated-nid; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/");
+  headers.append("Set-Cookie", "__Secure-BUCKET=rotated-bucket; Path=/; Secure");
+  headers.append("Set-Cookie", "__Secure-STRP=rotated-strp; Path=/; Secure");
+  headers.append("Set-Cookie", "__Secure-ENID=rotated-enid; Path=/; Secure");
   headers.append("Set-Cookie", "UNRELATED=ignore-me; Path=/");
 
   const merged = internals.mergeRotatedCookies(
-    "SAPISID=sapi; SID=session; SIDCC=old-cc; NID=old-nid; AEC=untouched",
+    "SAPISID=sapi; SID=session; SIDCC=old-cc; NID=old-nid; AEC=untouched; __Secure-BUCKET=old-bucket",
     internals.getSetCookieValues(headers),
   );
 
-  assert.deepEqual(merged.changed_cookie_names, ["SIDCC", "NID"]);
+  assert.deepEqual(merged.changed_cookie_names, ["SIDCC", "NID", "__Secure-BUCKET", "__Secure-STRP", "__Secure-ENID"]);
   assert.equal(merged.ignored_cookie_count, 1);
   assert.match(merged.cookie, /SID=session/);
   assert.match(merged.cookie, /SAPISID=sapi/);
   assert.match(merged.cookie, /SIDCC=rotated-cc/);
   assert.match(merged.cookie, /NID=rotated-nid/);
+  assert.match(merged.cookie, /__Secure-BUCKET=rotated-bucket/);
+  assert.match(merged.cookie, /__Secure-STRP=rotated-strp/);
+  assert.match(merged.cookie, /__Secure-ENID=rotated-enid/);
   assert.match(merged.cookie, /AEC=untouched/);
   assert.doesNotMatch(merged.cookie, /old-cc|old-nid|ignore-me|UNRELATED/);
 
@@ -198,14 +212,17 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     const validRecord = structuredClone(store.peek());
     globalThis.fetch = async () => {
       const headers = new Headers({ "Set-Cookie": "SIDCC=rotated-cc; Path=/" });
-      return new Response('{"SNlM0e":"fresh-at"}', { headers });
+      return new Response('{"SNlM0e":"newer-at"}', { headers });
     };
     const unchanged = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
       method: "POST",
       headers: adminHeaders,
     }), env);
     assert.equal((await unchanged.json()).status, "no_rotation");
-    assert.deepEqual(store.peek(), validRecord);
+    assert.equal(store.peek().cookie, validRecord.cookie);
+    assert.equal(store.peek().updated_at, validRecord.updated_at);
+    assert.equal(store.peek().xsrf_token, "newer-at");
+    assert.ok(store.peek().refreshed_at);
 
     globalThis.fetch = async () => new Response("<html>Sign in</html>", {
       headers: { "Set-Cookie": "SIDCC=must-not-save; Path=/" },
@@ -219,7 +236,8 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     assert.equal(expired.status, 200);
     assert.equal(expiredData.status, "reauth_required");
     assert.doesNotMatch(expiredText, /must-not-save|rotated-cc|rotated-nid/);
-    assert.deepEqual(store.peek(), validRecord);
+    assert.equal(store.peek().cookie, validRecord.cookie);
+    assert.equal(store.peek().xsrf_token, "newer-at");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -312,7 +330,7 @@ test("ADMIN_KEY is exclusive when it differs from API_KEYS", async () => {
     headers: { "X-Admin-Key": "admin-test-key" },
   }), env);
   assert.equal(status.status, 200);
-  assert.equal((await status.json()).cookie.source, "dashboard");
+  assert.equal((await status.json()).cookie.source, "durable_object");
 });
 
 test("Cookie-store failures fail closed while public health bypasses stored credentials", async () => {

@@ -4,8 +4,9 @@ import test from "node:test";
 import "../worker.js";
 
 const {
-  MODELS,
+  applyStoredAuth,
   authCacheKey,
+  buildModelCatalog,
   buildHeaders,
   buildPayload,
   extractActualModel,
@@ -21,41 +22,63 @@ const {
   toOpenAIStreamToolCallDeltas,
 } = globalThis.__GEMINI_WORKER_TEST__;
 
-test("existing Flash aliases remain stable", () => {
-  const models = [
-    "gemini-3.6-flash",
-    "gemini-3.6-flash-lite",
-    "gemini-3.6-flash-thinking",
-    "gemini-3.6-flash-thinking-lite",
-  ];
+function statusRow(primary, display, category, route) {
+  const row = [];
+  row[0] = primary;
+  row[1] = display.replace(/^\d+(?:\.\d+)?\s+/, "");
+  row[2] = `${display} description`;
+  row[6] = [route];
+  row[11] = display;
+  row[12] = `${display} description`;
+  row[17] = category;
+  return row;
+}
 
-  assert.deepEqual(Object.keys(MODELS).filter((name) => name.startsWith("gemini-3.6-flash")).sort(), models.sort());
-  for (const model of models) assert.equal(resolveModel(model, "gemini-3.6-flash").name, model);
+const statusPayload = new Array(16).fill(null);
+statusPayload[15] = [
+  statusRow("cf41b0e0dd7d53e5", "3.5 Flash-Lite", 6, "8c46e95b1a07cecc"),
+  statusRow("fbb127bbb056c959", "3.7 Flash", 1, "56fdd199312815e2"),
+  statusRow("9d8ca3786ebdfbea", "3.1 Pro", 3, "e6fa609c3fa255c0"),
+];
+const appHtml = [
+  '[["cf41b0e0dd7d53e5","8c46e95b1a07cecc"]]',
+  '[["56fdd199312815e2","fbb127bbb056c959"]]',
+  '[["e6fa609c3fa255c0","9d8ca3786ebdfbea"]]',
+].join("");
+const models = buildModelCatalog(statusPayload, appHtml);
+
+test("GetUserStatus builds exactly three current models with a thinking variant each", () => {
+  assert.deepEqual(Object.keys(models), [
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash-lite-thinking",
+    "gemini-3.7-flash",
+    "gemini-3.7-flash-thinking",
+    "gemini-3.1-pro",
+    "gemini-3.1-pro-thinking",
+  ]);
+  assert.equal(resolveModel("missing-client-alias", "", models).name, "gemini-3.7-flash");
 });
 
-test("upstream Gemini 3.7 Flash alias is available", () => {
-  assert.equal(resolveModel("gemini-3.7-flash", "gemini-3.6-flash").name, "gemini-3.7-flash");
-});
+test("standard and extended payloads use current route IDs and independent thinking levels", () => {
+  for (const [base, route, category] of [
+    ["gemini-3.5-flash-lite", "8c46e95b1a07cecc", 6],
+    ["gemini-3.7-flash", "56fdd199312815e2", 1],
+    ["gemini-3.1-pro", "e6fa609c3fa255c0", 3],
+  ]) {
+    for (const [name, level] of [[base, 1], [`${base}-thinking`, 2]]) {
+      const rm = resolveModel(name, "", models);
+      const outer = JSON.parse(new URLSearchParams(buildPayload("PING", rm.modeId, rm.thinkingLevel, null, rm.extra)).get("f.req"));
+      const inner = JSON.parse(outer[1]);
 
-test("current Gemini Web route includes model ID, mode, and thinking level", () => {
-  const rm = resolveModel("gemini-3.1-pro", "gemini-3.6-flash");
-  const outer = JSON.parse(new URLSearchParams(buildPayload("PING", rm.modeId, rm.thinkMode, null, rm.extra)).get("f.req"));
-  const inner = JSON.parse(outer[1]);
-
-  assert.equal(inner[59], "9d8ca3786ebdfbea");
-  assert.equal(inner[64], "e6fa609c3fa255c0");
-  assert.equal(inner[75], 3);
-  assert.equal(inner[79], 3);
-  assert.equal(inner[80], 1);
-
-  const extended = resolveModel("gemini-3.1-pro-enhanced", "gemini-3.6-flash");
-  const extendedOuter = JSON.parse(new URLSearchParams(buildPayload("PING", extended.modeId, extended.thinkMode, null, extended.extra)).get("f.req"));
-  const extendedInner = JSON.parse(extendedOuter[1]);
-  assert.deepEqual(extendedInner[17], [[3]]);
-  assert.equal(extendedInner[31], 2);
-  assert.equal(extendedInner[64], "e6fa609c3fa255c0");
-  assert.equal(extendedInner[79], 3);
-  assert.equal(extendedInner[80], 3);
+      assert.match(inner[59], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      assert.deepEqual(inner[17], [[4]]);
+      assert.equal(inner[31], null);
+      assert.equal(inner[64], route);
+      assert.equal(inner[75], category);
+      assert.equal(inner[79], category);
+      assert.equal(inner[80], level);
+    }
+  }
 });
 
 test("raw Cookie and gemini-auth JSON preserve account metadata", async () => {
@@ -65,7 +88,7 @@ test("raw Cookie and gemini-auth JSON preserve account metadata", async () => {
   assert.equal(parsed.sapisid, "sapi/value");
   assert.equal(parsed.removed_cookie_count, 1);
 
-  const cfg = getConfig({
+  const baseCfg = getConfig({
     GEMINI_COOKIE: JSON.stringify({
       cookie: raw,
       sapisid: "sapi/value",
@@ -73,6 +96,21 @@ test("raw Cookie and gemini-auth JSON preserve account metadata", async () => {
       xsrf_token: "xsrf-token",
       gemini_bl: "boq_assistant-bard-web-server_test",
     }),
+    SAPISID: "must-be-ignored",
+    GEMINI_AUTH_USER: "9",
+    GEMINI_XSRF_TOKEN: "must-be-ignored",
+  });
+  assert.equal(baseCfg.cookie, "");
+  assert.equal(baseCfg.sapisid, "");
+  assert.equal(baseCfg.auth_user, null);
+  assert.equal(baseCfg.xsrf_token, "");
+
+  const cfg = applyStoredAuth(baseCfg, {
+    cookie: raw,
+    sapisid: "sapi/value",
+    auth_user: 2,
+    xsrf_token: "xsrf-token",
+    gemini_bl: "boq_assistant-bard-web-server_test",
   });
   assert.equal(cfg.auth_user, "2");
   assert.equal(cfg.xsrf_token, "xsrf-token");
@@ -87,8 +125,8 @@ test("Cookie validation rejects an incomplete login session", () => {
 });
 
 test("page-token cache identity changes with the Cookie", async () => {
-  const a = await authCacheKey(getConfig({ GEMINI_COOKIE: "SAPISID=a; SID=session-a" }));
-  const b = await authCacheKey(getConfig({ GEMINI_COOKIE: "SAPISID=b; SID=session-b" }));
+  const a = await authCacheKey(applyStoredAuth(getConfig({}), { cookie: "SAPISID=a; SID=session-a" }));
+  const b = await authCacheKey(applyStoredAuth(getConfig({}), { cookie: "SAPISID=b; SID=session-b" }));
   assert.notEqual(a, b);
 });
 

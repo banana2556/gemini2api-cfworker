@@ -13,19 +13,13 @@
  *                POST /v1beta/models/{model}:generateContent
  *                POST /v1beta/models/{model}:streamGenerateContent
  *
- * 部署:把这个单文件粘贴到 Cloudflare 后台
- * (Workers & Pages → Create → 粘贴 → Deploy),或执行 `wrangler deploy`。
- * 核心 API 不需要 wrangler.toml 的 [vars]；若要在网页持久匯入 Cookie，
- * 则需使用仓库内 wrangler.toml 提供的 COOKIE_STORE Durable Object 绑定。
+ * 部署:匿名模式可直接粘贴这个单文件；需要登入态时执行 `wrangler deploy`，
+ * 让仓库内 wrangler.toml 建立 COOKIE_STORE Durable Object 与排程。
  *
  * 配置:编辑本文件顶部的 CONFIG 对象。每个键也都可以用同名的 Worker
- * 环境变量 / secret 覆盖(GEMINI_COOKIE / API_KEYS 建议用 secret,避免提交进仓库):
- *   GEMINI_COOKIE        完整 cookie 字符串,或 JSON {"cookie": "...", "sapisid": "..."}
- *   SAPISID              可选,显式指定 SAPISID(否则从 cookie 自动提取)
+ * 环境变量 / secret 覆盖(API_KEYS / ADMIN_KEY 建议用 secret,避免提交进仓库):
  *   API_KEYS             逗号分隔的列表或 JSON 数组;使用 Cookie 时必须设置
  *   ADMIN_KEY            面板管理密钥;设置后仅接受此 key,为空时才接受 API_KEYS
- *   GEMINI_AUTH_USER     可选,Google 多帐号索引
- *   GEMINI_XSRF_TOKEN    可选,显式指定 SNlM0e(否则自动抓取)
  *   GEMINI_BL            Gemini 网页版构建号(会随时间变化)
  *   GEMINI_ORIGIN        上游源站;部署被 Google 429 限流时,指向干净 IP 的反向代理
  *   UPSTREAM_SOCKET      true/false;true=上游优先用裸 socket(绕开 fetch 的 429)
@@ -34,13 +28,13 @@
  *   LOG_REQUESTS         true/false
  *   ENABLE_DEBUG         true/false;false=关闭 /debug 端点(避免泄露内部配置)
  *
- * 限制:图片/多模态输入需要登录态 —— 设置了 GEMINI_COOKIE 时,图片会经 Scotty
+ * 限制:图片/多模态输入需要登录态 —— 从面板匯入 Cookie 后,图片会经 Scotty
  * 上传到 Gemini 再绑进会话;未设置 cookie 时图片会被忽略(匿名带图会被后端以
- * 1100 拒绝),并在 prompt 里加一句提示。`gemini-3.1-pro` 也只有带付费账号 cookie
- * 时才会真正路由到 Pro,否则回退到 Flash。
+ * 1100 拒绝),并在 prompt 里加一句提示。动态发现的 Pro 路由也需要对应账号权限,
+ * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.5.0-worker";
+const VERSION = "1.6.0-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -54,15 +48,6 @@ const CONFIG = {
   // 面板 Cookie 管理密钥。设置后仅接受此 key；留空时才接受 API_KEYS 中任一
   // key。两者都为空时，面板仍可查看公开信息，但禁止 Cookie 管理操作。
   ADMIN_KEY: "",
-
-  // Gemini cookie。匿名访问对所有模型都可用,唯独真正的 Pro 路由需要它。
-  // 原始 cookie 字符串,例如:
-  //   "SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=..."
-  // 匿名就留空 ""。(出于安全考虑,建议把它设为 Worker secret。)
-  GEMINI_COOKIE: "",
-  SAPISID: "", // 可选;留空则自动从上面的 cookie 中提取
-  GEMINI_AUTH_USER: "", // 多 Google 帐号索引，例如 0、1；默认帐号留空
-  GEMINI_XSRF_TOKEN: "", // 可选；上游扩展导出的 SNlM0e
 
   // Gemini 网页版构建号。如果返回开始变空,去 gemini.google.com 页面源码里
   // 找一个新的值("boq_assistant-bard-web-server_...")。
@@ -78,7 +63,8 @@ const CONFIG = {
   // true=优先 socket,不可用/失败再回退 fetch;false=只用 fetch。
   UPSTREAM_SOCKET: true,
 
-  DEFAULT_MODEL: "gemini-3.6-flash",
+  // 留空时自动选择 GetUserStatus 当前回传的 Flash 标准模型。
+  DEFAULT_MODEL: "",
   RETRY_ATTEMPTS: 3,
   RETRY_DELAY_SEC: 2,
   REQUEST_TIMEOUT_SEC: 180,
@@ -86,55 +72,106 @@ const CONFIG = {
   ENABLE_DEBUG: true,
 };
 
-// ─── 模型 ────────────────────────────────────────────────────────────────
-// MODE_CATEGORY 枚举(来自 Gemini 前端 JS):
-//   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING,
-//   6=FLASH_LITE, 7=FLASH_PLUS
-// model/submodel 是 2026-08-20 GetUserStatus 与 Gemini Web 实际选中的路由。
-// 仅传 mode 会被降级；StreamGenerate 还必须携带主模型与子模型 ID。
-// 网页「延伸思考」开关的实测元数据为 [e6fa609c3fa255c0, 2, 3]：
-// 同一 Pro 子模型、扩展标记 2、thinking level 3。
-const MODELS = {
-  "gemini-3.7-flash": { mode: 1, think: 1, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", submode: 1, desc: "Latest all-around model (Gemini 3.7 Flash)" },
-  "gemini-3.6-flash": { mode: 1, think: 1, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", submode: 1, desc: "All-around model (Gemini 3.6 Flash)" },
-  "gemini-3.6-flash-thinking": { mode: 2, think: 2, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", desc: "Deep thinking mode, longest output (~20k chars)" },
-  "gemini-3.1-pro": { mode: 3, think: 1, model: "9d8ca3786ebdfbea", submodel: "e6fa609c3fa255c0", submode: 3, desc: "Pro model (requires cookie for real routing)" },
-  "gemini-3.1-pro-enhanced": { mode: 3, think: 3, model: "9d8ca3786ebdfbea", submodel: "e6fa609c3fa255c0", submode: 3, extra: { 31: 2 }, desc: "Gemini Web Pro Extended Thinking" },
-  "gemini-auto": { mode: 4, think: 1, desc: "Auto model selection" },
-  "gemini-3.6-flash-thinking-lite": { mode: 5, think: 1, model: "fbb127bbb056c959", submodel: "56fdd199312815e2", desc: "Dynamic thinking with adaptive depth" },
-  "gemini-3.6-flash-lite": { mode: 6, think: 1, model: "cf41b0e0dd7d53e5", submodel: "8c46e95b1a07cecc", submode: 6, desc: "Lightweight fast model" },
-};
+// ─── 动态模型目录 ─────────────────────────────────────────────────────────
+// MODE_CATEGORY 是 Gemini 协议枚举，不是模型清单：1=Flash、3=Pro、6=Flash-Lite。
+// 实际版本、显示名称和主/子模型 ID 均来自当前帐号的 GetUserStatus 与 /app。
+const MODEL_CATEGORIES = [6, 1, 3];
+const MODEL_STATUS_RPC = "otAQ7b";
+const MODEL_CATALOG_TTL_SEC = 6 * 60 * 60;
+let _modelCatalogMemory = { key: "", models: null, expiresAt: 0 };
+
+function modelAlias(displayName) {
+  const slug = String(displayName || "")
+    .toLowerCase()
+    .replace(/^gemini\s+/, "")
+    .replace(/[^a-z0-9.]+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "");
+  return slug ? `gemini-${slug}` : "";
+}
+
+function extractRpcPayload(raw, rpcId) {
+  const escapedId = String(rpcId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`\\["wrb\\.fr","${escapedId}","((?:\\\\.|[^"\\\\])*)"`).exec(raw || "");
+  if (!match) throw new Error(`${rpcId} response payload not found`);
+  return JSON.parse(JSON.parse(`"${match[1]}"`));
+}
+
+function extractRouteVariant(html, primaryId, candidates) {
+  const allowed = new Set((candidates || []).filter((id) => id !== primaryId && /^[a-f0-9]{16}$/i.test(id)));
+  let best = null;
+  for (const group of String(html || "").match(/\[\[[\s\S]{0,2048}?\]\]/g) || []) {
+    const ids = group.match(/[a-f0-9]{16}/gi) || [];
+    const primaryIndex = ids.indexOf(primaryId);
+    if (primaryIndex < 0) continue;
+    for (let i = 0; i < ids.length; i++) {
+      if (!allowed.has(ids[i])) continue;
+      const score = Math.abs(i - primaryIndex) * 2 + (i > primaryIndex ? 1 : 0);
+      if (!best || score < best.score) best = { id: ids[i], score };
+    }
+  }
+  return best ? best.id : "";
+}
+
+function buildModelCatalog(statusPayload, appHtml) {
+  const rows = statusPayload && Array.isArray(statusPayload[15]) ? statusPayload[15] : [];
+  const models = {};
+  for (const category of MODEL_CATEGORIES) {
+    const row = rows.find((item) => Array.isArray(item) && item[17] === category);
+    if (!row) throw new Error(`GetUserStatus missing model category ${category}`);
+    const primaryId = String(row[0] || "");
+    const displayName = String(row[11] || row[19] || row[1] || "").trim();
+    const id = modelAlias(displayName);
+    if (!primaryId || !id) throw new Error(`GetUserStatus returned an invalid model category ${category}`);
+    const submodel = extractRouteVariant(appHtml, primaryId, Array.isArray(row[6]) ? row[6] : []);
+    if (!submodel) throw new Error(`Gemini /app missing route ID for ${displayName}`);
+    const description = String(row[12] || row[2] || displayName).trim();
+    models[id] = {
+      mode: category,
+      thinking_level: 1,
+      model: primaryId,
+      submodel,
+      desc: `${displayName} · ${description}`,
+    };
+    models[`${id}-thinking`] = {
+      mode: category,
+      thinking_level: 2,
+      model: primaryId,
+      submodel,
+      desc: `${displayName} · Extended thinking`,
+    };
+  }
+  if (Object.keys(models).length !== 6) throw new Error("Gemini model catalog did not produce six models");
+  return models;
+}
+
+function defaultModelName(models, preferred = "") {
+  if (preferred && models[preferred]) return preferred;
+  return Object.keys(models).find((name) => models[name].mode === 1 && models[name].thinking_level === 1)
+    || Object.keys(models)[0]
+    || "";
+}
+
+function modelNameForCategory(models, category, thinkingLevel = 1) {
+  return Object.keys(models).find((name) => models[name].mode === category && models[name].thinking_level === thinkingLevel) || "";
+}
 
 /**
  * 把模型名解析成路由参数。
  * 未知名称会回退到 `def` 而不是报错(客户端可能传任意 id)。
- * 支持 `@think=N` 后缀来覆盖思考深度。
- * 返回 { name, modeId, thinkMode, extra },或 { error }。
+ * 返回 { name, modeId, thinkingLevel, extra },或 { error }。
  */
-function resolveModel(modelName, def) {
-  let thinkOverride = null;
-  if (modelName.includes("@think=")) {
-    const idx = modelName.lastIndexOf("@think=");
-    const thinkStr = modelName.slice(idx + "@think=".length);
-    modelName = modelName.slice(0, idx);
-    if (!/^-?\d+$/.test(thinkStr)) return { error: `Invalid think level: ${thinkStr}` };
-    thinkOverride = parseInt(thinkStr, 10);
-  }
-  let cfg = MODELS[modelName];
+function resolveModel(modelName, def, models) {
+  let cfg = models[modelName];
   if (!cfg) {
-    modelName = def;
-    cfg = MODELS[def];
+    modelName = defaultModelName(models, def);
+    cfg = models[modelName];
   }
+  if (!cfg) return { error: "Gemini model catalog is empty" };
   return {
     name: modelName,
     modeId: cfg.mode,
-    thinkMode: thinkOverride !== null ? thinkOverride : cfg.think,
-    extra: cfg.model ? {
-      59: cfg.model,
-      ...(cfg.submodel ? { 64: cfg.submodel } : {}),
-      ...(cfg.submode ? { 75: cfg.submode } : {}),
-      ...(cfg.extra || {}),
-    } : (cfg.extra || null),
+    thinkingLevel: cfg.thinking_level,
+    extra: cfg.submodel ? { 64: cfg.submodel, 75: cfg.mode } : null,
   };
 }
 
@@ -172,7 +209,7 @@ const SESSION_COOKIE_NAMES = ["__Secure-1PSID", "__Secure-3PSID", "SID"];
 const MAX_COOKIE_BYTES = 64 * 1024;
 const FORWARDED_COOKIE_NAMES = [
   "SID", "HSID", "SSID", "APISID", "SAPISID", "LSID", "OSID", "SIDCC",
-  "AEC", "NID", "COMPASS",
+  "AEC", "NID", "COMPASS", "__Secure-BUCKET", "__Secure-STRP", "__Secure-ENID",
   "__Secure-1PAPISID", "__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-1PSIDRTS", "__Secure-1PSIDCC",
   "__Secure-3PAPISID", "__Secure-3PSID", "__Secure-3PSIDTS", "__Secure-3PSIDRTS", "__Secure-3PSIDCC",
   "__Secure-OSID", "__Host-1PLSID", "__Host-3PLSID",
@@ -269,7 +306,7 @@ function parseAuthPayload(input, strict = false) {
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = {};
 
-  const rawCookie = String(payload.cookie ?? payload.GEMINI_COOKIE ?? "")
+  const rawCookie = String(payload.cookie ?? "")
     .replace(/^cookie\s*:\s*/i, "")
     .replace(/[\r\n]+[\t ]*/g, " ")
     .trim();
@@ -278,11 +315,11 @@ function parseAuthPayload(input, strict = false) {
   const cookie = serializeCookiePairs(pairs);
   const removedCookieCount = Math.max(0, pairs.size - forwarded.length);
   const embeddedSapisid = pairs.get("SAPISID") || "";
-  const explicitSapisid = String(payload.sapisid ?? payload.SAPISID ?? "").trim();
+  const explicitSapisid = String(payload.sapisid ?? "").trim();
   const sapisid = explicitSapisid || embeddedSapisid;
-  const authUserRaw = payload.auth_user ?? payload.authUser ?? payload.GEMINI_AUTH_USER ?? "";
+  const authUserRaw = payload.auth_user ?? payload.authUser ?? "";
   const authUser = authUserRaw === null || authUserRaw === "" ? null : String(authUserRaw).trim();
-  const xsrfToken = String(payload.xsrf_token ?? payload.xsrfToken ?? payload.GEMINI_XSRF_TOKEN ?? "").trim();
+  const xsrfToken = String(payload.xsrf_token ?? payload.xsrfToken ?? "").trim();
   const geminiBl = String(payload.gemini_bl ?? payload.geminiBl ?? "").trim();
 
   if (strict) {
@@ -333,19 +370,11 @@ function cookieSummary(cfg) {
 
 function getConfig(env) {
   env = env || {};
-  const rawCookie = envOr(env, "GEMINI_COOKIE", CONFIG.GEMINI_COOKIE) || "";
-  const auth = parseAuthPayload(rawCookie);
-  const sapisid = String(envOr(env, "SAPISID", CONFIG.SAPISID) || auth.sapisid || "").trim();
-  const authUserRaw = envOr(env, "GEMINI_AUTH_USER", CONFIG.GEMINI_AUTH_USER);
-  const authUser = authUserRaw === "" || authUserRaw === null || authUserRaw === undefined
-    ? auth.auth_user
-    : String(authUserRaw);
-  const xsrfToken = String(envOr(env, "GEMINI_XSRF_TOKEN", CONFIG.GEMINI_XSRF_TOKEN) || auth.xsrf_token || "");
   const envGeminiBl = env.GEMINI_BL !== undefined && env.GEMINI_BL !== null && env.GEMINI_BL !== ""
     ? env.GEMINI_BL
     : null;
   return {
-    gemini_bl: envGeminiBl || auth.gemini_bl || CONFIG.GEMINI_BL,
+    gemini_bl: envGeminiBl || CONFIG.GEMINI_BL,
     gemini_origin: String(envOr(env, "GEMINI_ORIGIN", CONFIG.GEMINI_ORIGIN)).replace(/\/$/, ""),
     upstream_socket: parseBool(envOr(env, "UPSTREAM_SOCKET", CONFIG.UPSTREAM_SOCKET), true),
     default_model: envOr(env, "DEFAULT_MODEL", CONFIG.DEFAULT_MODEL),
@@ -356,16 +385,14 @@ function getConfig(env) {
     enable_debug: parseBool(envOr(env, "ENABLE_DEBUG", CONFIG.ENABLE_DEBUG), true),
     api_keys: parseApiKeys(envOr(env, "API_KEYS", CONFIG.API_KEYS)),
     admin_key: String(envOr(env, "ADMIN_KEY", CONFIG.ADMIN_KEY) || ""),
-    cookie: auth.cookie,
-    sapisid,
-    auth_user: authUser === "" || authUser === null || authUser === undefined ? null : String(authUser),
-    xsrf_token: xsrfToken,
-    cookie_source: auth.cookie
-      ? (env.GEMINI_COOKIE !== undefined && env.GEMINI_COOKIE !== "" ? "secret" : "inline")
-      : "none",
+    cookie: "",
+    sapisid: "",
+    auth_user: null,
+    xsrf_token: "",
+    cookie_source: "none",
     cookie_updated_at: null,
     cookie_refreshed_at: null,
-    removed_cookie_count: auth.removed_cookie_count,
+    removed_cookie_count: 0,
   };
 }
 
@@ -379,7 +406,7 @@ function applyStoredAuth(cfg, record) {
     auth_user: auth.auth_user,
     xsrf_token: auth.xsrf_token,
     gemini_bl: auth.gemini_bl || cfg.gemini_bl,
-    cookie_source: "dashboard",
+    cookie_source: "durable_object",
     cookie_updated_at: record.updated_at || null,
     cookie_refreshed_at: record.refreshed_at || null,
     removed_cookie_count: record.removed_cookie_count || auth.removed_cookie_count || 0,
@@ -518,10 +545,11 @@ const SLOT = {
   PROMPT: 0, LANG: 1, META: 2, FLAGS_6: 6, FLAGS_7: 7,
   FLAGS_10: 10, FLAGS_11: 11, THINK_MODE: 17, FLAGS_18: 18,
   FLAGS_27: 27, FLAGS_30: 30, FLAGS_41: 41, FLAGS_53: 53,
-  MODEL_ID: 59, FLAGS_61: 61, FLAGS_68: 68, MODE: 79, THINK_LEVEL: 80,
+  REQUEST_ID: 59, FLAGS_61: 61, ROUTE_ID: 64, FLAGS_68: 68,
+  VARIANT_MODE: 75, MODE: 79, THINK_LEVEL: 80,
 };
 
-function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
+function buildPayload(prompt, modelId, thinkingLevel, fileRefs, extra) {
   const inner = new Array(102).fill(null);
   if (fileRefs && fileRefs.length) {
     // 每个上传文件表示为 [[fileRef, 1], filename](格式来自 gemini_webapi,
@@ -537,16 +565,18 @@ function buildPayload(prompt, modelId, thinkMode, fileRefs, extra) {
   inner[SLOT.FLAGS_7] = 1;
   inner[SLOT.FLAGS_10] = 1;
   inner[SLOT.FLAGS_11] = 0;
-  inner[SLOT.THINK_MODE] = [[thinkMode]];
+  // 17 是旧版自动思考模式；现行网页的标准/延伸开关使用独立的 80。
+  inner[SLOT.THINK_MODE] = [[4]];
   inner[SLOT.FLAGS_18] = 0;
   inner[SLOT.FLAGS_27] = 1;
   inner[SLOT.FLAGS_30] = [4];
   inner[SLOT.FLAGS_41] = [2];
   inner[SLOT.FLAGS_53] = 0;
+  inner[SLOT.REQUEST_ID] = globalThis.crypto.randomUUID();
   inner[SLOT.FLAGS_61] = [];
   inner[SLOT.FLAGS_68] = 1;
   inner[SLOT.MODE] = modelId;
-  if (thinkMode >= 1 && thinkMode <= 3) inner[SLOT.THINK_LEVEL] = thinkMode;
+  if (thinkingLevel >= 1 && thinkingLevel <= 3) inner[SLOT.THINK_LEVEL] = thinkingLevel;
   if (extra) {
     for (const k of Object.keys(extra)) inner[Number(k)] = extra[k];
   }
@@ -746,7 +776,7 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
 }
 
 // ─── 多模态:图片上传(Scotty 续传)───────────────────────────────────────────
-// 说明:图片输入需要登录态(GEMINI_COOKIE)。匿名会话上传文件能成功,但带图
+// 说明:图片输入需要从面板匯入登录态。匿名会话上传文件能成功,但带图
 // 生成会被后端以 BardErrorInfo[1100] 拒绝(权限门)。无 cookie 时不上传,
 // 改为在 prompt 里追加一句提示,降级为纯文本。详见 test/live-image.mjs。
 
@@ -849,6 +879,110 @@ async function refreshGeminiBl(cfg) {
   return cfg.gemini_bl;
 }
 
+async function fetchModelCatalog(cfg, key) {
+  const origin = cfg.gemini_origin || "https://gemini.google.com";
+  const headers = await buildHeaders(cfg);
+  const appResponse = await httpFetch(`${origin}${accountPrefix(cfg)}/app`, {
+    headers,
+    timeoutMs: 30000,
+    socket: cfg.upstream_socket,
+  });
+  const appHtml = await appResponse.text();
+  if (!appResponse.ok) throw new Error(`Gemini /app returned ${appResponse.status}`);
+
+  const tokens = extractPageTokens(appHtml);
+  if (cfg.cookie && !tokens.at) throw new Error("Gemini no longer accepts the stored Cookie; re-import is required");
+  if (tokens.bl) {
+    cfg.gemini_bl = tokens.bl;
+    _geminiBlMemory = {
+      origin,
+      value: tokens.bl,
+      expiresAt: Date.now() + GEMINI_BL_CACHE_TTL_SEC * 1000,
+    };
+  }
+  if (Object.keys(tokens).length) _pageTokens = { key, tokens, ts: Date.now() };
+
+  const reqid = (nowSec() * 1000 + Math.floor(Math.random() * 1000)) % 10000000;
+  const sourcePath = `${accountPrefix(cfg)}/app`;
+  const url = origin + accountPrefix(cfg) + "/_/BardChatUi/data/batchexecute" +
+    `?rpcids=${MODEL_STATUS_RPC}&source-path=${encodeURIComponent(sourcePath)}` +
+    `&bl=${encodeURIComponent(cfg.gemini_bl)}&hl=en&_reqid=${reqid}&rt=c`;
+  const body = new URLSearchParams({
+    "f.req": JSON.stringify([[[MODEL_STATUS_RPC, "[]", null, "generic"]]]),
+  });
+  if (tokens.at) body.set("at", tokens.at);
+  const statusResponse = await httpFetch(url, {
+    method: "POST",
+    headers,
+    body: body.toString(),
+    timeoutMs: 30000,
+    socket: cfg.upstream_socket,
+  });
+  const raw = await statusResponse.text();
+  if (!statusResponse.ok) throw new Error(`GetUserStatus returned ${statusResponse.status}`);
+  return buildModelCatalog(extractRpcPayload(raw, MODEL_STATUS_RPC), appHtml);
+}
+
+async function getModelCatalog(cfg, force = false) {
+  const key = await authCacheKey(cfg);
+  const now = Date.now();
+  let stale = _modelCatalogMemory.key === key ? _modelCatalogMemory.models : null;
+  if (!force && stale && _modelCatalogMemory.expiresAt > now) return stale;
+
+  const cache = globalThis.caches && globalThis.caches.default;
+  const cacheKey = new Request(`https://gemini2api-cache.invalid/model-catalog?account=${key}`);
+  if (cache) {
+    try {
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        const record = JSON.parse(await cached.text());
+        if (record.models && Object.keys(record.models).length === 6) {
+          stale = record.models;
+          _modelCatalogMemory = { key, models: record.models, expiresAt: record.expiresAt || 0 };
+          if (!force && _modelCatalogMemory.expiresAt > now) return record.models;
+        }
+      }
+    } catch (_) {}
+  }
+
+  try {
+    const models = await fetchModelCatalog(cfg, key);
+    const expiresAt = Date.now() + MODEL_CATALOG_TTL_SEC * 1000;
+    _modelCatalogMemory = { key, models, expiresAt };
+    if (cache) {
+      try {
+        await cache.put(cacheKey, new Response(JSON.stringify({ models, expiresAt }), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": `public, max-age=${MODEL_CATALOG_TTL_SEC}`,
+          },
+        }));
+      } catch (e) {
+        log(cfg, `model catalog cache write failed: ${e}`);
+      }
+    }
+    return models;
+  } catch (e) {
+    if (stale) {
+      log(cfg, `model catalog refresh failed; using stale catalog: ${e}`);
+      return stale;
+    }
+    throw e;
+  }
+}
+
+async function invalidateModelCatalog(...configs) {
+  _modelCatalogMemory = { key: "", models: null, expiresAt: 0 };
+  const cache = globalThis.caches && globalThis.caches.default;
+  if (!cache) return;
+  try {
+    await Promise.all(configs.map(async (cfg) => {
+      const key = await authCacheKey(cfg);
+      await cache.delete(new Request(`https://gemini2api-cache.invalid/model-catalog?account=${key}`));
+    }));
+  } catch (_) {}
+}
+
 function base64ToBytes(b64) {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
@@ -930,7 +1064,7 @@ async function uploadImage(cfg, bytes, mime) {
 async function resolveImages(cfg, images) {
   if (!images || !images.length) return { fileRefs: null, droppedNote: "" };
   if (!cfg.cookie) {
-    return { fileRefs: null, droppedNote: `\n\n[Note: ${images.length} image(s) were provided but ignored — image input requires a configured GEMINI_COOKIE.]` };
+    return { fileRefs: null, droppedNote: `\n\n[Note: ${images.length} image(s) were provided but ignored — image input requires a Cookie imported into the Worker console.]` };
   }
   const refs = [];
   for (const img of images) {
@@ -1044,8 +1178,8 @@ function routeMetadata(modelId, actualModel) {
   return { upstream_model: actualModel || null, route_status: routeStatus(modelId, actualModel) };
 }
 
-async function buildRequestBody(cfg, prompt, modelId, thinkMode, fileRefs, extra) {
-  let body = buildPayload(prompt, modelId, thinkMode, fileRefs || null, extra);
+async function buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra) {
+  let body = buildPayload(prompt, modelId, thinkingLevel, fileRefs || null, extra);
   if (cfg.cookie) {
     const at = cfg.xsrf_token || (await getPageTokens(cfg)).at;
     if (at) body += "&at=" + encodeURIComponent(at);
@@ -1054,9 +1188,9 @@ async function buildRequestBody(cfg, prompt, modelId, thinkMode, fileRefs, extra
 }
 
 /** 非流式生成(带重试)。返回最终的响应文本。 */
-async function generateResult(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
+async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRefs) {
   await refreshGeminiBl(cfg);
-  const body = await buildRequestBody(cfg, prompt, modelId, thinkMode, fileRefs, extra);
+  const body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
   const url = getUrl(cfg);
   const headers = await buildHeaders(cfg);
   let lastErr;
@@ -1093,17 +1227,17 @@ async function generateResult(cfg, prompt, modelId, thinkMode, extra, fileRefs) 
   throw lastErr;
 }
 
-async function generate(cfg, prompt, modelId, thinkMode, extra, fileRefs) {
-  return (await generateResult(cfg, prompt, modelId, thinkMode, extra, fileRefs)).text;
+async function generate(cfg, prompt, modelId, thinkingLevel, extra, fileRefs) {
+  return (await generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRefs)).text;
 }
 
 /**
  * 流式生成。每步 yield 一段文本增量(本次新追加的后缀)。
  * 只在尚未 yield 过任何内容时才重试,以避免重复输出。
  */
-async function* generateStream(cfg, prompt, modelId, thinkMode, extra, fileRefs, onRoute) {
+async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, onRoute) {
   await refreshGeminiBl(cfg);
-  const body = await buildRequestBody(cfg, prompt, modelId, thinkMode, fileRefs, extra);
+  const body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
   const url = getUrl(cfg);
   const headers = await buildHeaders(cfg);
   let lastErr;
@@ -1837,7 +1971,8 @@ const EMPTY_UPSTREAM_MSG =
 
 // POST /v1/chat/completions
 async function handleChat(req, cfg) {
-  const rm = resolveModel(req.model || cfg.default_model, cfg.default_model);
+  const models = await getModelCatalog(cfg);
+  const rm = resolveModel(req.model || cfg.default_model, cfg.default_model, models);
   if (rm.error) return jsonResponse({ error: { message: rm.error } }, 400);
 
   const tools = req.tools;
@@ -1861,7 +1996,7 @@ async function handleChat(req, cfg) {
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs, (meta) => { route = meta; })) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; })) {
           got = true;
           chunk({ content: delta }, null);
         }
@@ -1885,7 +2020,7 @@ async function handleChat(req, cfg) {
   let result;
   let text;
   try {
-    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
+    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs);
     text = result.text;
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
@@ -1933,7 +2068,8 @@ async function handleChat(req, cfg) {
 
 // POST /v1/responses(Codex CLI 用)
 async function handleResponses(req, cfg) {
-  const rm = resolveModel(req.model || cfg.default_model, cfg.default_model);
+  const models = await getModelCatalog(cfg);
+  const rm = resolveModel(req.model || cfg.default_model, cfg.default_model, models);
   if (rm.error) return jsonResponse({ error: { message: rm.error } }, 400);
 
   const inputItems = req.input != null ? req.input : [];
@@ -2001,7 +2137,7 @@ async function handleResponses(req, cfg) {
   let result;
   let text;
   try {
-    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
+    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs);
     text = result.text;
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
@@ -2052,7 +2188,8 @@ async function handleResponses(req, cfg) {
 // POST /v1beta/models/{model}:generateContent | :streamGenerateContent
 async function handleGoogleGenerate(req, cfg, path, stream) {
   const m = /\/v1beta\/models\/([^:?]+)/.exec(path);
-  const rm = resolveModel(m ? m[1] : cfg.default_model, cfg.default_model);
+  const models = await getModelCatalog(cfg);
+  const rm = resolveModel(m ? m[1] : cfg.default_model, cfg.default_model, models);
   if (rm.error) return jsonResponse({ error: { message: rm.error } }, 400);
 
   const fcMode = ((req.toolConfig || {}).functionCallingConfig || {}).mode || "AUTO";
@@ -2069,7 +2206,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
       let fullText = "";
       let route = routeMetadata(rm.modeId, "");
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs, (meta) => { route = meta; })) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; })) {
           if (!delta) continue;
           fullText += delta;
           write(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: delta }], role: "model" }, index: 0 }], modelVersion: rm.name, upstreamModel: route.upstream_model, routeStatus: route.route_status })}\n\n`);
@@ -2089,7 +2226,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
   let result;
   let text;
   try {
-    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkMode, rm.extra, fileRefs);
+    result = await generateResult(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs);
     text = result.text;
   } catch (e) {
     return jsonResponse({ error: { message: `upstream error: ${e}` } }, 502);
@@ -2142,9 +2279,10 @@ function cookieRouteSummary(cfg, proRoute, pageTokenFound) {
   };
 }
 
-async function probeModelRoute(cfg, name, detailed = false) {
-  const rm = resolveModel(name, cfg.default_model);
-  const result = await generateResult(cfg, "Reply with one word: PONG", rm.modeId, rm.thinkMode, rm.extra, null);
+async function probeModelRoute(cfg, name, detailed = false, models = null) {
+  models = models || await getModelCatalog(cfg);
+  const rm = resolveModel(name, cfg.default_model, models);
+  const result = await generateResult(cfg, "Reply with one word: PONG", rm.modeId, rm.thinkingLevel, rm.extra, null);
   const metadata = routeMetadata(rm.modeId, result.actualModel);
   const route = {
     requested_model: name,
@@ -2161,22 +2299,25 @@ async function probeModelRoute(cfg, name, detailed = false) {
 }
 
 async function inspectModelRoutes(cfg) {
+  const models = await getModelCatalog(cfg);
   await refreshGeminiBl(cfg);
   let pageTokenFound = false;
   if (cfg.cookie) pageTokenFound = !!(await getPageTokens(cfg)).at;
-  const pairs = await Promise.all(Object.keys(MODELS).map(async (name) => {
+  const pairs = await Promise.all(Object.keys(models).map(async (name) => {
     try {
-      return [name, await probeModelRoute(cfg, name)];
+      return [name, await probeModelRoute(cfg, name, false, models)];
     } catch (e) {
       return [name, { requested_model: name, upstream_model: null, route_status: "unknown", available: false, error: String((e && e.message) || e) }];
     }
   }));
   const routes = Object.fromEntries(pairs);
   const actualModels = [...new Set(Object.values(routes).map((r) => r.upstream_model).filter(Boolean))];
+  const proName = modelNameForCategory(models, 3);
   return {
+    models,
     routes,
     actual_models: actualModels,
-    cookie: cookieRouteSummary(cfg, routes["gemini-3.1-pro"], pageTokenFound),
+    cookie: cookieRouteSummary(cfg, routes[proName], pageTokenFound),
   };
 }
 
@@ -2184,10 +2325,11 @@ async function handleDebug(cfg) {
   await refreshGeminiBl(cfg);
   let pageTokenFound = false;
   if (cfg.cookie) pageTokenFound = !!(await getPageTokens(cfg)).at;
-  const guestCfg = { ...cfg, cookie: "", sapisid: "" };
+  const guestCfg = { ...cfg, cookie: "", sapisid: "", auth_user: null, xsrf_token: "" };
   const safeProbe = async (probeCfg) => {
     try {
-      return await probeModelRoute(probeCfg, "gemini-3.1-pro", true);
+      const models = await getModelCatalog(probeCfg);
+      return await probeModelRoute(probeCfg, modelNameForCategory(models, 3), true, models);
     } catch (e) {
       return { upstream_model: null, route_status: "unknown", error: String((e && e.message) || e) };
     }
@@ -2207,9 +2349,9 @@ async function handleDebug(cfg) {
   });
 }
 
-async function safeModelProbe(cfg, name, detailed = false) {
+async function safeModelProbe(cfg, name, detailed = false, models = null) {
   try {
-    return await probeModelRoute(cfg, name, detailed);
+    return await probeModelRoute(cfg, name, detailed, models);
   } catch (e) {
     return {
       requested_model: name,
@@ -2231,8 +2373,9 @@ async function handleAdminStatus(cfg, env, url) {
     inspection = await inspectModelRoutes(cfg);
     cookieVerification = inspection.cookie;
   } else if (verify && cfg.cookie) {
+    const models = await getModelCatalog(cfg);
     const pageTokenFound = !!(cfg.xsrf_token || (await getPageTokens(cfg)).at);
-    const proRoute = await safeModelProbe(cfg, "gemini-3.1-pro", true);
+    const proRoute = await safeModelProbe(cfg, modelNameForCategory(models, 3), true, models);
     cookieVerification = cookieRouteSummary(cfg, proRoute, pageTokenFound);
   }
 
@@ -2248,11 +2391,11 @@ async function handleAdminStatus(cfg, env, url) {
       ...cookieSummary(cfg),
       verification: cookieVerification,
     },
-    models: Object.entries(MODELS).map(([id, model]) => ({
+    models: inspection ? Object.entries(inspection.models).map(([id, model]) => ({
       id,
       description: model.desc,
-      ...(inspection ? inspection.routes[id] : {}),
-    })),
+      ...inspection.routes[id],
+    })) : undefined,
   });
 }
 
@@ -2292,16 +2435,6 @@ async function handleCookieRefresh(cfg, env) {
   }
 
   const merged = mergeRotatedCookies(cfg.cookie, getSetCookieValues(response.headers));
-  if (!merged.changed_cookie_names.length) {
-    return privateJsonResponse({
-      status: "no_rotation",
-      cookie: cookieSummary(cfg),
-      changed_cookie_names: [],
-      ignored_cookie_count: merged.ignored_cookie_count,
-      message: "登入態有效；Google 本次沒有輪替 Cookie。",
-    });
-  }
-
   const now = new Date().toISOString();
   const auth = parseAuthPayload({
     cookie: merged.cookie,
@@ -2313,30 +2446,34 @@ async function handleCookieRefresh(cfg, env) {
   const record = {
     ...auth,
     removed_cookie_count: cfg.removed_cookie_count || 0,
-    updated_at: now,
+    updated_at: merged.changed_cookie_names.length ? now : (cfg.cookie_updated_at || now),
     refreshed_at: now,
   };
   await writeStoredAuth(env, record);
 
   const refreshedCfg = applyStoredAuth(cfg, record);
+  await invalidateModelCatalog(cfg, refreshedCfg);
   _pageTokens = {
     key: await authCacheKey(refreshedCfg),
     tokens,
     ts: Date.now(),
   };
+  const rotated = merged.changed_cookie_names.length > 0;
   return privateJsonResponse({
-    status: "refreshed",
+    status: rotated ? "refreshed" : "no_rotation",
     cookie: cookieSummary(refreshedCfg),
     changed_cookie_names: merged.changed_cookie_names,
     ignored_cookie_count: merged.ignored_cookie_count,
-    message: `已保存 Google 輪替的 ${merged.changed_cookie_names.length} 個 Cookie。`,
+    message: rotated
+      ? `已保存 Google 輪替的 ${merged.changed_cookie_names.length} 個 Cookie。`
+      : "登入態有效；已更新頁面 token，Google 本次沒有輪替 Cookie。",
   });
 }
 
 async function handleCookieImport(request, cfg, env) {
   if (!cookieStoreStub(env)) {
     return privateJsonResponse({
-      error: { message: "COOKIE_STORE 尚未綁定；請用 wrangler.toml 部署，或繼續使用 GEMINI_COOKIE Secret。" },
+      error: { message: "COOKIE_STORE 尚未綁定；請使用仓库的 wrangler.toml 部署后再匯入。" },
     }, 503);
   }
 
@@ -2353,6 +2490,7 @@ async function handleCookieImport(request, cfg, env) {
     const record = { ...auth, updated_at: new Date().toISOString() };
     await writeStoredAuth(env, record);
     const importedCfg = applyStoredAuth(cfg, record);
+    await invalidateModelCatalog(importedCfg);
     return privateJsonResponse({
       status: "imported",
       cookie: cookieSummary(importedCfg),
@@ -2366,11 +2504,12 @@ async function handleCookieImport(request, cfg, env) {
 async function handleCookieDelete(cfg, env) {
   try {
     await clearStoredAuth(env);
-    const fallback = getConfig(env);
+    await invalidateModelCatalog(cfg);
+    const anonymous = getConfig(env);
     return privateJsonResponse({
       status: "deleted",
-      cookie: cookieSummary(fallback),
-      message: fallback.cookie ? "已移除面板覆寫，恢復使用環境 Secret。" : "已移除面板 Cookie。",
+      cookie: cookieSummary(anonymous),
+      message: "已移除 Durable Object 中的 Cookie；Worker 目前為未登入狀態。",
     });
   } catch (e) {
     return privateJsonResponse({ error: { message: String((e && e.message) || e) } }, 503);
@@ -2382,7 +2521,7 @@ function dashboardResponse(cfg) {
   const boot = JSON.stringify({
     version: VERSION,
     defaultModel: cfg.default_model,
-    models: Object.entries(MODELS).map(([id, model]) => ({ id, description: model.desc })),
+    models: [],
   }).replace(/</g, "\\u003c");
 
   const html = `<!doctype html>
@@ -2584,7 +2723,7 @@ function dashboardResponse(cfg) {
 
       <section class="surface" id="models" aria-labelledby="models-title">
         <div class="section-head">
-          <div><h2 id="models-title">模型與實際路由</h2><p>一般清單顯示穩定別名；即時探測會真的向 Gemini 各送一個短請求，確認上游回到哪個模型。</p></div>
+          <div><h2 id="models-title">模型與實際路由</h2><p>清單由目前帳號的 Gemini 網頁資料動態建立；即時探測會真的向每個模型送出短請求，確認上游路由。</p></div>
           <button class="button secondary" id="probe-models" type="button">即時探測</button>
         </div>
         <div class="model-list" id="model-list" role="table" aria-label="模型清單"></div>
@@ -2608,7 +2747,7 @@ function dashboardResponse(cfg) {
             <div class="inline-actions">
               <button class="button secondary" id="refresh-cookie" type="button">刷新 Cookie</button>
               <button class="button secondary" id="verify-cookie" type="button">驗證 Cookie</button>
-              <button class="button danger" id="clear-cookie" type="button">移除面板覆寫</button>
+              <button class="button danger" id="clear-cookie" type="button">移除登入 Cookie</button>
             </div>
           </div>
           <form class="import-panel" id="cookie-form">
@@ -2696,6 +2835,13 @@ function dashboardResponse(cfg) {
       const select = byId("play-model");
       list.textContent = "";
       select.textContent = "";
+      if (!models.length) {
+        const empty = document.createElement("div");
+        empty.className = "model-row";
+        empty.textContent = "套用 API 金鑰後載入目前帳號的動態模型清單。";
+        list.appendChild(empty);
+        return;
+      }
       models.forEach(function (model) {
         const row = document.createElement("div");
         row.className = "model-row";
@@ -2719,7 +2865,7 @@ function dashboardResponse(cfg) {
     }
 
     function sourceLabel(source) {
-      return source === "dashboard" ? "面板持久匯入" : source === "secret" ? "Worker Secret" : source === "inline" ? "程式內設定" : "未設定";
+      return source === "durable_object" ? "Durable Object" : "未設定";
     }
 
     function renderCookie(cookie) {
@@ -2756,8 +2902,8 @@ function dashboardResponse(cfg) {
       return data;
     }
 
-    async function loadLiveModels() {
-      const data = await readJson(await fetch("/v1/models?live=1", { headers: requestHeaders(false, false) }));
+    async function loadModels(live) {
+      const data = await readJson(await fetch("/v1/models" + (live ? "?live=1" : ""), { headers: requestHeaders(false, false) }));
       renderModels(data.data || []);
       return data;
     }
@@ -2776,6 +2922,7 @@ function dashboardResponse(cfg) {
       if (adminKey) sessionStorage.setItem("gemini-worker-admin-key", adminKey);
       else sessionStorage.removeItem("gemini-worker-admin-key");
       try {
+        await loadModels(false);
         await loadAdmin("");
         showToast("金鑰已套用，管理狀態已載入", false);
       } catch (error) {
@@ -2788,7 +2935,7 @@ function dashboardResponse(cfg) {
 
     byId("probe-models").addEventListener("click", async function (event) {
       setBusy(event.currentTarget, true, "探測中…");
-      try { await loadLiveModels(); showToast("模型路由探測完成", false); }
+      try { await loadModels(true); showToast("模型路由探測完成", false); }
       catch (error) { showToast(error.message, true); }
       finally { setBusy(event.currentTarget, false, ""); }
     });
@@ -2808,6 +2955,7 @@ function dashboardResponse(cfg) {
           headers: requestHeaders(true, false)
         }));
         renderCookie(data.cookie);
+        if (data.status !== "reauth_required") await loadModels(false);
         showToast(data.message, data.status === "reauth_required");
       } catch (error) { showToast(error.message, true); }
       finally { setBusy(event.currentTarget, false, ""); }
@@ -2827,17 +2975,19 @@ function dashboardResponse(cfg) {
         }));
         byId("cookie-input").value = "";
         renderCookie(data.cookie);
+        await loadModels(false);
         showToast(data.message, false);
       } catch (error) { showToast(error.message, true); }
       finally { setBusy(button, false, ""); }
     });
 
     byId("clear-cookie").addEventListener("click", async function (event) {
-      if (!confirm("移除面板匯入的 Cookie，並恢復環境 Secret？")) return;
+      if (!confirm("移除 Durable Object 中的登入 Cookie，讓 Worker 回到未登入狀態？")) return;
       setBusy(event.currentTarget, true, "移除中…");
       try {
         const data = await readJson(await fetch("/admin/cookie", { method: "DELETE", headers: requestHeaders(true, false) }));
         renderCookie(data.cookie);
+        await loadModels(false);
         showToast(data.message, false);
       } catch (error) { showToast(error.message, true); }
       finally { setBusy(event.currentTarget, false, ""); }
@@ -2885,6 +3035,7 @@ function dashboardResponse(cfg) {
     byId("base-url").textContent = location.origin + "/v1";
     renderModels(BOOT.models);
     loadHealth();
+    loadModels(false).catch(function (error) { if (apiKey) showToast(error.message, true); });
     if (adminKey || apiKey) loadAdmin("").catch(function (error) { showToast(error.message, true); });
   </script>
 </body>
@@ -2968,12 +3119,14 @@ export default {
         if (path === "/v1/models") {
           const live = parseBool(url.searchParams.get("live"), false);
           const inspection = live ? await inspectModelRoutes(cfg) : null;
+          const models = inspection ? inspection.models : await getModelCatalog(cfg);
           return jsonResponse({
             object: "list",
-            dynamic: live,
+            dynamic: true,
+            routes_probed: live,
             actual_models: inspection ? inspection.actual_models : undefined,
             cookie: inspection ? inspection.cookie : undefined,
-            data: Object.entries(MODELS).map(([n, c]) => ({
+            data: Object.entries(models).map(([n, c]) => ({
               id: n,
               object: "model",
               created: 1700000000,
@@ -2986,11 +3139,13 @@ export default {
         if (path.startsWith("/v1beta/models")) {
           const live = parseBool(url.searchParams.get("live"), false);
           const inspection = live ? await inspectModelRoutes(cfg) : null;
+          const models = inspection ? inspection.models : await getModelCatalog(cfg);
           return jsonResponse({
-            dynamic: live,
+            dynamic: true,
+            routesProbed: live,
             actualModels: inspection ? inspection.actual_models : undefined,
             cookie: inspection ? inspection.cookie : undefined,
-            models: Object.entries(MODELS).map(([n, c]) => ({
+            models: Object.entries(models).map(([n, c]) => ({
               name: `models/${n}`,
               displayName: n,
               description: c.desc,
@@ -3007,7 +3162,7 @@ export default {
           if (wantsHtml) return dashboardResponse(cfg);
           const publicCfg = { ...cfg, cookie: "", sapisid: "", xsrf_token: "" };
           await refreshGeminiBl(publicCfg);
-          return jsonResponse({ status: "ok", version: VERSION, gemini_bl: publicCfg.gemini_bl, models: Object.keys(MODELS) });
+          return jsonResponse({ status: "ok", version: VERSION, gemini_bl: publicCfg.gemini_bl, model_catalog: "dynamic" });
         }
         if (path === "/debug") {
           if (!cfg.enable_debug) return jsonResponse({ error: "debug endpoint disabled" }, 403);
@@ -3063,7 +3218,9 @@ export default {
 // entrypoint，因此仅在 Node 环境挂到 globalThis，不进入线上导出表。
 if (typeof process !== "undefined" && process.versions && process.versions.node) {
   globalThis.__GEMINI_WORKER_TEST__ = {
-    MODELS, SLOT, resolveModel, getConfig, getRequestConfig, parseAuthPayload, cookieSummary, authCacheKey,
+    MODEL_CATEGORIES, SLOT, modelAlias, extractRpcPayload, extractRouteVariant, buildModelCatalog,
+    defaultModelName, modelNameForCategory, resolveModel, getConfig, getRequestConfig, applyStoredAuth,
+    parseAuthPayload, cookieSummary, authCacheKey,
     getSetCookieValues, mergeRotatedCookies,
     buildPayload, getUrl, buildHeaders, cleanText,
     extractTextsFromLine, extractResponseText, extractActualModel, routeStatus, generate, generateResult, generateStream,

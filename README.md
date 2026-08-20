@@ -12,6 +12,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 - Image input via Scotty upload (requires cookie)
 - Raw TCP socket upstream to bypass Cloudflare egress 429
 - Actual upstream model reporting and Cookie/Pro route verification
+- Dynamic model discovery from Gemini Web: Flash-Lite, Flash, and Pro, each with Standard or Extended Thinking
 - Built-in web console for models, masked Cookie health/import/refresh, and Playground
 - Automatic persisted Cookie rotation every six hours through a Cloudflare Cron Trigger
 - Built-in retry, timeout, and debug probe endpoint
@@ -22,7 +23,10 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/banana2556/gemini2api-cfworker)
 
-Click the button above, or paste `worker.js` directly into **Cloudflare Dashboard > Workers & Pages > Create > Quick Edit > Deploy**. The console and environment-secret Cookie work in either case. Persistent Cookie import and six-hour automatic refresh additionally need the `COOKIE_STORE` Durable Object binding and Cron Trigger from `wrangler.toml`; without them, the console refuses persistent writes and keeps using `GEMINI_COOKIE`.
+Click the button above, or deploy the repository with Wrangler. Cookie login is
+stored **only** in the `COOKIE_STORE` Durable Object, so a bare Quick Edit paste
+is suitable only for anonymous use unless you also configure the binding,
+migration, and Cron Trigger from `wrangler.toml`.
 
 ### Wrangler CLI
 
@@ -46,55 +50,65 @@ Durable Object migration provisions persistent Cookie storage on deployment.
 
 ## Configuration
 
-Edit the `CONFIG` object at the top of `worker.js`, or set Worker environment variables / secrets with the same names (secrets take precedence).
+Edit the `CONFIG` object at the top of `worker.js`, or set the non-Cookie Worker
+variables/secrets with the same names. Gemini login fields are deliberately not
+read from Worker variables or secrets.
 
 | Variable | Required? | Description | Default |
 |---|---|---|---|
 | `API_KEYS` | With a Cookie | Comma-separated keys or JSON array. May be empty only for anonymous Gemini use | `[]` |
 | `ADMIN_KEY` | No | Exclusive Cookie-management key when set; only when empty does management accept an `API_KEYS` value | `""` |
-| `GEMINI_COOKIE` | Conditional | Full cookie string or `{"cookie":"...","sapisid":"..."}`; required for image input and logged-in features | `""` |
-| `SAPISID` | No | Explicit SAPISID (auto-extracted from cookie if omitted) | `""` |
-| `GEMINI_AUTH_USER` | No | Google multi-account index (`0`, `1`, …); imported automatically from `gemini-auth.json` | `""` |
-| `GEMINI_XSRF_TOKEN` | No | Explicit Gemini `SNlM0e`; normally fetched automatically or imported from `gemini-auth.json` | `""` |
 | `GEMINI_BL` | No | Fallback Gemini web build number; the current value is detected automatically and cached | `boq_assistant-bard-web-server_...` |
 | `GEMINI_ORIGIN` | No | Upstream origin; point to a relay proxy if 429'd | `https://gemini.google.com` |
 | `UPSTREAM_SOCKET` | No | Prefer raw TCP socket over fetch to upstream | `true` |
-| `DEFAULT_MODEL` | No | Default model when client doesn't specify | `gemini-3.6-flash` |
+| `DEFAULT_MODEL` | No | Preferred dynamic alias; empty automatically selects the current Flash Standard model | `""` |
 | `RETRY_ATTEMPTS` | No | Max retry count on upstream failure | `3` |
 | `RETRY_DELAY_SEC` | No | Delay between retries (seconds) | `2` |
 | `REQUEST_TIMEOUT_SEC` | No | Per-request timeout (seconds) | `180` |
 | `LOG_REQUESTS` | No | Enable request logging | `true` |
 | `ENABLE_DEBUG` | No | Enable `/debug` probe endpoint | `true` |
 
-No variable is required for anonymous text requests. If `GEMINI_COOKIE` is
-configured directly or through the console, `API_KEYS` becomes mandatory for
-generation endpoints. A Cookie is needed for image input and other logged-in
-Gemini features.
+No variable is required for anonymous text requests. Import a Cookie from the
+web console for image input and logged-in Gemini features. Once the Durable
+Object contains a Cookie, `API_KEYS` becomes mandatory for generation
+endpoints.
 
-> **Security tip:** Set `GEMINI_COOKIE`, `API_KEYS`, and `ADMIN_KEY` as Worker **secrets** (`wrangler secret put`) to avoid committing them to the repo. The console keeps API and Admin keys separately in the current tab's `sessionStorage` and never returns the raw Gemini Cookie from a status endpoint.
+> **Security tip:** Keep `API_KEYS` and `ADMIN_KEY` as Worker secrets. The
+> console keeps them separately in the current tab's `sessionStorage`; Gemini
+> Cookie values live only in Durable Object storage and are never returned by a
+> status endpoint. Legacy `GEMINI_COOKIE`, `SAPISID`, `GEMINI_AUTH_USER`, and
+> `GEMINI_XSRF_TOKEN` secrets are ignored by the Worker and may be deleted.
 
 ## Models
 
-| Model ID | Mode | Description |
+`GET /v1/models` calls Gemini Web's current `GetUserStatus` data and builds
+exactly six aliases for the account in use:
+
+| Base family | Standard | Extended Thinking |
 |---|---|---|
-| `gemini-3.7-flash` | Fast | Latest all-around model |
-| `gemini-3.6-flash` | Fast | All-around model |
-| `gemini-3.6-flash-thinking` | Thinking | Deep thinking, longest output (~20k chars) |
-| `gemini-3.1-pro` | Pro | Pro model (requires cookie) |
-| `gemini-3.1-pro-enhanced` | Pro Extended | Verified mapping to Gemini Web's **Extended Thinking** option (`thinking level = 3`) |
-| `gemini-auto` | Auto | Auto model selection |
-| `gemini-3.6-flash-thinking-lite` | Dynamic | Dynamic thinking with adaptive depth |
-| `gemini-3.6-flash-lite` | Lite | Lightweight fast model |
+| Flash-Lite | `gemini-{version}-flash-lite` | `gemini-{version}-flash-lite-thinking` |
+| Flash | `gemini-{version}-flash` | `gemini-{version}-flash-thinking` |
+| Pro | `gemini-{version}-pro` | `gemini-{version}-pro-thinking` |
 
-Append `@think=N` to override thinking depth, e.g. `gemini-3.6-flash@think=0`.
+The version and both upstream route IDs are discovered rather than hard-coded.
+For example, different rollout cohorts can expose `3.6 Flash` or `3.7 Flash`.
+The catalog is cached for six hours and automatically fetched again after it
+expires or the Durable Object Cookie changes.
 
-Model IDs are stable client aliases. To probe Gemini and see the model each
-alias actually routes to, request `GET /v1/models?live=1`. Each entry then
+Standard uses Gemini Web thinking level `1`; Extended Thinking uses level `2`
+for all three families. Level `3` is the separate **Deep Think** feature and is
+not one of these six aliases.
+
+To probe Gemini and see the model each alias actually routes to, request
+`GET /v1/models?live=1`. Each entry then
 includes `available`, `upstream_model`, and `route_status` (`matched`,
-`fallback`, `auto`, or `unknown`). Live probing makes one small upstream
+`fallback`, or `unknown`). Live probing makes one small upstream
 request per alias, so use it for diagnostics rather than every client startup.
 
 ## Usage Examples
+
+Fetch `/v1/models` first and substitute an ID returned for your account. The
+examples below use `gemini-3.6-flash` only as an illustrative rollout value.
 
 ### OpenAI SDK (Python)
 
@@ -141,15 +155,15 @@ curl "https://your-worker.workers.dev/v1beta/models/gemini-3.6-flash:generateCon
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/` | Browser console when `Accept: text/html`; health JSON for API clients |
-| `GET` | `/health` | Health JSON (version + current `GEMINI_BL` + model list) |
+| `GET` | `/health` | Health JSON (version + current `GEMINI_BL`; model catalog is served separately) |
 | `GET` | `/admin/status` | Masked configuration/Cookie status; `?verify=1` probes Pro, `?live=1` probes all aliases |
 | `PUT` | `/admin/cookie` | Persist a raw Cookie or Cookie Sync JSON (management key required) |
 | `POST` | `/admin/cookie/refresh` | Validate the login and persist approved values returned by Google's `Set-Cookie` rotation |
-| `DELETE` | `/admin/cookie` | Remove the dashboard override and fall back to `GEMINI_COOKIE` |
-| `GET` | `/v1/models` | List stable aliases; add `?live=1` for actual upstream routes |
+| `DELETE` | `/admin/cookie` | Remove the Durable Object Cookie and return to unsigned-in mode |
+| `GET` | `/v1/models` | Discover the six current aliases; add `?live=1` for actual upstream routes |
 | `POST` | `/v1/chat/completions` | Chat completions (OpenAI format) |
 | `POST` | `/v1/responses` | Responses API (Codex CLI) |
-| `GET` | `/v1beta/models` | List stable aliases; add `?live=1` for actual upstream routes |
+| `GET` | `/v1beta/models` | Discover the six current aliases; add `?live=1` for actual upstream routes |
 | `POST` | `/v1beta/models/{model}:generateContent` | Generate content (Google format) |
 | `POST` | `/v1beta/models/{model}:streamGenerateContent` | Stream generate (Google format) |
 | `GET` | `/debug` | Connectivity, Cookie token, and Pro-route probe |
@@ -192,11 +206,16 @@ anti-abuse fields, including `AEC`, `NID`, and `COMPASS`; unrelated preference,
 search, and billing fields are not stored or sent upstream.
 
 The console's **Refresh Cookie** action and the repository's six-hour Cron
-Trigger request Gemini's signed-in app page, merge only approved `Set-Cookie`
-rotations, and save the result as the `COOKIE_STORE` override. Manual refresh
+Trigger request Gemini's signed-in app page, save the newest page token, merge
+only approved `Set-Cookie` rotations, and persist the result in `COOKIE_STORE`. Manual refresh
 returns `refreshed`, `no_rotation`, or `reauth_required`. Rotation can extend a
 valid session, but it cannot recreate an expired Google login;
 `reauth_required` means the Cookie must be exported from the browser again.
+
+Durable Object storage survives normal Worker code deployments, so redeploying
+does not require another import. Re-import is needed only when Google rejects
+the login, the Cookie is manually deleted, or the Durable Object storage itself
+is removed.
 
 ## Troubleshooting
 
