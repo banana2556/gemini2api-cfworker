@@ -2625,6 +2625,7 @@ function dashboardResponse(cfg) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Gemini Bridge · Console</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23fbad41'/%3E%3Cstop offset='1' stop-color='%23f6821f'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M16 2 L19.5 12.5 L30 16 L19.5 19.5 L16 30 L12.5 19.5 L2 16 L12.5 12.5 Z' fill='url(%23g)'/%3E%3C/svg%3E">
   <style nonce="${nonce}">
     :root {
       --bg: #0a0e15;
@@ -2634,7 +2635,7 @@ function dashboardResponse(cfg) {
       --line-hi: #31456293;
       --ink: #e7eef8;
       --muted: #8598b3;
-      --faint: #5b6c85;
+      --faint: #71829c;
       --accent: #62b6ff;
       --accent-2: #9a8cff;
       --ok: #3ed598;
@@ -2665,16 +2666,16 @@ function dashboardResponse(cfg) {
     }
     .brand { display: flex; align-items: center; gap: 11px; }
     .brand svg { width: 30px; height: 30px; flex: none; }
-    .brand strong { font-size: 1.02rem; letter-spacing: .01em; }
+    .brand strong { font-size: 1rem; letter-spacing: .01em; }
     .brand .ver {
-      margin-left: 8px; font: 11.5px var(--mono); color: var(--accent);
+      margin-left: 8px; font: .75rem var(--mono); color: var(--accent);
       border: 1px solid rgba(98, 182, 255, .35); border-radius: 99px; padding: 1.5px 8px;
       background: rgba(98, 182, 255, .08);
     }
     .tabs { display: flex; gap: 4px; margin-inline: auto; padding: 4px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); }
     .tab {
       border: 0; background: transparent; color: var(--muted);
-      padding: 7px 16px; border-radius: 9px; font-weight: 600; font-size: .92rem;
+      padding: 7px 16px; border-radius: 9px; font-weight: 600; font-size: .9rem;
       transition: color .15s, background .15s;
     }
     .tab:hover { color: var(--ink); }
@@ -2683,7 +2684,7 @@ function dashboardResponse(cfg) {
     .keybox input {
       width: clamp(140px, 22vw, 230px); min-height: 36px; padding: 0 12px;
       border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2);
-      font-family: var(--mono); font-size: .88rem;
+      font-family: var(--mono); font-size: .9rem;
     }
     .keybox input:focus, textarea:focus, select:focus, .prompt input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(98, 182, 255, .15); }
     .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; box-shadow: 0 0 0 3px rgba(91, 108, 133, .15); }
@@ -2699,13 +2700,19 @@ function dashboardResponse(cfg) {
     }
     .btn:hover { filter: brightness(1.18); border-color: #3f587c; }
     .btn:active { transform: translateY(1px); }
-    .btn:disabled { opacity: .5; cursor: wait; filter: none; }
+    .btn:disabled { opacity: .5; cursor: progress; filter: none; }
+    .btn:focus-visible, .tab:focus-visible, .switch:focus-visible, .model-list button:focus-visible,
+    .value-btn:focus-visible, .howto summary:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px;
+    }
+    .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
     .btn.primary {
       border: 0; color: #06121f;
       background: linear-gradient(135deg, var(--accent), var(--accent-2));
     }
     .btn.danger { color: var(--err); border-color: rgba(255, 115, 115, .4); background: rgba(255, 115, 115, .07); }
-    .btn.sm { min-height: 30px; padding: 0 11px; font-size: .82rem; border-radius: 8px; }
+    .btn.danger.armed { color: #14060a; border-color: var(--err); background: var(--err); }
+    .btn.sm { min-height: 30px; padding: 0 11px; font-size: .85rem; border-radius: 8px; }
 
     main { width: min(1160px, calc(100% - 36px)); margin: 26px auto 60px; }
     .panel { display: none; }
@@ -2715,7 +2722,7 @@ function dashboardResponse(cfg) {
     .panel-head h1 { margin: 0; font-size: 1.25rem; letter-spacing: .01em; }
     .panel-head p { margin: 0; color: var(--muted); font-size: .9rem; }
     .panel-tools { margin-left: auto; display: flex; align-items: center; gap: 12px; }
-    .stamp { color: var(--faint); font-size: .8rem; font-family: var(--mono); }
+    .stamp { color: var(--faint); font-size: .75rem; font-family: var(--mono); }
 
     .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
     .card {
@@ -2724,23 +2731,25 @@ function dashboardResponse(cfg) {
       padding: 16px 18px;
     }
     .stat header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .stat header span { color: var(--muted); font-size: .8rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+    .stat header span { color: var(--muted); font-size: .75rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
     .stat .value { margin-top: 9px; font-size: 1.18rem; font-weight: 700; letter-spacing: -.01em; overflow-wrap: anywhere; }
     .stat .value.mono { font-family: var(--mono); font-size: .95rem; font-weight: 600; }
-    .stat .sub { margin-top: 5px; color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
+    .value-btn { display: block; width: 100%; border: 0; background: none; padding: 0; text-align: left; color: inherit; cursor: pointer; overflow-wrap: anywhere; }
+    .value-btn:hover { color: var(--accent); }
+    .stat .sub { margin-top: 5px; color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
 
     .card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
     .card-head h2 { margin: 0; font-size: 1rem; }
-    .chip { font: 11.5px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 2px 9px; background: var(--panel-2); }
+    .chip { font: .75rem var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 2px 9px; background: var(--panel-2); }
     .card-head .btn { margin-left: auto; }
 
     .model-list { list-style: none; margin: 0; padding: 0; max-height: 340px; overflow: auto; border-top: 1px solid var(--line); }
     .model-list li { display: flex; align-items: baseline; gap: 12px; padding: 9px 4px; border-bottom: 1px solid var(--line); }
-    .model-list code { font: 600 .86rem var(--mono); color: var(--accent); flex: none; }
-    .model-list span { color: var(--muted); font-size: .82rem; flex: 1; min-width: 120px; overflow-wrap: anywhere; }
-    .model-list button { border: 0; background: none; color: var(--faint); font-size: .78rem; padding: 2px 6px; border-radius: 6px; }
+    .model-list code { font: 600 .9rem var(--mono); color: var(--accent); flex: none; }
+    .model-list span { color: var(--muted); font-size: .85rem; flex: 1; min-width: 120px; overflow-wrap: anywhere; }
+    .model-list button { border: 0; background: none; color: var(--faint); font-size: .85rem; padding: 2px 6px; border-radius: 6px; }
     .model-list button:hover { color: var(--ink); background: var(--line); }
-    .empty { color: var(--faint); font-size: .86rem; padding: 14px 4px; }
+    .empty { color: var(--faint); font-size: .9rem; padding: 14px 4px; }
 
     .baseline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; color: var(--muted); font-size: .85rem; }
     .baseline code { font: .85rem var(--mono); color: var(--ink); background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 3px 10px; }
@@ -2751,28 +2760,33 @@ function dashboardResponse(cfg) {
     @media (max-width: 880px) { .grid-2 { grid-template-columns: 1fr; } }
     textarea {
       width: 100%; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-2);
-      padding: 11px 13px; resize: vertical; font-family: var(--mono); font-size: .86rem; line-height: 1.5;
+      padding: 11px 13px; resize: vertical; font-family: var(--mono); font-size: .9rem; line-height: 1.5;
     }
-    .hint { color: var(--faint); font-size: .8rem; margin: 9px 2px 13px; }
+    .hint { color: var(--faint); font-size: .85rem; margin: 9px 2px 13px; }
     .hint code { font-family: var(--mono); color: var(--muted); }
-    .actions { display: flex; gap: 9px; flex-wrap: wrap; }
-    .note { margin-top: 12px; font-size: .84rem; color: var(--muted); min-height: 1.2em; overflow-wrap: anywhere; }
+    .actions { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; }
+    .actions .danger { margin-left: auto; }
+    .howto { margin: 0 0 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); font-size: .85rem; }
+    .howto summary { padding: 9px 13px; cursor: pointer; color: var(--accent); font-weight: 600; list-style-position: inside; }
+    .howto ol { margin: 0; padding: 0 16px 12px 36px; color: var(--muted); display: grid; gap: 6px; }
+    .howto code { font-family: var(--mono); color: var(--ink); }
+    .note { margin-top: 12px; font-size: .85rem; color: var(--muted); min-height: 1.2em; overflow-wrap: anywhere; }
     .note.bad { color: var(--err); }
     .note.good { color: var(--ok); }
 
-    .kv { display: grid; grid-template-columns: max-content 1fr; gap: 7px 16px; margin: 0; font-size: .86rem; }
+    .kv { display: grid; grid-template-columns: max-content 1fr; gap: 7px 16px; margin: 0; font-size: .9rem; }
     .kv dt { color: var(--muted); }
-    .kv dd { margin: 0; font-family: var(--mono); font-size: .84rem; overflow-wrap: anywhere; }
+    .kv dd { margin: 0; font-family: var(--mono); font-size: .85rem; overflow-wrap: anywhere; }
     .kv dd.good { color: var(--ok); }
     .kv dd.bad { color: var(--err); }
-    .issues { margin: 12px 0 0; padding: 10px 12px; border: 1px solid rgba(246, 185, 92, .35); border-radius: 10px; background: rgba(246, 185, 92, .07); color: var(--warn); font-size: .83rem; }
+    .issues { margin: 12px 0 0; padding: 10px 12px; border: 1px solid rgba(246, 185, 92, .35); border-radius: 10px; background: rgba(246, 185, 92, .07); color: var(--warn); font-size: .85rem; }
     .issues ul { margin: 4px 0 0; padding-left: 18px; }
 
     .play-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 13px; }
     .play-bar label { color: var(--muted); font-size: .85rem; display: inline-flex; align-items: center; gap: 7px; }
     select {
       min-height: 36px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px;
-      background: var(--panel-2); font-family: var(--mono); font-size: .86rem; max-width: 300px;
+      background: var(--panel-2); font-family: var(--mono); font-size: .9rem; max-width: 300px;
     }
     .switch { position: relative; width: 36px; height: 20px; appearance: none; border-radius: 99px; background: var(--line); transition: background .15s; cursor: pointer; flex: none; }
     .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--muted); transition: transform .15s, background .15s; }
@@ -2781,20 +2795,20 @@ function dashboardResponse(cfg) {
     .prompt { display: grid; gap: 10px; }
     .prompt input {
       width: 100%; min-height: 38px; padding: 0 13px; border: 1px solid var(--line);
-      border-radius: 11px; background: var(--panel-2); font-family: var(--mono); font-size: .86rem;
+      border-radius: 11px; background: var(--panel-2); font-family: var(--mono); font-size: .9rem;
     }
     .output {
       margin-top: 16px; border: 1px solid var(--line); border-radius: var(--radius);
       background: var(--panel-2); min-height: 190px; padding: 15px 17px;
-      white-space: pre-wrap; overflow-wrap: anywhere; font-size: .92rem; line-height: 1.65;
+      white-space: pre-wrap; overflow-wrap: anywhere; font-size: .95rem; line-height: 1.65;
     }
     .output.idle { color: var(--faint); }
-    .out-meta { margin-top: 9px; color: var(--faint); font: .78rem var(--mono); min-height: 1.2em; }
+    .out-meta { margin-top: 9px; color: var(--faint); font: .85rem var(--mono); min-height: 1.2em; }
 
     #toast {
       position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 20px);
       padding: 10px 18px; border-radius: 11px; border: 1px solid var(--line-hi);
-      background: #172335; color: var(--ink); font-size: .88rem;
+      background: #172335; color: var(--ink); font-size: .9rem;
       opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; max-width: 84vw; z-index: 30;
     }
     #toast.show { opacity: 1; transform: translate(-50%, 0); }
@@ -2809,21 +2823,22 @@ function dashboardResponse(cfg) {
   <header class="top">
     <div class="brand">
       <svg viewBox="0 0 32 32" aria-hidden="true">
-        <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#62b6ff"/><stop offset="1" stop-color="#9a8cff"/>
+        <defs><linearGradient id="spark" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#fbad41"/><stop offset="1" stop-color="#f6821f"/>
         </linearGradient></defs>
-        <path d="M16 2 L19.5 12.5 L30 16 L19.5 19.5 L16 30 L12.5 19.5 L2 16 L12.5 12.5 Z" fill="url(#g)"/>
+        <path d="M16 2 L19.5 12.5 L30 16 L19.5 19.5 L16 30 L12.5 19.5 L2 16 L12.5 12.5 Z" fill="url(#spark)"/>
       </svg>
       <strong>Gemini Bridge</strong>
       <span class="ver" id="ver-chip">v—</span>
     </div>
     <nav class="tabs" role="tablist" aria-label="主要區域">
-      <button class="tab active" data-tab="info" role="tab" aria-selected="true">資訊面板</button>
-      <button class="tab" data-tab="import" role="tab" aria-selected="false">匯入面板</button>
-      <button class="tab" data-tab="play" role="tab" aria-selected="false">Playground</button>
+      <button class="tab active" data-tab="info" role="tab" aria-selected="true" aria-controls="panel-info">資訊面板</button>
+      <button class="tab" data-tab="import" role="tab" aria-selected="false" aria-controls="panel-import" tabindex="-1">匯入面板</button>
+      <button class="tab" data-tab="play" role="tab" aria-selected="false" aria-controls="panel-play" tabindex="-1">Playground</button>
     </nav>
     <div class="keybox">
-      <span class="dot" id="conn-dot" title="連線狀態"></span>
+      <span class="dot" id="conn-dot" title="連線狀態" aria-hidden="true"></span>
+      <span class="sr-only" id="conn-text" role="status">尚未連線</span>
       <input id="api-key" type="password" placeholder="API Key" autocomplete="off" aria-label="API Key">
       <button class="btn primary" id="connect">連線</button>
     </div>
@@ -2859,7 +2874,7 @@ function dashboardResponse(cfg) {
         </article>
         <article class="card stat" id="stat-build">
           <header><span>Gemini Build</span><i class="dot"></i></header>
-          <div class="value mono" id="build-value" title="點擊複製">—</div><div class="sub">—</div>
+          <button type="button" class="value mono value-btn" id="build-value" title="點擊複製" aria-label="複製 Gemini Build 字串">—</button><div class="sub">—</div>
         </article>
         <article class="card stat" id="stat-version">
           <header><span>版本</span><i class="dot"></i></header>
@@ -2871,7 +2886,7 @@ function dashboardResponse(cfg) {
         <div class="card-head">
           <h2>模型列表</h2>
           <span class="chip" id="model-count">0 個</span>
-          <button class="btn sm" id="refresh-models">刷新目錄</button>
+          <button class="btn sm" id="refresh-models">重新整理目錄</button>
         </div>
         <ul class="model-list" id="model-list"><li class="empty">尚未載入模型。</li></ul>
         <div class="baseline">
@@ -2889,11 +2904,19 @@ function dashboardResponse(cfg) {
       <div class="grid-2">
         <div class="card">
           <div class="card-head"><h2>匯入 Cookie</h2></div>
-          <textarea id="import-input" rows="9" spellcheck="false" placeholder="貼上完整 Cookie 字串或 Cookie Sync JSON…"></textarea>
+          <details class="howto">
+            <summary>如何取得 Cookie？</summary>
+            <ol>
+              <li>用桌面瀏覽器登入 <code>gemini.google.com</code>。</li>
+              <li>按 F12 開啟開發人員工具 → Network（網路）→ 重新整理頁面後點選任一個 gemini.google.com 的請求。</li>
+              <li>在 Request Headers 找到 <code>cookie:</code>，複製整行的值貼到下方；內容需包含 <code>SAPISID</code> 與 <code>__Secure-1PSID</code>。</li>
+            </ol>
+          </details>
+          <textarea id="import-input" rows="9" spellcheck="false" aria-label="Cookie 內容" placeholder="貼上完整 Cookie 字串或 Cookie Sync JSON…"></textarea>
           <p class="hint">支援：原始 Cookie 字串、Cookie Sync JSON、或 <code>{"auth": …}</code> 包裝；需含 <code>SAPISID</code> 與 <code>__Secure-1PSID</code>（原文只存入 DO，不會回傳）。</p>
           <div class="actions">
             <button class="btn primary" id="do-import">匯入並驗證</button>
-            <button class="btn" id="do-refresh">手動刷新</button>
+            <button class="btn" id="do-refresh">手動重新整理</button>
             <button class="btn danger" id="do-delete">清除 Cookie</button>
           </div>
           <p class="note" id="import-note"></p>
@@ -2923,10 +2946,10 @@ function dashboardResponse(cfg) {
           <button class="btn primary push-right" id="play-send">送出（Ctrl+Enter）</button>
         </div>
         <div class="prompt">
-          <input id="play-system" placeholder="System prompt（選填）" spellcheck="false">
-          <textarea id="play-input" rows="5" spellcheck="false" placeholder="輸入訊息…"></textarea>
+          <input id="play-system" aria-label="System prompt（選填）" placeholder="System prompt（選填）" spellcheck="false">
+          <textarea id="play-input" rows="5" spellcheck="false" aria-label="訊息內容" placeholder="輸入訊息…"></textarea>
         </div>
-        <div class="output idle" id="play-output">回應會顯示在這裡。</div>
+        <div class="output idle" id="play-output" aria-live="polite">回應會顯示在這裡。</div>
         <div class="out-meta" id="play-meta"></div>
       </div>
     </section>
@@ -2973,7 +2996,7 @@ function dashboardResponse(cfg) {
       btn.textContent = on ? "處理中…" : btn.dataset.label;
     }
     async function copyText(value, label) {
-      try { await navigator.clipboard.writeText(value); toast(label + "已複製"); }
+      try { await navigator.clipboard.writeText(value); toast(label + " 已複製"); }
       catch (_) { toast("無法存取剪貼簿，請手動複製", true); }
     }
     function fmtTime(iso) {
@@ -3003,18 +3026,29 @@ function dashboardResponse(cfg) {
       return v;
     }
 
-    // ── 分頁切換 ──
-    var tabs = document.querySelectorAll(".tab");
-    tabs.forEach(function (tab) {
-      tab.addEventListener("click", function () {
-        tabs.forEach(function (t) {
-          var on = t === tab;
-          t.classList.toggle("active", on);
-          t.setAttribute("aria-selected", on ? "true" : "false");
-        });
-        document.querySelectorAll(".panel").forEach(function (p) {
-          p.classList.toggle("active", p.id === "panel-" + tab.dataset.tab);
-        });
+    // ── 分頁切換（含 ARIA tab 鍵盤模式）──
+    var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
+    function activateTab(tab, focus) {
+      tabs.forEach(function (t) {
+        var on = t === tab;
+        t.classList.toggle("active", on);
+        t.setAttribute("aria-selected", on ? "true" : "false");
+        t.tabIndex = on ? 0 : -1;
+      });
+      document.querySelectorAll(".panel").forEach(function (p) {
+        p.classList.toggle("active", p.id === "panel-" + tab.dataset.tab);
+      });
+      if (focus) tab.focus();
+    }
+    tabs.forEach(function (tab, i) {
+      tab.addEventListener("click", function () { activateTab(tab, false); });
+      tab.addEventListener("keydown", function (e) {
+        var next = null;
+        if (e.key === "ArrowRight") next = tabs[(i + 1) % tabs.length];
+        else if (e.key === "ArrowLeft") next = tabs[(i - 1 + tabs.length) % tabs.length];
+        else if (e.key === "Home") next = tabs[0];
+        else if (e.key === "End") next = tabs[tabs.length - 1];
+        if (next) { e.preventDefault(); activateTab(next, true); }
       });
     });
 
@@ -3031,12 +3065,14 @@ function dashboardResponse(cfg) {
         bv.dataset.full = bl;
         setStat("stat-build", bl ? "ok" : "warn", "", bl ? "動態上游 build（點擊值可複製）" : "尚未取得上游 build");
         $("conn-dot").className = "dot ok";
+        $("conn-text").textContent = state.key ? "已連線" : "服務正常，尚未輸入 API Key";
         return true;
       } catch (e) {
         setStat("stat-worker", "err", "離線", "健康檢查失敗：" + e.message);
         setStat("stat-build", "err", "", "無法取得");
         $("build-value").textContent = "—";
         $("conn-dot").className = "dot err";
+        $("conn-text").textContent = "連線失敗：" + e.message;
         return false;
       }
     }
@@ -3057,7 +3093,7 @@ function dashboardResponse(cfg) {
         ["結構檢查", yn(cookie.structurally_valid), cookie.structurally_valid ? "good" : "bad"],
         ["儲存來源", cookie.source || "—"],
         ["匯入時間", fmtTime(cookie.updated_at)],
-        ["上次刷新", fmtTime(cookie.refreshed_at)],
+        ["上次重新整理", fmtTime(cookie.refreshed_at)],
         ["Cookie 數量", (cookie.cookie_count != null ? cookie.cookie_count : "—") + (cookie.removed_cookie_count ? "（已過濾 " + cookie.removed_cookie_count + "）" : "")],
         ["大小", cookie.byte_length != null ? cookie.byte_length + " bytes" : "—"],
         ["SAPISID", yn(cookie.sapisid_present), cookie.sapisid_present ? "good" : "bad"],
@@ -3095,7 +3131,7 @@ function dashboardResponse(cfg) {
 
       if (!cookie.configured) {
         setStat("stat-cookie", "warn", "未設定", "尚未匯入 Cookie，僅能使用訪客路由");
-        setStat("stat-cron", "idle", "待命", "每 10 分鐘排程運行，但目前沒有可刷新的 Cookie");
+        setStat("stat-cron", "idle", "待命", "每 10 分鐘排程運行，目前沒有可重新整理的 Cookie");
       } else {
         var healthy = cookie.structurally_valid && cookie.sapisid_present;
         setStat("stat-cookie", healthy ? "ok" : "warn",
@@ -3104,11 +3140,12 @@ function dashboardResponse(cfg) {
           ((cookie.issues || []).length ? " · " + cookie.issues.length + " 項問題" : ""));
         var ago = fmtAgo(cookie.refreshed_at);
         if (!cookie.refreshed_at) {
-          setStat("stat-cron", "warn", "每 10 分鐘", "尚未有刷新紀錄");
+          setStat("stat-cron", "warn", "尚未執行", "每 10 分鐘排程 · 還沒有重新整理紀錄");
         } else {
           var overdue = Date.now() - new Date(cookie.refreshed_at).getTime() > 30 * 60000;
-          setStat("stat-cron", overdue ? "warn" : "ok", "每 10 分鐘",
-            "上次刷新：" + ago + (overdue ? "（已逾期）" : ""));
+          setStat("stat-cron", overdue ? "warn" : "ok", overdue ? "已逾期" : "正常",
+            "每 10 分鐘排程 · 上次重新整理：" + ago +
+            (overdue ? "；請按「手動重新整理」或檢查 Cookie 是否失效" : ""));
         }
       }
       renderCookieKv(data.cookie || null);
@@ -3149,7 +3186,7 @@ function dashboardResponse(cfg) {
           var code = document.createElement("code"); code.textContent = m.id;
           var desc = document.createElement("span"); desc.textContent = m.description || "";
           var btn = document.createElement("button"); btn.type = "button"; btn.textContent = "複製";
-          btn.addEventListener("click", function () { copyText(m.id, "模型 ID "); });
+          btn.addEventListener("click", function () { copyText(m.id, "模型 ID"); });
           li.append(code, desc, btn);
           list.append(li);
         });
@@ -3225,9 +3262,28 @@ function dashboardResponse(cfg) {
         return api("/admin/cookie/refresh", { method: "POST", headers: headersFor(false) });
       });
     });
+    var deleteArmTimer = null;
+    function disarmDelete() {
+      var btn = $("do-delete");
+      clearTimeout(deleteArmTimer);
+      btn.classList.remove("armed");
+      btn.textContent = "清除 Cookie";
+    }
     $("do-delete").addEventListener("click", function () {
-      if (!confirm("確定要刪除已儲存的 Cookie？Worker 將回到未登入狀態。")) return;
-      importAction(this, function () {
+      var btn = this;
+      if (!state.key) { toast("請先輸入 API Key 並連線", true); return; }
+      if (!btn.classList.contains("armed")) {
+        btn.classList.add("armed");
+        btn.textContent = "再按一次確認清除";
+        importNote("清除後 Worker 將回到未登入狀態；6 秒內再按一次即執行。", true);
+        deleteArmTimer = setTimeout(function () {
+          disarmDelete();
+          importNote("", false);
+        }, 6000);
+        return;
+      }
+      disarmDelete();
+      importAction(btn, function () {
         return api("/admin/cookie", { method: "DELETE", headers: headersFor(false) });
       });
     });
@@ -3238,6 +3294,7 @@ function dashboardResponse(cfg) {
     });
 
     // ── Playground ──
+    var playAbort = null;
     async function runPlayground() {
       var btn = $("play-send");
       var out = $("play-output");
@@ -3253,7 +3310,10 @@ function dashboardResponse(cfg) {
       messages.push({ role: "user", content: text });
       var wantStream = $("play-stream").checked;
 
-      busy(btn, true);
+      playAbort = new AbortController();
+      if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+      btn.textContent = "中止";
+      btn.classList.add("danger");
       out.className = "output";
       out.textContent = "";
       meta.textContent = wantStream ? "串流中…" : "等待回應…";
@@ -3263,6 +3323,7 @@ function dashboardResponse(cfg) {
           method: "POST",
           headers: headersFor(true),
           body: JSON.stringify({ model: model, messages: messages, stream: wantStream }),
+          signal: playAbort.signal,
         });
         if (!res.ok) {
           var errData = null;
@@ -3311,23 +3372,38 @@ function dashboardResponse(cfg) {
         }
         if (!out.textContent) { out.className = "output idle"; out.textContent = "(沒有文字內容)"; }
       } catch (e) {
-        out.className = "output idle";
-        out.textContent = "請求失敗：" + e.message;
-        meta.textContent = "失敗";
-        toast(e.message, true);
-      } finally { busy(btn, false); }
+        if (e && e.name === "AbortError") {
+          meta.textContent = "已中止" + (out.textContent ? "（保留已收到的內容）" : "");
+          if (!out.textContent) { out.className = "output idle"; out.textContent = "請求已中止。"; }
+        } else {
+          out.className = "output idle";
+          out.textContent = "請求失敗：" + e.message;
+          meta.textContent = "失敗";
+          toast(e.message, true);
+        }
+      } finally {
+        playAbort = null;
+        btn.classList.remove("danger");
+        btn.textContent = btn.dataset.label;
+      }
     }
-    $("play-send").addEventListener("click", runPlayground);
+    $("play-send").addEventListener("click", function () {
+      if (playAbort) { playAbort.abort(); return; }
+      runPlayground();
+    });
     $("play-input").addEventListener("keydown", function (e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runPlayground(); }
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        e.preventDefault();
+        if (!playAbort) runPlayground();
+      }
     });
 
     // ── 其他 ──
     $("build-value").addEventListener("click", function () {
-      if (this.dataset.full) copyText(this.dataset.full, "Gemini Build ");
+      if (this.dataset.full) copyText(this.dataset.full, "Gemini Build");
     });
     $("copy-base").addEventListener("click", function () {
-      copyText(location.origin + "/v1", "API Base URL ");
+      copyText(location.origin + "/v1", "API Base URL");
     });
     $("refresh-info").addEventListener("click", function () {
       var btn = this; busy(btn, true);
