@@ -2616,7 +2616,6 @@ function dashboardResponse(cfg) {
   const boot = JSON.stringify({
     version: VERSION,
     defaultModel: cfg.default_model,
-    models: [],
   }).replace(/</g, "\\u003c");
 
   const html = `<!doctype html>
@@ -2624,501 +2623,741 @@ function dashboardResponse(cfg) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>Gemini Bridge · Worker Console</title>
+  <meta name="color-scheme" content="dark">
+  <title>Gemini Bridge · Console</title>
   <style nonce="${nonce}">
     :root {
-      --canvas: #dfe7e9;
-      --paper: #f8faf9;
-      --ink: #152127;
-      --muted: #52636b;
-      --line: #c7d2d6;
-      --line-strong: #92a4ab;
-      --blue: #2456c7;
-      --blue-dark: #163b8d;
-      --blue-soft: #e5ecff;
-      --green: #19704f;
-      --green-soft: #dff3e9;
-      --amber: #8a5700;
-      --amber-soft: #fff0cc;
-      --red: #a32929;
-      --red-soft: #fde6e4;
+      --bg: #0a0e15;
+      --panel: #111927;
+      --panel-2: #0d1420;
+      --line: #1e2c40;
+      --line-hi: #31456293;
+      --ink: #e7eef8;
+      --muted: #8598b3;
+      --faint: #5b6c85;
+      --accent: #62b6ff;
+      --accent-2: #9a8cff;
+      --ok: #3ed598;
+      --warn: #f6b95c;
+      --err: #ff7373;
+      --mono: ui-monospace, SFMono-Regular, "Cascadia Code", Menlo, Consolas, monospace;
       --radius: 14px;
-      --shadow: 0 18px 42px rgba(30, 51, 60, .13);
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--ink);
-      background: var(--canvas);
     }
     * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
-    body { margin: 0; min-width: 320px; background: var(--canvas); color: var(--ink); }
-    button, input, textarea, select { font: inherit; }
-    button, select { cursor: pointer; }
-    a { color: inherit; }
-    .skip-link { position: fixed; left: 1rem; top: -5rem; z-index: 20; padding: .7rem 1rem; background: var(--ink); color: #fff; border-radius: 8px; }
-    .skip-link:focus { top: 1rem; }
-    .shell { width: min(1180px, calc(100% - 32px)); margin: 28px auto; background: var(--paper); border-radius: 18px; box-shadow: var(--shadow); overflow: hidden; }
-    .topbar { min-height: 76px; display: flex; align-items: center; gap: 24px; padding: 14px 24px; color: #fff; background: #17252c; }
-    .brand { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; flex: 0 0 auto; }
-    .brand svg { width: 34px; height: 34px; }
-    .brand-copy { display: grid; gap: 1px; }
-    .brand-copy strong { font-size: .98rem; letter-spacing: -.01em; }
-    .brand-copy span { color: #b9c9cf; font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
-    .access { margin-left: auto; display: grid; grid-template-columns: minmax(160px, 280px) auto; align-items: end; gap: 8px; }
-    .access label { display: grid; gap: 5px; color: #c6d3d8; font-size: .75rem; }
-    .access input { width: 100%; min-height: 38px; border: 1px solid #4b616a; border-radius: 9px; padding: 0 11px; color: #fff; background: #22343c; font-size: 1rem; }
-    main { display: block; }
-    .hero { padding: clamp(38px, 6vw, 76px) clamp(24px, 6vw, 72px) 32px; }
-    .hero-copy { max-width: 760px; }
-    h1, h2, h3, p { margin-top: 0; }
-    h1 { max-width: 14ch; margin-bottom: 18px; font-size: 4.4rem; line-height: .98; letter-spacing: -.04em; text-wrap: balance; }
-    .hero-copy p { max-width: 66ch; margin-bottom: 30px; color: var(--muted); font-size: 1.03rem; line-height: 1.65; }
-    .health-strip { display: grid; grid-template-columns: 1.1fr 1.8fr 1.2fr; border-block: 1px solid var(--line); }
-    .datum { min-width: 0; padding: 16px 18px 16px 0; }
-    .datum + .datum { padding-left: 18px; border-left: 1px solid var(--line); }
-    .datum span { display: block; margin-bottom: 6px; color: var(--muted); font-size: .72rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-    .datum strong { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: .9rem; font-weight: 650; }
-    .datum code { overflow: hidden; color: var(--ink); font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .82rem; text-overflow: ellipsis; white-space: nowrap; }
-    .dot { width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; background: var(--line-strong); box-shadow: 0 0 0 4px rgba(146, 164, 171, .2); }
-    .dot.ok { background: var(--green); box-shadow: 0 0 0 4px rgba(25, 112, 79, .16); }
-    .section-nav { display: flex; gap: 7px; padding: 0 clamp(24px, 6vw, 72px) 30px; overflow-x: auto; }
-    .section-nav a { padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .83rem; font-weight: 650; text-decoration: none; white-space: nowrap; }
-    .section-nav a:hover { color: var(--blue-dark); border-color: #8aa5e8; background: var(--blue-soft); }
-    .surface { padding: clamp(34px, 5vw, 58px) clamp(24px, 6vw, 72px); border-top: 1px solid var(--line); }
-    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
-    .section-head h2 { margin-bottom: 7px; font-size: 2.1rem; line-height: 1.08; letter-spacing: -.03em; }
-    .section-head p { max-width: 64ch; margin-bottom: 0; color: var(--muted); line-height: 1.55; }
-    .button { min-height: 42px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 0; border-radius: 9px; padding: 0 15px; color: #fff; background: var(--blue); font-weight: 700; transition: background-color .18s ease, box-shadow .18s ease, transform .18s ease; }
-    .button:hover { background: var(--blue-dark); box-shadow: 0 8px 18px rgba(36, 86, 199, .2); transform: translateY(-1px); }
-    .button:active { transform: translateY(0); }
-    .button.secondary { border: 1px solid var(--line-strong); color: var(--ink); background: transparent; }
-    .topbar .button.secondary { color: #fff; border-color: #5e737c; }
-    .button.secondary:hover { color: var(--blue-dark); border-color: #7192de; background: var(--blue-soft); box-shadow: none; }
-    .topbar .button.secondary:hover { color: #fff; border-color: #9db3bc; background: #304750; }
-    .button.danger { color: var(--red); border: 1px solid #e0aaa5; background: transparent; }
-    .button.danger:hover { color: #7b1c1c; background: var(--red-soft); box-shadow: none; }
-    .button:disabled { cursor: wait; opacity: .58; transform: none; box-shadow: none; }
-    .model-list { border-block: 1px solid var(--line-strong); }
-    .model-row { display: grid; grid-template-columns: minmax(210px, .85fr) minmax(260px, 1.4fr); gap: 24px; align-items: center; min-height: 74px; padding: 13px 4px; border-bottom: 1px solid var(--line); }
-    .model-row:last-child { border-bottom: 0; }
-    .model-id { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .86rem; font-weight: 700; overflow-wrap: anywhere; }
-    .model-desc { color: var(--muted); font-size: .9rem; line-height: 1.45; }
-    .badge { width: max-content; display: inline-flex; align-items: center; gap: 7px; border-radius: 999px; padding: 6px 9px; color: var(--muted); background: #e9eef0; font-size: .72rem; font-weight: 750; white-space: nowrap; }
-    .badge.good { color: var(--green); background: var(--green-soft); }
-    .badge.warn { color: var(--amber); background: var(--amber-soft); }
-    .badge.bad { color: var(--red); background: var(--red-soft); }
-    .cookie-layout { display: grid; grid-template-columns: minmax(260px, .75fr) minmax(360px, 1.25fr); gap: clamp(32px, 6vw, 72px); }
-    .status-panel h3, .import-panel h3, .play-form h3, .result-panel h3 { margin-bottom: 9px; font-size: 1.12rem; letter-spacing: -.015em; }
-    .status-panel > p, .import-panel > p { color: var(--muted); line-height: 1.55; }
-    .cookie-state { margin: 26px 0; padding-block: 20px; border-block: 1px solid var(--line); }
-    .cookie-state strong { display: block; margin-bottom: 8px; font-size: 1.35rem; letter-spacing: -.02em; }
-    .cookie-state span { color: var(--muted); font-size: .88rem; }
-    .facts { display: grid; gap: 12px; margin: 0; }
-    .facts div { display: flex; justify-content: space-between; gap: 24px; }
-    .facts dt { color: var(--muted); }
-    .facts dd { margin: 0; font-weight: 700; text-align: right; }
-    .inline-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 24px; }
-    .field { display: grid; gap: 8px; margin-bottom: 17px; }
-    .field label { font-size: .84rem; font-weight: 750; }
-    .field small { color: var(--muted); line-height: 1.5; }
-    textarea, select, .text-input { width: 100%; border: 1px solid var(--line-strong); border-radius: 10px; padding: 12px 13px; color: var(--ink); background: #fff; }
-    textarea { min-height: 148px; resize: vertical; line-height: 1.5; }
-    textarea::placeholder, input::placeholder { color: #718188; opacity: 1; }
-    textarea:focus, select:focus, input:focus, button:focus-visible, a:focus-visible { outline: 3px solid rgba(36, 86, 199, .28); outline-offset: 2px; border-color: var(--blue); }
-    .security-note { margin: 18px 0 0; padding: 13px 15px; border-radius: 10px; color: #374c55; background: #e8eff1; font-size: .82rem; line-height: 1.55; }
-    .play-layout { display: grid; grid-template-columns: minmax(320px, .9fr) minmax(360px, 1.1fr); gap: clamp(28px, 5vw, 56px); align-items: start; }
-    .play-form textarea { min-height: 180px; }
-    .result-panel { min-width: 0; }
-    .result-meta { min-height: 24px; margin-bottom: 9px; color: var(--muted); font-size: .78rem; }
-    .result { min-height: 292px; margin: 0; overflow: auto; border: 1px solid #2a3b43; border-radius: 12px; padding: 18px; color: #dce8eb; background: #17252c; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .85rem; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .result.fresh { animation: result-reveal .38s cubic-bezier(.16, 1, .3, 1); }
-    @keyframes result-reveal { from { clip-path: inset(0 0 18% 0); filter: blur(2px); } to { clip-path: inset(0); filter: blur(0); } }
-    .endpoint { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 24px; padding: 14px 0; border-top: 1px solid var(--line); }
-    .endpoint code { color: var(--blue-dark); font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .86rem; overflow-wrap: anywhere; }
-    .text-button { border: 0; padding: 6px 0; color: var(--blue-dark); background: transparent; font-weight: 750; }
-    .text-button:hover { text-decoration: underline; text-underline-offset: 3px; }
-    .footer { display: flex; justify-content: space-between; gap: 20px; padding: 22px clamp(24px, 6vw, 72px); border-top: 1px solid var(--line); color: var(--muted); font-size: .78rem; }
-    .toast { position: fixed; right: 22px; bottom: 22px; z-index: 30; max-width: min(420px, calc(100vw - 44px)); padding: 13px 16px; border-radius: 10px; color: #fff; background: #17252c; box-shadow: 0 12px 30px rgba(15, 33, 41, .24); transform: translateY(20px); opacity: 0; pointer-events: none; transition: transform .24s cubic-bezier(.16, 1, .3, 1), opacity .2s ease; }
-    .toast.show { transform: translateY(0); opacity: 1; }
-    .toast.error { background: #7f2424; }
-    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-    @media (max-width: 760px) {
-      .shell { width: 100%; margin: 0; border-radius: 0; }
-      .topbar { align-items: stretch; flex-direction: column; gap: 14px; padding: 18px 20px; }
-      .access { width: 100%; margin-left: 0; grid-template-columns: minmax(0, 1fr); }
-      .access .button { grid-column: 1 / -1; }
-      .hero { padding-top: 42px; }
-      h1 { font-size: 3rem; }
-      .section-head h2 { font-size: 1.8rem; }
-      .health-strip { grid-template-columns: 1fr; }
-      .datum { padding: 14px 0; }
-      .datum + .datum { padding-left: 0; border-left: 0; border-top: 1px solid var(--line); }
-      .section-head { align-items: stretch; flex-direction: column; }
-      .section-head .button { width: 100%; }
-      .model-row { grid-template-columns: 1fr auto; gap: 7px 14px; padding-block: 16px; }
-      .model-desc { grid-column: 1 / -1; }
-      .cookie-layout, .play-layout { grid-template-columns: 1fr; }
-      .import-panel, .result-panel { padding-top: 30px; border-top: 1px solid var(--line); }
-      .footer { flex-direction: column; }
+    html, body { margin: 0; }
+    body {
+      min-width: 340px; min-height: 100vh; color: var(--ink);
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Noto Sans TC", sans-serif;
+      background:
+        radial-gradient(1100px 500px at 15% -10%, rgba(98, 182, 255, .10), transparent 60%),
+        radial-gradient(900px 500px at 90% -20%, rgba(154, 140, 255, .09), transparent 55%),
+        var(--bg);
     }
-    @media (prefers-reduced-motion: reduce) {
-      html { scroll-behavior: auto; }
-      *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+    button, input, textarea, select { font: inherit; color: inherit; }
+    button { cursor: pointer; }
+    ::selection { background: rgba(98, 182, 255, .3); }
+
+    .top {
+      position: sticky; top: 0; z-index: 10;
+      display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+      padding: 12px 22px; border-bottom: 1px solid var(--line);
+      background: rgba(10, 14, 21, .82); backdrop-filter: blur(12px);
+    }
+    .brand { display: flex; align-items: center; gap: 11px; }
+    .brand svg { width: 30px; height: 30px; flex: none; }
+    .brand strong { font-size: 1.02rem; letter-spacing: .01em; }
+    .brand .ver {
+      margin-left: 8px; font: 11.5px var(--mono); color: var(--accent);
+      border: 1px solid rgba(98, 182, 255, .35); border-radius: 99px; padding: 1.5px 8px;
+      background: rgba(98, 182, 255, .08);
+    }
+    .tabs { display: flex; gap: 4px; margin-inline: auto; padding: 4px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); }
+    .tab {
+      border: 0; background: transparent; color: var(--muted);
+      padding: 7px 16px; border-radius: 9px; font-weight: 600; font-size: .92rem;
+      transition: color .15s, background .15s;
+    }
+    .tab:hover { color: var(--ink); }
+    .tab.active { color: var(--ink); background: linear-gradient(180deg, #1d2b41, #17233595); box-shadow: inset 0 0 0 1px var(--line-hi); }
+    .keybox { display: flex; align-items: center; gap: 8px; }
+    .keybox input {
+      width: clamp(140px, 22vw, 230px); min-height: 36px; padding: 0 12px;
+      border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2);
+      font-family: var(--mono); font-size: .88rem;
+    }
+    .keybox input:focus, textarea:focus, select:focus, .prompt input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(98, 182, 255, .15); }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; box-shadow: 0 0 0 3px rgba(91, 108, 133, .15); }
+    .dot.ok   { background: var(--ok);   box-shadow: 0 0 0 3px rgba(62, 213, 152, .16); }
+    .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(246, 185, 92, .16); }
+    .dot.err  { background: var(--err);  box-shadow: 0 0 0 3px rgba(255, 115, 115, .16); }
+
+    .btn {
+      display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 0 15px;
+      border: 1px solid var(--line-hi); border-radius: 10px; background: #16233795;
+      color: var(--ink); font-weight: 600; font-size: .9rem;
+      transition: filter .15s, transform .05s, border-color .15s;
+    }
+    .btn:hover { filter: brightness(1.18); border-color: #3f587c; }
+    .btn:active { transform: translateY(1px); }
+    .btn:disabled { opacity: .5; cursor: wait; filter: none; }
+    .btn.primary {
+      border: 0; color: #06121f;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    }
+    .btn.danger { color: var(--err); border-color: rgba(255, 115, 115, .4); background: rgba(255, 115, 115, .07); }
+    .btn.sm { min-height: 30px; padding: 0 11px; font-size: .82rem; border-radius: 8px; }
+
+    main { width: min(1160px, calc(100% - 36px)); margin: 26px auto 60px; }
+    .panel { display: none; }
+    .panel.active { display: block; animation: rise .22s ease; }
+    @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+    .panel-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 4px 2px 18px; }
+    .panel-head h1 { margin: 0; font-size: 1.25rem; letter-spacing: .01em; }
+    .panel-head p { margin: 0; color: var(--muted); font-size: .9rem; }
+    .panel-tools { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+    .stamp { color: var(--faint); font-size: .8rem; font-family: var(--mono); }
+
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+    .card {
+      border: 1px solid var(--line); border-radius: var(--radius);
+      background: linear-gradient(180deg, var(--panel), var(--panel-2));
+      padding: 16px 18px;
+    }
+    .stat header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .stat header span { color: var(--muted); font-size: .8rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+    .stat .value { margin-top: 9px; font-size: 1.18rem; font-weight: 700; letter-spacing: -.01em; overflow-wrap: anywhere; }
+    .stat .value.mono { font-family: var(--mono); font-size: .95rem; font-weight: 600; }
+    .stat .sub { margin-top: 5px; color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
+
+    .card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+    .card-head h2 { margin: 0; font-size: 1rem; }
+    .chip { font: 11.5px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 2px 9px; background: var(--panel-2); }
+    .card-head .btn { margin-left: auto; }
+
+    .model-list { list-style: none; margin: 0; padding: 0; max-height: 340px; overflow: auto; border-top: 1px solid var(--line); }
+    .model-list li { display: flex; align-items: baseline; gap: 12px; padding: 9px 4px; border-bottom: 1px solid var(--line); }
+    .model-list code { font: 600 .86rem var(--mono); color: var(--accent); flex: none; }
+    .model-list span { color: var(--muted); font-size: .82rem; flex: 1; min-width: 120px; overflow-wrap: anywhere; }
+    .model-list button { border: 0; background: none; color: var(--faint); font-size: .78rem; padding: 2px 6px; border-radius: 6px; }
+    .model-list button:hover { color: var(--ink); background: var(--line); }
+    .empty { color: var(--faint); font-size: .86rem; padding: 14px 4px; }
+
+    .baseline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; color: var(--muted); font-size: .85rem; }
+    .baseline code { font: .85rem var(--mono); color: var(--ink); background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 3px 10px; }
+    .mt { margin-top: 16px; }
+    .push-right { margin-left: auto; }
+
+    .grid-2 { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(0, .92fr); gap: 16px; align-items: start; }
+    @media (max-width: 880px) { .grid-2 { grid-template-columns: 1fr; } }
+    textarea {
+      width: 100%; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-2);
+      padding: 11px 13px; resize: vertical; font-family: var(--mono); font-size: .86rem; line-height: 1.5;
+    }
+    .hint { color: var(--faint); font-size: .8rem; margin: 9px 2px 13px; }
+    .hint code { font-family: var(--mono); color: var(--muted); }
+    .actions { display: flex; gap: 9px; flex-wrap: wrap; }
+    .note { margin-top: 12px; font-size: .84rem; color: var(--muted); min-height: 1.2em; overflow-wrap: anywhere; }
+    .note.bad { color: var(--err); }
+    .note.good { color: var(--ok); }
+
+    .kv { display: grid; grid-template-columns: max-content 1fr; gap: 7px 16px; margin: 0; font-size: .86rem; }
+    .kv dt { color: var(--muted); }
+    .kv dd { margin: 0; font-family: var(--mono); font-size: .84rem; overflow-wrap: anywhere; }
+    .kv dd.good { color: var(--ok); }
+    .kv dd.bad { color: var(--err); }
+    .issues { margin: 12px 0 0; padding: 10px 12px; border: 1px solid rgba(246, 185, 92, .35); border-radius: 10px; background: rgba(246, 185, 92, .07); color: var(--warn); font-size: .83rem; }
+    .issues ul { margin: 4px 0 0; padding-left: 18px; }
+
+    .play-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 13px; }
+    .play-bar label { color: var(--muted); font-size: .85rem; display: inline-flex; align-items: center; gap: 7px; }
+    select {
+      min-height: 36px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px;
+      background: var(--panel-2); font-family: var(--mono); font-size: .86rem; max-width: 300px;
+    }
+    .switch { position: relative; width: 36px; height: 20px; appearance: none; border-radius: 99px; background: var(--line); transition: background .15s; cursor: pointer; flex: none; }
+    .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--muted); transition: transform .15s, background .15s; }
+    .switch:checked { background: rgba(98, 182, 255, .45); }
+    .switch:checked::after { transform: translateX(16px); background: var(--accent); }
+    .prompt { display: grid; gap: 10px; }
+    .prompt input {
+      width: 100%; min-height: 38px; padding: 0 13px; border: 1px solid var(--line);
+      border-radius: 11px; background: var(--panel-2); font-family: var(--mono); font-size: .86rem;
+    }
+    .output {
+      margin-top: 16px; border: 1px solid var(--line); border-radius: var(--radius);
+      background: var(--panel-2); min-height: 190px; padding: 15px 17px;
+      white-space: pre-wrap; overflow-wrap: anywhere; font-size: .92rem; line-height: 1.65;
+    }
+    .output.idle { color: var(--faint); }
+    .out-meta { margin-top: 9px; color: var(--faint); font: .78rem var(--mono); min-height: 1.2em; }
+
+    #toast {
+      position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 20px);
+      padding: 10px 18px; border-radius: 11px; border: 1px solid var(--line-hi);
+      background: #172335; color: var(--ink); font-size: .88rem;
+      opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; max-width: 84vw; z-index: 30;
+    }
+    #toast.show { opacity: 1; transform: translate(-50%, 0); }
+    #toast.bad { border-color: rgba(255, 115, 115, .5); color: #ffc2c2; }
+    @media (max-width: 760px) {
+      .tabs { order: 3; width: 100%; margin: 2px 0 0; }
+      .keybox { margin-left: auto; }
     }
   </style>
 </head>
 <body>
-  <!--
-    THESIS: One operator bench exposes route truth, credential health, and a real request without dashboard clutter.
-    OWN-WORLD: Cool daylight paper, dense ink, cobalt action, ruled data rows, and restrained status color.
-    STORY: Confirm the Worker, inspect models and Cookie health, then prove the route in Playground.
-    FIRST VIEWPORT: Large operational headline over a three-part health rail; section controls remain immediately below.
-    FORM: Single-page operator console, direct functional extension; seed key scoped-worker-console.
-    FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
-  -->
-  <a class="skip-link" href="#content">跳到主要內容</a>
-  <div class="shell">
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="Gemini Bridge 首頁">
-        <svg viewBox="0 0 36 36" aria-hidden="true">
-          <rect x="2" y="2" width="14" height="14" rx="4" fill="#8eb0ff"/>
-          <rect x="20" y="2" width="14" height="14" rx="7" fill="#4fd09b"/>
-          <rect x="2" y="20" width="14" height="14" rx="7" fill="#ffffff"/>
-          <rect x="20" y="20" width="14" height="14" rx="4" fill="#f1bf58"/>
-        </svg>
-        <span class="brand-copy"><strong>Gemini Bridge</strong><span>Worker Console</span></span>
-      </a>
-      <div class="access">
-        <label for="api-key">API 金鑰
-          <input id="api-key" type="password" autocomplete="off" placeholder="面板與 API">
-        </label>
-        <button class="button secondary" id="connect-key" type="button">套用</button>
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true">
+        <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#62b6ff"/><stop offset="1" stop-color="#9a8cff"/>
+        </linearGradient></defs>
+        <path d="M16 2 L19.5 12.5 L30 16 L19.5 19.5 L16 30 L12.5 19.5 L2 16 L12.5 12.5 Z" fill="url(#g)"/>
+      </svg>
+      <strong>Gemini Bridge</strong>
+      <span class="ver" id="ver-chip">v—</span>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="主要區域">
+      <button class="tab active" data-tab="info" role="tab" aria-selected="true">資訊面板</button>
+      <button class="tab" data-tab="import" role="tab" aria-selected="false">匯入面板</button>
+      <button class="tab" data-tab="play" role="tab" aria-selected="false">Playground</button>
+    </nav>
+    <div class="keybox">
+      <span class="dot" id="conn-dot" title="連線狀態"></span>
+      <input id="api-key" type="password" placeholder="API Key" autocomplete="off" aria-label="API Key">
+      <button class="btn primary" id="connect">連線</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel active" id="panel-info" role="tabpanel">
+      <div class="panel-head">
+        <h1>資訊面板</h1>
+        <p>Worker、排程與 Cookie 的即時狀態總覽。</p>
+        <div class="panel-tools">
+          <span class="stamp" id="info-stamp"></span>
+          <button class="btn sm" id="refresh-info">重新整理</button>
+        </div>
       </div>
-    </header>
 
-    <main id="content">
-      <section class="hero" aria-labelledby="page-title">
-        <div class="hero-copy">
-          <h1 id="page-title">Worker 狀態，一眼看完。</h1>
-          <p>檢查實際模型路由、管理 Gemini 登入 Cookie，並從同一個位址送出測試請求。支援每 10 分鐘排程刷新 <code>__Secure-1PSIDTS</code>，原文不會由狀態 API 回傳。</p>
+      <div class="stat-grid">
+        <article class="card stat" id="stat-worker">
+          <header><span>Worker 狀態</span><i class="dot"></i></header>
+          <div class="value">—</div><div class="sub">正在偵測…</div>
+        </article>
+        <article class="card stat" id="stat-cron">
+          <header><span>Cron 運行狀態</span><i class="dot"></i></header>
+          <div class="value">—</div><div class="sub">—</div>
+        </article>
+        <article class="card stat" id="stat-do">
+          <header><span>Durable Object</span><i class="dot"></i></header>
+          <div class="value">—</div><div class="sub">—</div>
+        </article>
+        <article class="card stat" id="stat-cookie">
+          <header><span>Cookie 狀態</span><i class="dot"></i></header>
+          <div class="value">—</div><div class="sub">—</div>
+        </article>
+        <article class="card stat" id="stat-build">
+          <header><span>Gemini Build</span><i class="dot"></i></header>
+          <div class="value mono" id="build-value" title="點擊複製">—</div><div class="sub">—</div>
+        </article>
+        <article class="card stat" id="stat-version">
+          <header><span>版本</span><i class="dot"></i></header>
+          <div class="value mono">—</div><div class="sub">gemini2api-cfworker</div>
+        </article>
+      </div>
+
+      <div class="card mt">
+        <div class="card-head">
+          <h2>模型列表</h2>
+          <span class="chip" id="model-count">0 個</span>
+          <button class="btn sm" id="refresh-models">刷新目錄</button>
         </div>
-        <div class="health-strip" aria-live="polite">
-          <div class="datum"><span>Worker</span><strong><i class="dot" id="health-dot"></i><b id="health-state">連線中</b></strong></div>
-          <div class="datum"><span>Gemini build</span><strong><code id="build-value">讀取中</code></strong></div>
-          <div class="datum"><span>版本</span><strong><code id="version-value">${VERSION}</code></strong></div>
+        <ul class="model-list" id="model-list"><li class="empty">尚未載入模型。</li></ul>
+        <div class="baseline">
+          API Base URL <code id="base-url">—</code>
+          <button class="btn sm" id="copy-base">複製</button>
         </div>
-      </section>
+      </div>
+    </section>
 
-      <nav class="section-nav" aria-label="頁面區段">
-        <a href="#models">模型</a><a href="#cookie">Cookie</a><a href="#playground">Playground</a>
-      </nav>
-
-      <section class="surface" id="models" aria-labelledby="models-title">
-        <div class="section-head">
-          <div><h2 id="models-title">模型與實際路由</h2><p>清單由目前帳號的 Gemini 網頁資料動態建立，不另外對每個別名送探測請求。</p></div>
-        </div>
-        <div class="model-list" id="model-list" role="table" aria-label="模型清單"></div>
-      </section>
-
-      <section class="surface" id="cookie" aria-labelledby="cookie-title">
-        <div class="section-head"><div><h2 id="cookie-title">Cookie 狀態與匯入</h2><p>支援完整 Cookie header，以及上游 Cookie Sync 擴充輸出的 <code>gemini-auth.json</code>。</p></div></div>
-        <div class="cookie-layout">
-          <div class="status-panel">
-            <h3>目前登入鏈</h3>
-            <p>先檢查 Cookie 結構，再用 GetUserStatus 動態目錄確認這份登入態看得到哪些模型。</p>
-            <div class="cookie-state"><strong id="cookie-state">需要 API 金鑰</strong><span id="cookie-detail">輸入金鑰後讀取，不會顯示 Cookie 值。</span></div>
-            <dl class="facts">
-              <div><dt>來源</dt><dd id="cookie-source">—</dd></div>
-              <div><dt>工作階段</dt><dd id="cookie-session">—</dd></div>
-              <div><dt>XSRF token</dt><dd id="cookie-xsrf">—</dd></div>
-              <div><dt>自動刷新</dt><dd>每 10 分鐘（Cron）</dd></div>
-              <div><dt>最近刷新</dt><dd id="cookie-refreshed">尚未刷新</dd></div>
-              <div><dt>模型目錄</dt><dd id="cookie-route">尚未載入</dd></div>
-            </dl>
-            <div class="inline-actions">
-              <button class="button secondary" id="refresh-cookie" type="button">刷新 Cookie</button>
-              <button class="button secondary" id="verify-cookie" type="button">驗證 Cookie</button>
-              <button class="button danger" id="clear-cookie" type="button">移除登入 Cookie</button>
-            </div>
+    <section class="panel" id="panel-import" role="tabpanel">
+      <div class="panel-head">
+        <h1>匯入面板</h1>
+        <p>將 Gemini 網頁版 Cookie 匯入 Durable Object 持久保存。</p>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><h2>匯入 Cookie</h2></div>
+          <textarea id="import-input" rows="9" spellcheck="false" placeholder="貼上完整 Cookie 字串或 Cookie Sync JSON…"></textarea>
+          <p class="hint">支援：原始 Cookie 字串、Cookie Sync JSON、或 <code>{"auth": …}</code> 包裝；需含 <code>SAPISID</code> 與 <code>__Secure-1PSID</code>（原文只存入 DO，不會回傳）。</p>
+          <div class="actions">
+            <button class="btn primary" id="do-import">匯入並驗證</button>
+            <button class="btn" id="do-refresh">手動刷新</button>
+            <button class="btn danger" id="do-delete">清除 Cookie</button>
           </div>
-          <form class="import-panel" id="cookie-form">
-            <h3>匯入新的登入態</h3>
-            <p>貼上 raw Cookie，或整份 JSON。匯入成功後輸入框會立即清空。</p>
-            <div class="field">
-              <label for="cookie-input">Cookie / gemini-auth.json</label>
-              <textarea id="cookie-input" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="SAPISID=...; __Secure-1PSID=...; ..."></textarea>
-              <small>至少需要 SAPISID，以及 SID、__Secure-1PSID、__Secure-3PSID 其中之一。</small>
-            </div>
-            <button class="button" id="import-cookie" type="submit">持久匯入</button>
-            <p class="security-note">API 呼叫與 Cookie 管理都使用 <code>API_KEYS</code>。持久資料由 <code>COOKIE_STORE</code> Durable Object 保存。</p>
-          </form>
+          <p class="note" id="import-note"></p>
         </div>
-      </section>
-
-      <section class="surface" id="playground" aria-labelledby="playground-title">
-        <div class="section-head"><div><h2 id="playground-title">Playground</h2><p>使用同一組 OpenAI 相容 API，回覆會同時顯示實際上游模型與路由狀態。</p></div></div>
-        <div class="play-layout">
-          <form class="play-form" id="play-form">
-            <h3>送出測試</h3>
-            <div class="field"><label for="play-model">模型</label><select id="play-model"></select></div>
-            <div class="field"><label for="play-prompt">訊息</label><textarea id="play-prompt" required placeholder="請用一句話確認服務正常。">請只回答：Worker OK</textarea></div>
-            <button class="button" id="send-prompt" type="submit">送出請求</button>
-          </form>
-          <div class="result-panel">
-            <h3>回覆</h3>
-            <div class="result-meta" id="result-meta">尚未送出請求</div>
-            <pre class="result" id="result" tabindex="0">回覆會顯示在這裡。</pre>
+        <div class="card">
+          <div class="card-head">
+            <h2>Cookie 資訊</h2>
+            <button class="btn sm" id="reload-cookie">重新讀取</button>
           </div>
+          <dl class="kv" id="cookie-kv"><dt>狀態</dt><dd>尚未載入（需要 API Key）</dd></dl>
+          <div class="issues" id="cookie-issues" hidden></div>
         </div>
-        <div class="endpoint"><code id="base-url">/v1</code><button class="text-button" id="copy-url" type="button">複製 API Base URL</button></div>
-      </section>
-    </main>
-    <footer class="footer"><span>Gemini Bridge ${VERSION}</span><span>Cookie 值永不出現在狀態回應或瀏覽器儲存。</span></footer>
-  </div>
-  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-play" role="tabpanel">
+      <div class="panel-head">
+        <h1>Playground</h1>
+        <p>直接對 <code>/v1/chat/completions</code> 發送測試請求。</p>
+      </div>
+      <div class="card">
+        <div class="play-bar">
+          <label>模型
+            <select id="play-model"><option value="">（尚未載入）</option></select>
+          </label>
+          <label><input type="checkbox" class="switch" id="play-stream" checked>串流輸出</label>
+          <button class="btn primary push-right" id="play-send">送出（Ctrl+Enter）</button>
+        </div>
+        <div class="prompt">
+          <input id="play-system" placeholder="System prompt（選填）" spellcheck="false">
+          <textarea id="play-input" rows="5" spellcheck="false" placeholder="輸入訊息…"></textarea>
+        </div>
+        <div class="output idle" id="play-output">回應會顯示在這裡。</div>
+        <div class="out-meta" id="play-meta"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" role="status"></div>
 
   <script nonce="${nonce}">
-    const BOOT = ${boot};
-    const byId = function (id) { return document.getElementById(id); };
-    let apiKey = sessionStorage.getItem("gemini-worker-api-key") || "";
-    let toastTimer;
+    "use strict";
+    var BOOT = ${boot};
+    var KEY_STORE = "gemini-worker-api-key";
+    var state = { key: "", models: [] };
+    try { state.key = sessionStorage.getItem(KEY_STORE) || ""; } catch (_) {}
 
-    function showToast(message, error) {
-      const toast = byId("toast");
-      toast.textContent = message;
-      toast.className = "toast show" + (error ? " error" : "");
-      clearTimeout(toastTimer);
-      toastTimer = setTimeout(function () { toast.className = "toast"; }, 4200);
+    function $(id) { return document.getElementById(id); }
+    function headersFor(json) {
+      var h = {};
+      if (json) h["Content-Type"] = "application/json";
+      if (state.key) { h["x-api-key"] = state.key; h["Authorization"] = "Bearer " + state.key; }
+      return h;
     }
-
-    function requestHeaders(json) {
-      const headers = {};
-      if (json) headers["Content-Type"] = "application/json";
-      if (apiKey) headers.Authorization = "Bearer " + apiKey;
-      return headers;
-    }
-
-    async function readJson(response) {
-      let data = null;
-      try { data = await response.json(); } catch (_) {}
-      if (!response.ok) {
-        const message = data && data.error ? (data.error.message || data.error) : "HTTP " + response.status;
-        throw new Error(message);
+    async function api(path, opts) {
+      var res = await fetch(path, opts || { headers: headersFor(false) });
+      var data = null;
+      try { data = await res.json(); } catch (_) {}
+      if (!res.ok) {
+        var msg = (data && data.error && (data.error.message || data.error.code)) || ("HTTP " + res.status);
+        var err = new Error(msg); err.status = res.status; throw err;
       }
       return data;
     }
 
-    function catalogLabel(models) {
-      const ids = (models || []).map(function (model) { return model.id; }).filter(function (id) {
-        return id && id.indexOf("-thinking") < 0;
+    var toastTimer = null;
+    function toast(msg, bad) {
+      var t = $("toast");
+      t.textContent = msg;
+      t.className = bad ? "show bad" : "show";
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(function () { t.className = ""; }, 3200);
+    }
+    function busy(btn, on) {
+      if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+      btn.disabled = on;
+      btn.textContent = on ? "處理中…" : btn.dataset.label;
+    }
+    async function copyText(value, label) {
+      try { await navigator.clipboard.writeText(value); toast(label + "已複製"); }
+      catch (_) { toast("無法存取剪貼簿，請手動複製", true); }
+    }
+    function fmtTime(iso) {
+      if (!iso) return "—";
+      var d = new Date(iso);
+      return isNaN(d) ? String(iso) : d.toLocaleString();
+    }
+    function fmtAgo(iso) {
+      if (!iso) return null;
+      var ms = Date.now() - new Date(iso).getTime();
+      if (isNaN(ms)) return null;
+      if (ms < 0) ms = 0;
+      var m = Math.floor(ms / 60000);
+      if (m < 1) return "剛剛";
+      if (m < 60) return m + " 分鐘前";
+      var h = Math.floor(m / 60);
+      if (h < 24) return h + " 小時前";
+      return Math.floor(h / 24) + " 天前";
+    }
+    function setStat(id, tone, value, sub) {
+      var card = $(id);
+      card.querySelector(".dot").className = "dot" + (tone ? " " + tone : "");
+      var v = card.querySelector(".value");
+      if (!v.id) v.textContent = value;
+      var s = card.querySelector(".sub");
+      if (sub !== undefined) s.textContent = sub;
+      return v;
+    }
+
+    // ── 分頁切換 ──
+    var tabs = document.querySelectorAll(".tab");
+    tabs.forEach(function (tab) {
+      tab.addEventListener("click", function () {
+        tabs.forEach(function (t) {
+          var on = t === tab;
+          t.classList.toggle("active", on);
+          t.setAttribute("aria-selected", on ? "true" : "false");
+        });
+        document.querySelectorAll(".panel").forEach(function (p) {
+          p.classList.toggle("active", p.id === "panel-" + tab.dataset.tab);
+        });
       });
-      if (!ids.length) return "尚未載入";
-      if (ids.length === 1 && ids[0] === "gemini-auto") return "訪客自動路由";
-      return ids.join(" · ");
-    }
+    });
 
-    function renderModels(models) {
-      const list = byId("model-list");
-      const select = byId("play-model");
-      list.textContent = "";
-      select.textContent = "";
-      if (!models.length) {
-        const empty = document.createElement("div");
-        empty.className = "model-row";
-        empty.textContent = "套用 API 金鑰後載入目前帳號的動態模型清單。";
-        list.appendChild(empty);
-        byId("cookie-route").textContent = "尚未載入";
-        return;
-      }
-      models.forEach(function (model) {
-        const row = document.createElement("div");
-        row.className = "model-row";
-        row.setAttribute("role", "row");
-        const id = document.createElement("div");
-        id.className = "model-id";
-        id.setAttribute("role", "cell");
-        id.textContent = model.id;
-        const desc = document.createElement("div");
-        desc.className = "model-desc";
-        desc.setAttribute("role", "cell");
-        desc.textContent = model.description || "";
-        row.append(id, desc);
-        list.appendChild(row);
-        const option = document.createElement("option");
-        option.value = model.id;
-        option.textContent = model.id;
-        option.selected = model.id === BOOT.defaultModel;
-        select.appendChild(option);
-      });
-      byId("cookie-route").textContent = catalogLabel(models);
-    }
-
-    function sourceLabel(source) {
-      return source === "durable_object" ? "Durable Object" : "未設定";
-    }
-
-    function renderCookie(cookie) {
-      const configured = cookie && cookie.configured;
-      byId("cookie-state").textContent = configured ? (cookie.structurally_valid ? "結構完整" : "設定不完整") : "尚未設定 Cookie";
-      byId("cookie-detail").textContent = configured
-        ? String(cookie.cookie_count) + " 個登入欄位，" + String(cookie.byte_length) + " bytes" + (cookie.removed_cookie_count ? "；已移除 " + cookie.removed_cookie_count + " 個非必要欄位。" : "；Cookie 值已遮蔽。")
-        : "匿名文字請求仍可使用；圖片與真正 Pro 路由需要登入態。";
-      byId("cookie-source").textContent = sourceLabel(cookie && cookie.source);
-      byId("cookie-session").textContent = cookie && cookie.session_cookie ? cookie.session_cookie : "缺少";
-      byId("cookie-xsrf").textContent = cookie && cookie.xsrf_token_present ? "已匯入" : configured ? "請求時自動抓取" : "—";
-      byId("cookie-refreshed").textContent = cookie && cookie.refreshed_at ? new Date(cookie.refreshed_at).toLocaleString() : "尚未刷新";
-    }
-
+    // ── 資訊面板 ──
     async function loadHealth() {
       try {
-        const data = await readJson(await fetch("/health"));
-        byId("health-dot").className = "dot ok";
-        byId("health-state").textContent = "正常";
-        byId("build-value").textContent = data.gemini_bl || "未取得";
-        byId("version-value").textContent = data.version || BOOT.version;
-      } catch (error) {
-        byId("health-state").textContent = "無法連線";
-        byId("build-value").textContent = error.message;
+        var h = await api("/health");
+        setStat("stat-worker", "ok", "運作中", "健康檢查 /health 正常");
+        setStat("stat-version", "ok", h.version || BOOT.version, "gemini2api-cfworker");
+        $("ver-chip").textContent = "v" + (h.version || BOOT.version || "?");
+        var bl = h.gemini_bl || "";
+        var bv = $("build-value");
+        bv.textContent = bl || "未知";
+        bv.dataset.full = bl;
+        setStat("stat-build", bl ? "ok" : "warn", "", bl ? "動態上游 build（點擊值可複製）" : "尚未取得上游 build");
+        $("conn-dot").className = "dot ok";
+        return true;
+      } catch (e) {
+        setStat("stat-worker", "err", "離線", "健康檢查失敗：" + e.message);
+        setStat("stat-build", "err", "", "無法取得");
+        $("build-value").textContent = "—";
+        $("conn-dot").className = "dot err";
+        return false;
       }
+    }
+
+    function renderCookieKv(cookie) {
+      var kv = $("cookie-kv");
+      kv.textContent = "";
+      if (!cookie) {
+        var dt = document.createElement("dt"); dt.textContent = "狀態";
+        var dd = document.createElement("dd"); dd.textContent = "尚未載入（需要 API Key）";
+        kv.append(dt, dd);
+        $("cookie-issues").hidden = true;
+        return;
+      }
+      var yn = function (v) { return v ? "是" : "否"; };
+      var rows = [
+        ["已設定", yn(cookie.configured), cookie.configured ? "good" : "bad"],
+        ["結構檢查", yn(cookie.structurally_valid), cookie.structurally_valid ? "good" : "bad"],
+        ["儲存來源", cookie.source || "—"],
+        ["匯入時間", fmtTime(cookie.updated_at)],
+        ["上次刷新", fmtTime(cookie.refreshed_at)],
+        ["Cookie 數量", (cookie.cookie_count != null ? cookie.cookie_count : "—") + (cookie.removed_cookie_count ? "（已過濾 " + cookie.removed_cookie_count + "）" : "")],
+        ["大小", cookie.byte_length != null ? cookie.byte_length + " bytes" : "—"],
+        ["SAPISID", yn(cookie.sapisid_present), cookie.sapisid_present ? "good" : "bad"],
+        ["Session Cookie", cookie.session_cookie || "—"],
+        ["XSRF Token", yn(cookie.xsrf_token_present)],
+        ["Auth User", cookie.auth_user != null && cookie.auth_user !== "" ? String(cookie.auth_user) : "—"],
+      ];
+      rows.forEach(function (row) {
+        var dt = document.createElement("dt"); dt.textContent = row[0];
+        var dd = document.createElement("dd"); dd.textContent = row[1];
+        if (row[2]) dd.className = row[2];
+        kv.append(dt, dd);
+      });
+      var box = $("cookie-issues");
+      var issues = cookie.issues || [];
+      if (issues.length) {
+        box.textContent = "";
+        var head = document.createElement("strong"); head.textContent = "偵測到問題";
+        var ul = document.createElement("ul");
+        issues.forEach(function (msg) {
+          var li = document.createElement("li"); li.textContent = String(msg); ul.append(li);
+        });
+        box.append(head, ul);
+        box.hidden = false;
+      } else {
+        box.hidden = true;
+      }
+    }
+
+    function applyAdmin(data) {
+      var cookie = data.cookie || {};
+      setStat("stat-do", data.storage_available ? "ok" : "err",
+        data.storage_available ? "運作中" : "無法使用",
+        "CookieStore（SQLite DO）· 來源：" + (cookie.source || "無"));
+
+      if (!cookie.configured) {
+        setStat("stat-cookie", "warn", "未設定", "尚未匯入 Cookie，僅能使用訪客路由");
+        setStat("stat-cron", "idle", "待命", "每 10 分鐘排程運行，但目前沒有可刷新的 Cookie");
+      } else {
+        var healthy = cookie.structurally_valid && cookie.sapisid_present;
+        setStat("stat-cookie", healthy ? "ok" : "warn",
+          healthy ? "有效" : "異常",
+          (cookie.session_cookie || "無 session") + " · " + (cookie.cookie_count || 0) + " 條" +
+          ((cookie.issues || []).length ? " · " + cookie.issues.length + " 項問題" : ""));
+        var ago = fmtAgo(cookie.refreshed_at);
+        if (!cookie.refreshed_at) {
+          setStat("stat-cron", "warn", "每 10 分鐘", "尚未有刷新紀錄");
+        } else {
+          var overdue = Date.now() - new Date(cookie.refreshed_at).getTime() > 30 * 60000;
+          setStat("stat-cron", overdue ? "warn" : "ok", "每 10 分鐘",
+            "上次刷新：" + ago + (overdue ? "（已逾期）" : ""));
+        }
+      }
+      renderCookieKv(data.cookie || null);
     }
 
     async function loadAdmin() {
-      const data = await readJson(await fetch("/admin/status", { headers: requestHeaders(false) }));
-      renderCookie(data.cookie);
-      return data;
-    }
-
-    async function loadModels(refresh) {
-      const data = await readJson(await fetch("/v1/models" + (refresh ? "?refresh=1" : ""), { headers: requestHeaders(false) }));
-      renderModels(data.data || []);
-      return data;
-    }
-
-    function setBusy(button, busy, text) {
-      if (!button) return;
-      if (!button.dataset.label) button.dataset.label = button.textContent;
-      button.disabled = !!busy;
-      button.textContent = busy ? text : button.dataset.label;
-    }
-
-    byId("connect-key").addEventListener("click", async function () {
-      apiKey = byId("api-key").value.trim();
-      if (apiKey) sessionStorage.setItem("gemini-worker-api-key", apiKey);
-      else sessionStorage.removeItem("gemini-worker-api-key");
-      try {
-        await loadModels(false);
-        await loadAdmin();
-        showToast("金鑰已套用，管理狀態已載入", false);
-      } catch (error) {
-        renderCookie(null);
-        byId("cookie-state").textContent = "管理存取未通過";
-        byId("cookie-detail").textContent = error.message;
-        showToast(error.message, true);
+      if (!state.key) {
+        setStat("stat-cron", "idle", "需要 API Key", "輸入管理金鑰後可查看排程狀態");
+        setStat("stat-do", "idle", "需要 API Key", "輸入管理金鑰後可查看儲存狀態");
+        setStat("stat-cookie", "idle", "需要 API Key", "輸入管理金鑰後可查看 Cookie 狀態");
+        renderCookieKv(null);
+        return;
       }
-    });
-
-    byId("verify-cookie").addEventListener("click", async function (event) {
-      const button = event.currentTarget;
-      setBusy(button, true, "驗證中…");
       try {
-        await loadAdmin();
-        await loadModels(true);
-        showToast("已用動態模型目錄驗證 Cookie", false);
-      } catch (error) { showToast(error.message, true); }
-      finally { setBusy(button, false); }
-    });
+        applyAdmin(await api("/admin/status"));
+      } catch (e) {
+        var msg = e.status === 401 ? "API 金鑰無效" : e.message;
+        setStat("stat-cron", "err", "讀取失敗", msg);
+        setStat("stat-do", "err", "讀取失敗", msg);
+        setStat("stat-cookie", "err", "讀取失敗", msg);
+        throw e;
+      }
+    }
 
-    byId("refresh-cookie").addEventListener("click", async function (event) {
-      const button = event.currentTarget;
-      setBusy(button, true, "刷新中…");
-      try {
-        const data = await readJson(await fetch("/admin/cookie/refresh", {
-          method: "POST",
-          headers: requestHeaders(false)
-        }));
-        renderCookie(data.cookie);
-        if (data.status !== "reauth_required") await loadModels(true);
-        showToast(data.message, data.status === "reauth_required");
-      } catch (error) { showToast(error.message, true); }
-      finally { setBusy(button, false); }
-    });
+    function renderModels(models) {
+      state.models = models || [];
+      $("model-count").textContent = state.models.length + " 個";
+      var list = $("model-list");
+      list.textContent = "";
+      if (!state.models.length) {
+        var li = document.createElement("li");
+        li.className = "empty";
+        li.textContent = state.key ? "目前沒有可用模型。" : "輸入 API Key 並連線後載入模型。";
+        list.append(li);
+      } else {
+        state.models.forEach(function (m) {
+          var li = document.createElement("li");
+          var code = document.createElement("code"); code.textContent = m.id;
+          var desc = document.createElement("span"); desc.textContent = m.description || "";
+          var btn = document.createElement("button"); btn.type = "button"; btn.textContent = "複製";
+          btn.addEventListener("click", function () { copyText(m.id, "模型 ID "); });
+          li.append(code, desc, btn);
+          list.append(li);
+        });
+      }
+      var sel = $("play-model");
+      var prev = sel.value || BOOT.defaultModel || "";
+      sel.textContent = "";
+      if (!state.models.length) {
+        var opt = document.createElement("option");
+        opt.value = ""; opt.textContent = "（尚未載入）";
+        sel.append(opt);
+      } else {
+        state.models.forEach(function (m) {
+          var opt = document.createElement("option");
+          opt.value = m.id; opt.textContent = m.id;
+          sel.append(opt);
+        });
+        if (prev && state.models.some(function (m) { return m.id === prev; })) sel.value = prev;
+      }
+    }
 
-    byId("cookie-form").addEventListener("submit", async function (event) {
-      event.preventDefault();
-      const button = byId("import-cookie");
-      const value = byId("cookie-input").value.trim();
-      if (!value) return;
-      setBusy(button, true, "匯入中…");
+    async function loadModels(force) {
+      var data = await api("/v1/models" + (force ? "?refresh=1" : ""));
+      renderModels((data && data.data) || []);
+    }
+
+    async function refreshAll(quiet) {
+      var jobs = [loadHealth()];
+      jobs.push(loadAdmin().catch(function (e) { if (!quiet) toast(e.message, true); }));
+      jobs.push(loadModels(false).catch(function (e) {
+        if (!quiet && state.key) toast("模型載入失敗：" + e.message, true);
+      }));
+      await Promise.all(jobs);
+      $("info-stamp").textContent = "更新於 " + new Date().toLocaleTimeString();
+    }
+
+    // ── 匯入面板 ──
+    function importNote(msg, bad) {
+      var note = $("import-note");
+      note.textContent = msg || "";
+      note.className = "note" + (msg ? (bad ? " bad" : " good") : "");
+    }
+    async function importAction(btn, run) {
+      if (!state.key) { toast("請先輸入 API Key 並連線", true); return; }
+      busy(btn, true);
       try {
-        const data = await readJson(await fetch("/admin/cookie", {
+        var data = await run();
+        if (data && data.cookie) renderCookieKv(data.cookie);
+        importNote((data && data.message) || "完成（" + ((data && data.status) || "ok") + "）", false);
+        await Promise.all([
+          loadAdmin().catch(function () {}),
+          loadModels(true).catch(function () {}),
+        ]);
+      } catch (e) {
+        importNote(e.message, true);
+        toast(e.message, true);
+      } finally { busy(btn, false); }
+    }
+
+    $("do-import").addEventListener("click", function () {
+      var raw = $("import-input").value.trim();
+      if (!raw) { importNote("請先貼上 Cookie 內容。", true); return; }
+      importAction(this, function () {
+        return api("/admin/cookie", {
           method: "PUT",
-          headers: requestHeaders(true),
-          body: JSON.stringify({ auth: value })
-        }));
-        byId("cookie-input").value = "";
-        renderCookie(data.cookie);
-        await loadModels(true);
-        showToast(data.message, false);
-      } catch (error) { showToast(error.message, true); }
-      finally { setBusy(button, false); }
+          headers: headersFor(true),
+          body: JSON.stringify({ auth: raw }),
+        });
+      });
+    });
+    $("do-refresh").addEventListener("click", function () {
+      importAction(this, function () {
+        return api("/admin/cookie/refresh", { method: "POST", headers: headersFor(false) });
+      });
+    });
+    $("do-delete").addEventListener("click", function () {
+      if (!confirm("確定要刪除已儲存的 Cookie？Worker 將回到未登入狀態。")) return;
+      importAction(this, function () {
+        return api("/admin/cookie", { method: "DELETE", headers: headersFor(false) });
+      });
+    });
+    $("reload-cookie").addEventListener("click", function () {
+      var btn = this; busy(btn, true);
+      loadAdmin().catch(function (e) { toast(e.message, true); })
+        .finally(function () { busy(btn, false); });
     });
 
-    byId("clear-cookie").addEventListener("click", async function (event) {
-      const button = event.currentTarget;
-      if (!confirm("移除 Durable Object 中的登入 Cookie，讓 Worker 回到未登入狀態？")) return;
-      setBusy(button, true, "移除中…");
-      try {
-        const data = await readJson(await fetch("/admin/cookie", { method: "DELETE", headers: requestHeaders(false) }));
-        renderCookie(data.cookie);
-        await loadModels(true);
-        showToast(data.message, false);
-      } catch (error) { showToast(error.message, true); }
-      finally { setBusy(button, false); }
-    });
+    // ── Playground ──
+    async function runPlayground() {
+      var btn = $("play-send");
+      var out = $("play-output");
+      var meta = $("play-meta");
+      var model = $("play-model").value;
+      var text = $("play-input").value.trim();
+      if (!model) { toast("尚未載入模型，請先連線", true); return; }
+      if (!text) { toast("請輸入訊息", true); return; }
 
-    byId("play-form").addEventListener("submit", async function (event) {
-      event.preventDefault();
-      const button = byId("send-prompt");
-      const result = byId("result");
-      const started = performance.now();
-      setBusy(button, true, "等待上游…");
-      result.className = "result";
-      result.textContent = "請求處理中…";
+      var messages = [];
+      var sys = $("play-system").value.trim();
+      if (sys) messages.push({ role: "system", content: sys });
+      messages.push({ role: "user", content: text });
+      var wantStream = $("play-stream").checked;
+
+      busy(btn, true);
+      out.className = "output";
+      out.textContent = "";
+      meta.textContent = wantStream ? "串流中…" : "等待回應…";
+      var t0 = performance.now();
       try {
-        const data = await readJson(await fetch("/v1/chat/completions", {
+        var res = await fetch("/v1/chat/completions", {
           method: "POST",
-          headers: requestHeaders(true),
-          body: JSON.stringify({
-            model: byId("play-model").value,
-            messages: [{ role: "user", content: byId("play-prompt").value }],
-            stream: false
-          })
-        }));
-        const message = data.choices && data.choices[0] && data.choices[0].message;
-        result.textContent = message && message.content ? message.content : JSON.stringify(data, null, 2);
-        const elapsed = (performance.now() - started) / 1000;
-        byId("result-meta").textContent = elapsed.toFixed(1) + "s · upstream " + (data.upstream_model || "unknown") + " · " + (data.route_status || "unknown");
-        void result.offsetWidth;
-        result.className = "result fresh";
-      } catch (error) {
-        result.textContent = "請求失敗：" + error.message + "\\n\\n請確認 API key、Cookie 狀態與上游連線。";
-        byId("result-meta").textContent = "請求失敗";
-        showToast(error.message, true);
-      } finally { setBusy(button, false, ""); }
+          headers: headersFor(true),
+          body: JSON.stringify({ model: model, messages: messages, stream: wantStream }),
+        });
+        if (!res.ok) {
+          var errData = null;
+          try { errData = await res.json(); } catch (_) {}
+          throw new Error((errData && errData.error && errData.error.message) || ("HTTP " + res.status));
+        }
+        var elapsed;
+        if (wantStream && res.body) {
+          var reader = res.body.getReader();
+          var dec = new TextDecoder();
+          var buf = "", finish = "", upstream = "";
+          while (true) {
+            var chunk = await reader.read();
+            if (chunk.done) break;
+            buf += dec.decode(chunk.value, { stream: true });
+            var lines = buf.split("\\n");
+            buf = lines.pop();
+            lines.forEach(function (line) {
+              line = line.trim();
+              if (!line.startsWith("data:")) return;
+              var payload = line.slice(5).trim();
+              if (!payload || payload === "[DONE]") return;
+              try {
+                var j = JSON.parse(payload);
+                if (j.upstream_model) upstream = j.upstream_model;
+                var c = j.choices && j.choices[0];
+                if (c && c.delta && c.delta.content) out.textContent += c.delta.content;
+                if (c && c.finish_reason) finish = c.finish_reason;
+              } catch (_) {}
+            });
+          }
+          elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+          meta.textContent = elapsed + "s · 串流" +
+            (upstream ? " · 上游 " + upstream : "") +
+            (finish ? " · " + finish : "");
+        } else {
+          var data = await res.json();
+          elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+          var choice = data.choices && data.choices[0];
+          out.textContent = (choice && choice.message && choice.message.content) || "(空回應)";
+          var usage = data.usage || {};
+          meta.textContent = elapsed + "s" +
+            " · 上游 " + (data.upstream_model || "unknown") +
+            " · " + (data.route_status || "unknown") +
+            (usage.total_tokens != null ? " · " + usage.total_tokens + " tokens" : "");
+        }
+        if (!out.textContent) { out.className = "output idle"; out.textContent = "(沒有文字內容)"; }
+      } catch (e) {
+        out.className = "output idle";
+        out.textContent = "請求失敗：" + e.message;
+        meta.textContent = "失敗";
+        toast(e.message, true);
+      } finally { busy(btn, false); }
+    }
+    $("play-send").addEventListener("click", runPlayground);
+    $("play-input").addEventListener("keydown", function (e) {
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runPlayground(); }
     });
 
-    byId("copy-url").addEventListener("click", async function () {
-      const value = location.origin + "/v1";
-      try { await navigator.clipboard.writeText(value); showToast("API Base URL 已複製", false); }
-      catch (_) { showToast("無法存取剪貼簿，請手動複製", true); }
+    // ── 其他 ──
+    $("build-value").addEventListener("click", function () {
+      if (this.dataset.full) copyText(this.dataset.full, "Gemini Build ");
+    });
+    $("copy-base").addEventListener("click", function () {
+      copyText(location.origin + "/v1", "API Base URL ");
+    });
+    $("refresh-info").addEventListener("click", function () {
+      var btn = this; busy(btn, true);
+      refreshAll(false).finally(function () { busy(btn, false); });
+    });
+    $("refresh-models").addEventListener("click", function () {
+      var btn = this; busy(btn, true);
+      loadModels(true).catch(function (e) { toast(e.message, true); })
+        .finally(function () { busy(btn, false); });
+    });
+    $("connect").addEventListener("click", function () {
+      state.key = $("api-key").value.trim();
+      try { sessionStorage.setItem(KEY_STORE, state.key); } catch (_) {}
+      var btn = this; busy(btn, true);
+      refreshAll(false).then(function () {
+        if (state.key) toast("已更新狀態");
+      }).finally(function () { busy(btn, false); });
+    });
+    $("api-key").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") $("connect").click();
     });
 
-    byId("api-key").value = apiKey;
-    byId("base-url").textContent = location.origin + "/v1";
-    renderModels(BOOT.models);
-    loadHealth();
-    loadModels(false).catch(function (error) { if (apiKey) showToast(error.message, true); });
-    if (apiKey) loadAdmin().catch(function (error) { showToast(error.message, true); });
+    // ── 啟動 ──
+    $("ver-chip").textContent = "v" + (BOOT.version || "?");
+    $("api-key").value = state.key;
+    $("base-url").textContent = location.origin + "/v1";
+    refreshAll(true);
+    setInterval(function () {
+      if (document.visibilityState === "visible") refreshAll(true);
+    }, 60000);
   </script>
 </body>
 </html>`;
