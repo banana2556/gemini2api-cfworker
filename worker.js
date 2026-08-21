@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.8.0-worker";
+const VERSION = "1.8.2-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -831,6 +831,8 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
 // 改为在 prompt 里追加一句提示,降级为纯文本。详见 test/live-image.mjs。
 
 const _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+const ROTATE_COOKIES_URL = "https://accounts.google.com/RotateCookies";
+const ROTATE_COOKIES_BODY = '[000,"-0000000000000000000"]';
 let _pageTokens = { key: "", tokens: null, ts: 0 };
 const GEMINI_BL_CACHE_TTL_SEC = 3600;
 let _geminiBlMemory = { origin: "", value: "", expiresAt: 0 };
@@ -2453,6 +2455,33 @@ async function handleAdminStatus(cfg, env, url) {
   });
 }
 
+async function rotateGoogleCookies(cfg) {
+  const headers = {
+    "Content-Type": "application/json",
+    Origin: "https://accounts.google.com",
+    Referer: "https://accounts.google.com/",
+    "User-Agent": _UA,
+    Cookie: cfg.cookie,
+  };
+  applyAccountHeaders(headers, cfg);
+  return httpFetch(ROTATE_COOKIES_URL, {
+    method: "POST",
+    headers,
+    body: ROTATE_COOKIES_BODY,
+    timeoutMs: 15000,
+    socket: cfg.upstream_socket,
+  });
+}
+
+function reauthRequiredResponse(cfg) {
+  return privateJsonResponse({
+    status: "reauth_required",
+    cookie: cookieSummary(cfg),
+    changed_cookie_names: [],
+    message: "Google 已不接受這份登入態；Worker 無法自行重新登入，請從瀏覽器重新匯入 Cookie。",
+  });
+}
+
 async function handleCookieRefresh(cfg, env) {
   if (!cookieStoreStub(env)) {
     return privateJsonResponse({
@@ -2465,9 +2494,28 @@ async function handleCookieRefresh(cfg, env) {
     }, 400);
   }
 
+  let cookie = cfg.cookie;
+  const changedCookieNames = [];
+  let ignoredCookieCount = 0;
+  const rememberRotation = (merged) => {
+    cookie = merged.cookie;
+    ignoredCookieCount += merged.ignored_cookie_count;
+    for (const name of merged.changed_cookie_names) {
+      if (!changedCookieNames.includes(name)) changedCookieNames.push(name);
+    }
+  };
+
+  try {
+    const rotateResponse = await rotateGoogleCookies(cfg);
+    if (rotateResponse.status === 401) return reauthRequiredResponse(cfg);
+    if (rotateResponse.ok) rememberRotation(mergeRotatedCookies(cookie, getSetCookieValues(rotateResponse.headers)));
+  } catch (e) {
+    log(cfg, `RotateCookies failed: ${e}`);
+  }
+
   const headers = { "User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9" };
   applyAccountHeaders(headers, cfg);
-  headers.Cookie = cfg.cookie;
+  headers.Cookie = cookie;
   if (cfg.sapisid) headers.Authorization = await makeSapisidHash(cfg.sapisid);
 
   const origin = cfg.gemini_origin || "https://gemini.google.com";
@@ -2479,19 +2527,12 @@ async function handleCookieRefresh(cfg, env) {
   const html = await response.text();
   const tokens = extractPageTokens(html);
 
-  if (!response.ok || !tokens.at) {
-    return privateJsonResponse({
-      status: "reauth_required",
-      cookie: cookieSummary(cfg),
-      changed_cookie_names: [],
-      message: "Google 已不接受這份登入態；Worker 無法自行重新登入，請從瀏覽器重新匯入 Cookie。",
-    });
-  }
+  if (!response.ok || !tokens.at) return reauthRequiredResponse(cfg);
 
-  const merged = mergeRotatedCookies(cfg.cookie, getSetCookieValues(response.headers));
+  rememberRotation(mergeRotatedCookies(cookie, getSetCookieValues(response.headers)));
   const now = new Date().toISOString();
   const auth = parseAuthPayload({
-    cookie: merged.cookie,
+    cookie,
     sapisid: cfg.sapisid,
     auth_user: cfg.auth_user,
     xsrf_token: tokens.at,
@@ -2500,7 +2541,7 @@ async function handleCookieRefresh(cfg, env) {
   const record = {
     ...auth,
     removed_cookie_count: cfg.removed_cookie_count || 0,
-    updated_at: merged.changed_cookie_names.length ? now : (cfg.cookie_updated_at || now),
+    updated_at: changedCookieNames.length ? now : (cfg.cookie_updated_at || now),
     refreshed_at: now,
   };
   await writeStoredAuth(env, record);
@@ -2512,14 +2553,14 @@ async function handleCookieRefresh(cfg, env) {
     tokens,
     ts: Date.now(),
   };
-  const rotated = merged.changed_cookie_names.length > 0;
+  const rotated = changedCookieNames.length > 0;
   return privateJsonResponse({
     status: rotated ? "refreshed" : "no_rotation",
     cookie: cookieSummary(refreshedCfg),
-    changed_cookie_names: merged.changed_cookie_names,
-    ignored_cookie_count: merged.ignored_cookie_count,
+    changed_cookie_names: changedCookieNames,
+    ignored_cookie_count: ignoredCookieCount,
     message: rotated
-      ? `已保存 Google 輪替的 ${merged.changed_cookie_names.length} 個 Cookie。`
+      ? `已保存 Google 輪替的 ${changedCookieNames.length} 個 Cookie。`
       : "登入態有效；已更新頁面 token，Google 本次沒有輪替 Cookie。",
   });
 }
@@ -2658,7 +2699,7 @@ function dashboardResponse(cfg) {
     .button.danger:hover { color: #7b1c1c; background: var(--red-soft); box-shadow: none; }
     .button:disabled { cursor: wait; opacity: .58; transform: none; box-shadow: none; }
     .model-list { border-block: 1px solid var(--line-strong); }
-    .model-row { display: grid; grid-template-columns: minmax(210px, .85fr) minmax(260px, 1.4fr) 130px; gap: 24px; align-items: center; min-height: 74px; padding: 13px 4px; border-bottom: 1px solid var(--line); }
+    .model-row { display: grid; grid-template-columns: minmax(210px, .85fr) minmax(260px, 1.4fr); gap: 24px; align-items: center; min-height: 74px; padding: 13px 4px; border-bottom: 1px solid var(--line); }
     .model-row:last-child { border-bottom: 0; }
     .model-id { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .86rem; font-weight: 700; overflow-wrap: anywhere; }
     .model-desc { color: var(--muted); font-size: .9rem; line-height: 1.45; }
@@ -2759,7 +2800,7 @@ function dashboardResponse(cfg) {
       <section class="hero" aria-labelledby="page-title">
         <div class="hero-copy">
           <h1 id="page-title">Worker 狀態，一眼看完。</h1>
-          <p>檢查實際模型路由、管理 Gemini 登入 Cookie，並從同一個位址送出測試請求。支援每 6 小時排程刷新 Cookie，原文不會由狀態 API 回傳。</p>
+          <p>檢查實際模型路由、管理 Gemini 登入 Cookie，並從同一個位址送出測試請求。支援每 10 分鐘排程刷新 <code>__Secure-1PSIDTS</code>，原文不會由狀態 API 回傳。</p>
         </div>
         <div class="health-strip" aria-live="polite">
           <div class="datum"><span>Worker</span><strong><i class="dot" id="health-dot"></i><b id="health-state">連線中</b></strong></div>
@@ -2774,8 +2815,7 @@ function dashboardResponse(cfg) {
 
       <section class="surface" id="models" aria-labelledby="models-title">
         <div class="section-head">
-          <div><h2 id="models-title">模型與實際路由</h2><p>清單由目前帳號的 Gemini 網頁資料動態建立；即時探測會真的向每個模型送出短請求，確認上游路由。</p></div>
-          <button class="button secondary" id="probe-models" type="button">即時探測</button>
+          <div><h2 id="models-title">模型與實際路由</h2><p>清單由目前帳號的 Gemini 網頁資料動態建立，不另外對每個別名送探測請求。</p></div>
         </div>
         <div class="model-list" id="model-list" role="table" aria-label="模型清單"></div>
       </section>
@@ -2785,15 +2825,15 @@ function dashboardResponse(cfg) {
         <div class="cookie-layout">
           <div class="status-panel">
             <h3>目前登入鏈</h3>
-            <p>先做結構檢查，再用 Pro 路由探測驗證這份登入態是否真的被上游接受。</p>
+            <p>先檢查 Cookie 結構，再用 GetUserStatus 動態目錄確認這份登入態看得到哪些模型。</p>
             <div class="cookie-state"><strong id="cookie-state">需要 API 金鑰</strong><span id="cookie-detail">輸入金鑰後讀取，不會顯示 Cookie 值。</span></div>
             <dl class="facts">
               <div><dt>來源</dt><dd id="cookie-source">—</dd></div>
               <div><dt>工作階段</dt><dd id="cookie-session">—</dd></div>
               <div><dt>XSRF token</dt><dd id="cookie-xsrf">—</dd></div>
-              <div><dt>自動刷新</dt><dd>每 6 小時（Cron）</dd></div>
+              <div><dt>自動刷新</dt><dd>每 10 分鐘（Cron）</dd></div>
               <div><dt>最近刷新</dt><dd id="cookie-refreshed">尚未刷新</dd></div>
-              <div><dt>實際 Pro 路由</dt><dd id="cookie-route">尚未探測</dd></div>
+              <div><dt>模型目錄</dt><dd id="cookie-route">尚未載入</dd></div>
             </dl>
             <div class="inline-actions">
               <button class="button secondary" id="refresh-cookie" type="button">刷新 Cookie</button>
@@ -2868,12 +2908,13 @@ function dashboardResponse(cfg) {
       return data;
     }
 
-    function statusBadge(route) {
-      const badge = document.createElement("span");
-      const status = route && route.route_status;
-      badge.className = "badge" + (status === "matched" || status === "auto" ? " good" : status === "fallback" ? " warn" : "");
-      badge.textContent = status === "matched" ? "路由吻合" : status === "auto" ? "自動選擇" : status === "fallback" ? "已回退" : "尚未探測";
-      return badge;
+    function catalogLabel(models) {
+      const ids = (models || []).map(function (model) { return model.id; }).filter(function (id) {
+        return id && id.indexOf("-thinking") < 0;
+      });
+      if (!ids.length) return "尚未載入";
+      if (ids.length === 1 && ids[0] === "gemini-auto") return "訪客自動路由";
+      return ids.join(" · ");
     }
 
     function renderModels(models) {
@@ -2886,6 +2927,7 @@ function dashboardResponse(cfg) {
         empty.className = "model-row";
         empty.textContent = "套用 API 金鑰後載入目前帳號的動態模型清單。";
         list.appendChild(empty);
+        byId("cookie-route").textContent = "尚未載入";
         return;
       }
       models.forEach(function (model) {
@@ -2899,8 +2941,8 @@ function dashboardResponse(cfg) {
         const desc = document.createElement("div");
         desc.className = "model-desc";
         desc.setAttribute("role", "cell");
-        desc.textContent = model.upstream_model ? model.description + " · upstream: " + model.upstream_model : model.description;
-        row.append(id, desc, statusBadge(model));
+        desc.textContent = model.description || "";
+        row.append(id, desc);
         list.appendChild(row);
         const option = document.createElement("option");
         option.value = model.id;
@@ -2908,6 +2950,7 @@ function dashboardResponse(cfg) {
         option.selected = model.id === BOOT.defaultModel;
         select.appendChild(option);
       });
+      byId("cookie-route").textContent = catalogLabel(models);
     }
 
     function sourceLabel(source) {
@@ -2924,8 +2967,6 @@ function dashboardResponse(cfg) {
       byId("cookie-session").textContent = cookie && cookie.session_cookie ? cookie.session_cookie : "缺少";
       byId("cookie-xsrf").textContent = cookie && cookie.xsrf_token_present ? "已匯入" : configured ? "請求時自動抓取" : "—";
       byId("cookie-refreshed").textContent = cookie && cookie.refreshed_at ? new Date(cookie.refreshed_at).toLocaleString() : "尚未刷新";
-      const verification = cookie && cookie.verification;
-      byId("cookie-route").textContent = !verification ? "尚未探測" : verification.pro_route_verified ? "已驗證 Pro" : verification.actual_model ? "回到 " + verification.actual_model : "無法確認";
     }
 
     async function loadHealth() {
@@ -2941,22 +2982,22 @@ function dashboardResponse(cfg) {
       }
     }
 
-    async function loadAdmin(mode) {
-      const suffix = mode === "verify" ? "?verify=1" : "";
-      const data = await readJson(await fetch("/admin/status" + suffix, { headers: requestHeaders(false) }));
+    async function loadAdmin() {
+      const data = await readJson(await fetch("/admin/status", { headers: requestHeaders(false) }));
       renderCookie(data.cookie);
       return data;
     }
 
-    async function loadModels(live) {
-      const data = await readJson(await fetch("/v1/models" + (live ? "?live=1" : ""), { headers: requestHeaders(false) }));
+    async function loadModels(refresh) {
+      const data = await readJson(await fetch("/v1/models" + (refresh ? "?refresh=1" : ""), { headers: requestHeaders(false) }));
       renderModels(data.data || []);
       return data;
     }
 
     function setBusy(button, busy, text) {
+      if (!button) return;
       if (!button.dataset.label) button.dataset.label = button.textContent;
-      button.disabled = busy;
+      button.disabled = !!busy;
       button.textContent = busy ? text : button.dataset.label;
     }
 
@@ -2966,7 +3007,7 @@ function dashboardResponse(cfg) {
       else sessionStorage.removeItem("gemini-worker-api-key");
       try {
         await loadModels(false);
-        await loadAdmin("");
+        await loadAdmin();
         showToast("金鑰已套用，管理狀態已載入", false);
       } catch (error) {
         renderCookie(null);
@@ -2976,32 +3017,30 @@ function dashboardResponse(cfg) {
       }
     });
 
-    byId("probe-models").addEventListener("click", async function (event) {
-      setBusy(event.currentTarget, true, "探測中…");
-      try { await loadModels(true); showToast("模型路由探測完成", false); }
-      catch (error) { showToast(error.message, true); }
-      finally { setBusy(event.currentTarget, false, ""); }
-    });
-
     byId("verify-cookie").addEventListener("click", async function (event) {
-      setBusy(event.currentTarget, true, "驗證中…");
-      try { await loadAdmin("verify"); showToast("Cookie 驗證完成", false); }
-      catch (error) { showToast(error.message, true); }
-      finally { setBusy(event.currentTarget, false, ""); }
+      const button = event.currentTarget;
+      setBusy(button, true, "驗證中…");
+      try {
+        await loadAdmin();
+        await loadModels(true);
+        showToast("已用動態模型目錄驗證 Cookie", false);
+      } catch (error) { showToast(error.message, true); }
+      finally { setBusy(button, false); }
     });
 
     byId("refresh-cookie").addEventListener("click", async function (event) {
-      setBusy(event.currentTarget, true, "刷新中…");
+      const button = event.currentTarget;
+      setBusy(button, true, "刷新中…");
       try {
         const data = await readJson(await fetch("/admin/cookie/refresh", {
           method: "POST",
           headers: requestHeaders(false)
         }));
         renderCookie(data.cookie);
-        if (data.status !== "reauth_required") await loadModels(false);
+        if (data.status !== "reauth_required") await loadModels(true);
         showToast(data.message, data.status === "reauth_required");
       } catch (error) { showToast(error.message, true); }
-      finally { setBusy(event.currentTarget, false, ""); }
+      finally { setBusy(button, false); }
     });
 
     byId("cookie-form").addEventListener("submit", async function (event) {
@@ -3018,22 +3057,23 @@ function dashboardResponse(cfg) {
         }));
         byId("cookie-input").value = "";
         renderCookie(data.cookie);
-        await loadModels(false);
+        await loadModels(true);
         showToast(data.message, false);
       } catch (error) { showToast(error.message, true); }
-      finally { setBusy(button, false, ""); }
+      finally { setBusy(button, false); }
     });
 
     byId("clear-cookie").addEventListener("click", async function (event) {
+      const button = event.currentTarget;
       if (!confirm("移除 Durable Object 中的登入 Cookie，讓 Worker 回到未登入狀態？")) return;
-      setBusy(event.currentTarget, true, "移除中…");
+      setBusy(button, true, "移除中…");
       try {
         const data = await readJson(await fetch("/admin/cookie", { method: "DELETE", headers: requestHeaders(false) }));
         renderCookie(data.cookie);
-        await loadModels(false);
+        await loadModels(true);
         showToast(data.message, false);
       } catch (error) { showToast(error.message, true); }
-      finally { setBusy(event.currentTarget, false, ""); }
+      finally { setBusy(button, false); }
     });
 
     byId("play-form").addEventListener("submit", async function (event) {
@@ -3078,7 +3118,7 @@ function dashboardResponse(cfg) {
     renderModels(BOOT.models);
     loadHealth();
     loadModels(false).catch(function (error) { if (apiKey) showToast(error.message, true); });
-    if (apiKey) loadAdmin("").catch(function (error) { showToast(error.message, true); });
+    if (apiKey) loadAdmin().catch(function (error) { showToast(error.message, true); });
   </script>
 </body>
 </html>`;
@@ -3159,40 +3199,30 @@ export default {
 
       if (method === "GET") {
         if (path === "/v1/models") {
-          const live = parseBool(url.searchParams.get("live"), false);
-          const inspection = live ? await inspectModelRoutes(cfg) : null;
-          const models = inspection ? inspection.models : await getModelCatalog(cfg);
+          const refresh = parseBool(url.searchParams.get("refresh"), false);
+          const models = await getModelCatalog(cfg, refresh);
           return jsonResponse({
             object: "list",
             dynamic: true,
-            routes_probed: live,
-            actual_models: inspection ? inspection.actual_models : undefined,
-            cookie: inspection ? inspection.cookie : undefined,
             data: Object.entries(models).map(([n, c]) => ({
               id: n,
               object: "model",
               created: 1700000000,
               owned_by: "google",
               description: c.desc,
-              ...(inspection ? inspection.routes[n] : {}),
             })),
           });
         }
         if (path.startsWith("/v1beta/models")) {
-          const live = parseBool(url.searchParams.get("live"), false);
-          const inspection = live ? await inspectModelRoutes(cfg) : null;
-          const models = inspection ? inspection.models : await getModelCatalog(cfg);
+          const refresh = parseBool(url.searchParams.get("refresh"), false);
+          const models = await getModelCatalog(cfg, refresh);
           return jsonResponse({
             dynamic: true,
-            routesProbed: live,
-            actualModels: inspection ? inspection.actual_models : undefined,
-            cookie: inspection ? inspection.cookie : undefined,
             models: Object.entries(models).map(([n, c]) => ({
               name: `models/${n}`,
               displayName: n,
               description: c.desc,
               supportedGenerationMethods: ["generateContent", "streamGenerateContent"],
-              ...(inspection ? inspection.routes[n] : {}),
             })),
           });
         }

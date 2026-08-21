@@ -5,6 +5,26 @@ import worker from "../worker.js";
 
 const internals = globalThis.__GEMINI_WORKER_TEST__;
 
+function googleAuthFetch({
+  rotateStatus = 200,
+  rotateCookies = [],
+  appStatus = 200,
+  appCookies = [],
+  appBody = '{"SNlM0e":"fresh-at","cfb2h":"boq_assistant-bard-web-server_test"}',
+} = {}) {
+  return async (input) => {
+    const url = String(typeof input === "string" ? input : input.url);
+    if (url.includes("/RotateCookies")) {
+      const headers = new Headers({ "Content-Type": "application/json" });
+      for (const cookie of rotateCookies) headers.append("Set-Cookie", cookie);
+      return new Response(`)]}'\n[["identity.hfcr",600]]`, { status: rotateStatus, headers });
+    }
+    const headers = new Headers({ "Content-Type": "text/html" });
+    for (const cookie of appCookies) headers.append("Set-Cookie", cookie);
+    return new Response(appBody, { status: appStatus, headers });
+  };
+}
+
 function memoryCookieStore() {
   let record = null;
   return {
@@ -64,7 +84,9 @@ test("browser root serves a CSP-protected console and ignores legacy Cookie secr
   assert.match(html, /id="api-key"/);
   assert.doesNotMatch(html, /id="admin-key"|gemini-worker-admin-key|ADMIN_KEY/);
   assert.match(html, /gemini-worker-api-key/);
-  assert.doesNotMatch(html, /id="access-key"|gemini-worker-key/);
+  assert.doesNotMatch(html, /id="probe-models"|即時探測|\?live=1|\?verify=1/);
+  assert.match(html, /id="verify-cookie"/);
+  assert.match(html, /id="refresh-cookie"/);
   assert.doesNotMatch(html, /never-render-this|session-secret/);
   const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)?.[1];
   assert.ok(script);
@@ -177,20 +199,21 @@ test("authenticated Cookie refresh persists rotations without exposing values an
   const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
     method: "PUT",
     headers: { ...adminHeaders, "Content-Type": "application/json" },
-    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session; SIDCC=old-cc; NID=old-nid" }),
+    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session; SIDCC=old-cc; NID=old-nid; __Secure-1PSIDTS=old-ts" }),
   }), env);
   assert.equal(imported.status, 200);
 
   const originalFetch = globalThis.fetch;
   internals.__setConnect(null);
   try {
-    globalThis.fetch = async () => {
-      const headers = new Headers({ "Content-Type": "text/html" });
-      headers.append("Set-Cookie", "SIDCC=rotated-cc; Path=/; Secure; HttpOnly");
-      headers.append("Set-Cookie", "NID=rotated-nid; Path=/; Secure");
-      headers.append("Set-Cookie", "UNRELATED=ignore-me; Path=/");
-      return new Response('{"SNlM0e":"fresh-at","cfb2h":"boq_assistant-bard-web-server_test"}', { headers });
-    };
+    globalThis.fetch = googleAuthFetch({
+      rotateCookies: ["__Secure-1PSIDTS=rotated-ts; Path=/; Secure; HttpOnly"],
+      appCookies: [
+        "SIDCC=rotated-cc; Path=/; Secure; HttpOnly",
+        "NID=rotated-nid; Path=/; Secure",
+        "UNRELATED=ignore-me; Path=/",
+      ],
+    });
 
     const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
       method: "POST",
@@ -200,19 +223,21 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     const refreshedData = JSON.parse(refreshedText);
     assert.equal(refreshed.status, 200);
     assert.equal(refreshedData.status, "refreshed");
-    assert.deepEqual(refreshedData.changed_cookie_names, ["SIDCC", "NID"]);
+    assert.deepEqual(refreshedData.changed_cookie_names, ["__Secure-1PSIDTS", "SIDCC", "NID"]);
     assert.ok(refreshedData.cookie.refreshed_at);
-    assert.doesNotMatch(refreshedText, /rotated-cc|rotated-nid|ignore-me/);
+    assert.doesNotMatch(refreshedText, /rotated-ts|rotated-cc|rotated-nid|ignore-me/);
+    assert.match(store.peek().cookie, /__Secure-1PSIDTS=rotated-ts/);
     assert.match(store.peek().cookie, /SIDCC=rotated-cc/);
     assert.match(store.peek().cookie, /NID=rotated-nid/);
     assert.doesNotMatch(store.peek().cookie, /UNRELATED|ignore-me/);
     assert.equal(store.peek().xsrf_token, "fresh-at");
 
     const validRecord = structuredClone(store.peek());
-    globalThis.fetch = async () => {
-      const headers = new Headers({ "Set-Cookie": "SIDCC=rotated-cc; Path=/" });
-      return new Response('{"SNlM0e":"newer-at"}', { headers });
-    };
+    globalThis.fetch = googleAuthFetch({
+      rotateCookies: ["__Secure-1PSIDTS=rotated-ts; Path=/; Secure; HttpOnly"],
+      appCookies: ["SIDCC=rotated-cc; Path=/"],
+      appBody: '{"SNlM0e":"newer-at"}',
+    });
     const unchanged = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
       method: "POST",
       headers: adminHeaders,
@@ -223,8 +248,10 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     assert.equal(store.peek().xsrf_token, "newer-at");
     assert.ok(store.peek().refreshed_at);
 
-    globalThis.fetch = async () => new Response("<html>Sign in</html>", {
-      headers: { "Set-Cookie": "SIDCC=must-not-save; Path=/" },
+    globalThis.fetch = googleAuthFetch({
+      rotateStatus: 401,
+      appCookies: ["SIDCC=must-not-save; Path=/"],
+      appBody: "<html>Sign in</html>",
     });
     const expired = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
       method: "POST",
@@ -260,16 +287,17 @@ test("scheduled Cookie refresh automatically persists Google rotations", async (
   const originalFetch = globalThis.fetch;
   internals.__setConnect(null);
   try {
-    globalThis.fetch = async () => {
-      const headers = new Headers({ "Content-Type": "text/html" });
-      headers.append("Set-Cookie", "SIDCC=automatic-cc; Path=/; Secure; HttpOnly");
-      return new Response('{"SNlM0e":"automatic-at","cfb2h":"boq_assistant-bard-web-server_test"}', { headers });
-    };
+    globalThis.fetch = googleAuthFetch({
+      rotateCookies: ["__Secure-1PSIDTS=automatic-ts; Path=/; Secure; HttpOnly"],
+      appCookies: ["SIDCC=automatic-cc; Path=/; Secure; HttpOnly"],
+      appBody: '{"SNlM0e":"automatic-at","cfb2h":"boq_assistant-bard-web-server_test"}',
+    });
 
     const tasks = [];
     await worker.scheduled({}, env, { waitUntil(task) { tasks.push(task); } });
     await Promise.all(tasks);
 
+    assert.match(store.peek().cookie, /__Secure-1PSIDTS=automatic-ts/);
     assert.match(store.peek().cookie, /SIDCC=automatic-cc/);
     assert.equal(store.peek().xsrf_token, "automatic-at");
     assert.ok(store.peek().refreshed_at);
@@ -342,6 +370,13 @@ test("anonymous catalog is guest auto routing and does not fetch Gemini", async 
     const data = await response.json();
     assert.equal(response.status, 200);
     assert.deepEqual(data.data.map((model) => model.id), ["gemini-auto", "gemini-auto-thinking"]);
+    assert.equal(fetches, 0);
+
+    const refreshed = await worker.fetch(new Request("https://worker.example/v1/models?refresh=1"), {
+      UPSTREAM_SOCKET: "false",
+      LOG_REQUESTS: "false",
+    });
+    assert.deepEqual((await refreshed.json()).data.map((model) => model.id), ["gemini-auto", "gemini-auto-thinking"]);
     assert.equal(fetches, 0);
   } finally {
     globalThis.fetch = originalFetch;

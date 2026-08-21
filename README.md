@@ -15,7 +15,7 @@ Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into
 - Dynamic model discovery from Gemini Web: Flash-Lite, Flash, and Pro, each with Standard or Extended Thinking
 - Anonymous/guest requests keep working through Gemini's auto-routing model when no Cookie is configured
 - Built-in web console for models, masked Cookie health/import/refresh, and Playground
-- Automatic persisted Cookie rotation every six hours through a Cloudflare Cron Trigger
+- Automatic persisted Cookie rotation every ten minutes through a Cloudflare Cron Trigger
 - Built-in retry, timeout, and debug probe endpoint
 
 ## Quick Start
@@ -108,11 +108,10 @@ Paid Gemini / Google AI Pro accounts need the web model-select header
 (primary model ID + account capacity). Without that header, Google keeps the
 UI default — usually Flash — even when Pro is in the catalog.
 
-To probe Gemini and see the model each alias actually routes to, request
-`GET /v1/models?live=1`. Each entry then
-includes `available`, `upstream_model`, and `route_status` (`matched`,
-`fallback`, `auto`, or `unknown`). Live probing makes one small upstream
-request per alias, so use it for diagnostics rather than every client startup.
+To force a fresh GetUserStatus lookup, request `GET /v1/models?refresh=1`.
+The console **Verify Cookie** button does this instead of sending a live
+generation to every alias. Chat responses still report `upstream_model` and
+`route_status` for that one request.
 
 ## Usage Examples
 
@@ -165,14 +164,14 @@ curl "https://your-worker.workers.dev/v1beta/models/gemini-3.6-flash:generateCon
 |---|---|---|
 | `GET` | `/` | Browser console when `Accept: text/html`; health JSON for API clients |
 | `GET` | `/health` | Health JSON (version + current `GEMINI_BL`; model catalog is served separately) |
-| `GET` | `/admin/status` | Masked configuration/Cookie status; `?verify=1` probes Pro, `?live=1` probes all aliases |
+| `GET` | `/admin/status` | Masked configuration/Cookie status |
 | `PUT` | `/admin/cookie` | Persist a raw Cookie or Cookie Sync JSON (management key required) |
 | `POST` | `/admin/cookie/refresh` | Validate the login and persist approved values returned by Google's `Set-Cookie` rotation |
 | `DELETE` | `/admin/cookie` | Remove the Durable Object Cookie and return to unsigned-in mode |
-| `GET` | `/v1/models` | Discover the six current aliases; add `?live=1` for actual upstream routes |
+| `GET` | `/v1/models` | Discover the current aliases; add `?refresh=1` to bypass the catalog cache |
 | `POST` | `/v1/chat/completions` | Chat completions (OpenAI format) |
 | `POST` | `/v1/responses` | Responses API (Codex CLI) |
-| `GET` | `/v1beta/models` | Discover the six current aliases; add `?live=1` for actual upstream routes |
+| `GET` | `/v1beta/models` | Discover the current aliases; add `?refresh=1` to bypass the catalog cache |
 | `POST` | `/v1beta/models/{model}:generateContent` | Generate content (Google format) |
 | `POST` | `/v1beta/models/{model}:streamGenerateContent` | Stream generate (Google format) |
 | `GET` | `/debug` | Connectivity, Cookie token, and Pro-route probe |
@@ -213,12 +212,16 @@ token. Raw browser Cookie pastes are normalized to approved authentication and
 anti-abuse fields, including `AEC`, `NID`, and `COMPASS`; unrelated preference,
 search, and billing fields are not stored or sent upstream.
 
-The console's **Refresh Cookie** action and the repository's six-hour Cron
-Trigger request Gemini's signed-in app page, save the newest page token, merge
-only approved `Set-Cookie` rotations, and persist the result in `COOKIE_STORE`. Manual refresh
+The console's **Refresh Cookie** action and the repository's ten-minute Cron
+Trigger first call Google's `RotateCookies` endpoint (the same 10-minute
+`__Secure-1PSIDTS` cadence Chrome uses), then request Gemini's signed-in app
+page, save the newest page token, merge only approved `Set-Cookie` rotations,
+and persist the result in `COOKIE_STORE`. Manual refresh
 returns `refreshed`, `no_rotation`, or `reauth_required`. Rotation can extend a
 valid session, but it cannot recreate an expired Google login;
 `reauth_required` means the Cookie must be exported from the browser again.
+The six-hour model-catalog cache is unrelated: model aliases change far less
+often than session cookies.
 
 Durable Object storage survives normal Worker code deployments, so redeploying
 does not require another import. Re-import is needed only when Google rejects
