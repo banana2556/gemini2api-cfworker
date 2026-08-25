@@ -402,6 +402,9 @@ function cookieSummary(cfg) {
     source: cfg.cookie_source || "none",
     updated_at: cfg.cookie_updated_at || null,
     refreshed_at: cfg.cookie_refreshed_at || null,
+    refresh_checked_at: cfg.cookie_refresh_checked_at || null,
+    refresh_status: cfg.cookie_refresh_status || null,
+    refresh_error: cfg.cookie_refresh_error || null,
     byte_length: cfg.cookie ? new TextEncoder().encode(cfg.cookie).length : 0,
     cookie_count: pairs.size,
     removed_cookie_count: cfg.removed_cookie_count || 0,
@@ -437,6 +440,9 @@ function getConfig(env) {
     cookie_source: "none",
     cookie_updated_at: null,
     cookie_refreshed_at: null,
+    cookie_refresh_checked_at: null,
+    cookie_refresh_status: null,
+    cookie_refresh_error: null,
     removed_cookie_count: 0,
   };
 }
@@ -454,8 +460,21 @@ function applyStoredAuth(cfg, record) {
     cookie_source: "durable_object",
     cookie_updated_at: record.updated_at || null,
     cookie_refreshed_at: record.refreshed_at || null,
+    cookie_refresh_checked_at: record.refresh_checked_at || null,
+    cookie_refresh_status: record.refresh_status || null,
+    cookie_refresh_error: record.refresh_error || null,
     removed_cookie_count: record.removed_cookie_count || auth.removed_cookie_count || 0,
   };
+}
+
+function switchToGuest(cfg, reason) {
+  cfg.cookie = "";
+  cfg.sapisid = "";
+  cfg.auth_user = null;
+  cfg.xsrf_token = "";
+  cfg.cookie_source = "guest_fallback";
+  cfg.cookie_refresh_error = reason || "guest_fallback";
+  return cfg;
 }
 
 function cookieStoreStub(env) {
@@ -1016,6 +1035,14 @@ async function getModelCatalog(cfg, force = false) {
     }
     return models;
   } catch (e) {
+    if (cfg.cookie) {
+      const reason = String((e && e.message) || e);
+      log(cfg, `model catalog refresh failed; falling back to guest catalog: ${reason}`);
+      const guestCfg = switchToGuest({ ...cfg }, reason);
+      const models = await getModelCatalog(guestCfg, force);
+      switchToGuest(cfg, reason);
+      return models;
+    }
     if (stale) {
       log(cfg, `model catalog refresh failed; using stale catalog: ${e}`);
       return stale;
@@ -1243,10 +1270,20 @@ async function buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, e
 
 /** 非流式生成(带重试)。返回最终的响应文本。 */
 async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, modelHeader) {
-  await refreshGeminiBl(cfg);
-  const body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
-  const url = getUrl(cfg);
-  const headers = await buildHeaders(cfg, modelHeader);
+  let body, url, headers;
+  try {
+    await refreshGeminiBl(cfg);
+    body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
+    url = getUrl(cfg);
+    headers = await buildHeaders(cfg, modelHeader);
+  } catch (e) {
+    if (cfg.cookie) {
+      const reason = String((e && e.message) || e || "authenticated request setup failed");
+      log(cfg, `authenticated request setup failed; falling back to guest: ${reason}`);
+      return await generateResult(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, modelHeader);
+    }
+    throw e;
+  }
   let lastErr;
   for (let attempt = 0; attempt < cfg.retry_attempts; attempt++) {
     try {
@@ -1263,6 +1300,9 @@ async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRe
       if (!resp.ok || !text) {
         log(cfg, `upstream status=${resp.status} rawLen=${raw.length} parsedLen=${text.length} snippet=${JSON.stringify(raw.slice(0, 200))}`);
       }
+      if (cfg.cookie && (!resp.ok || (!text && !actualModel))) {
+        throw new Error(`authenticated upstream returned ${resp.status} without usable content`);
+      }
       return {
         text,
         actualModel,
@@ -1278,6 +1318,11 @@ async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRe
       }
     }
   }
+  if (cfg.cookie) {
+    const reason = String((lastErr && lastErr.message) || lastErr || "authenticated upstream failed");
+    log(cfg, `authenticated generation failed; falling back to guest: ${reason}`);
+    return await generateResult(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, modelHeader);
+  }
   throw lastErr;
 }
 
@@ -1290,10 +1335,21 @@ async function generate(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, mo
  * 只在尚未 yield 过任何内容时才重试,以避免重复输出。
  */
 async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader) {
-  await refreshGeminiBl(cfg);
-  const body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
-  const url = getUrl(cfg);
-  const headers = await buildHeaders(cfg, modelHeader);
+  let body, url, headers;
+  try {
+    await refreshGeminiBl(cfg);
+    body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
+    url = getUrl(cfg);
+    headers = await buildHeaders(cfg, modelHeader);
+  } catch (e) {
+    if (cfg.cookie) {
+      const reason = String((e && e.message) || e || "authenticated stream setup failed");
+      log(cfg, `authenticated stream setup failed; falling back to guest: ${reason}`);
+      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader);
+      return;
+    }
+    throw e;
+  }
   let lastErr;
   let yielded = false;
 
@@ -1315,6 +1371,7 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
           yielded = true;
           yield text;
         }
+        if (!yielded && cfg.cookie) throw new Error(`authenticated stream returned ${resp.status} without usable content`);
         return;
       }
       const reader = resp.body.getReader();
@@ -1366,6 +1423,7 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
         }
       }
       if (!yielded) log(cfg, `stream upstream produced no text (status=${resp.status})`);
+      if (!yielded && cfg.cookie) throw new Error(`authenticated stream returned ${resp.status} without usable content`);
       return;
     } catch (e) {
       lastErr = e;
@@ -1374,10 +1432,24 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
         await sleep(cfg.retry_delay_sec * 1000);
         continue;
       }
+      if (!yielded && cfg.cookie) {
+        const reason = String((e && e.message) || e || "authenticated stream failed");
+        log(cfg, `authenticated stream failed; falling back to guest: ${reason}`);
+        yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader);
+        return;
+      }
       throw e;
     }
   }
-  if (lastErr) throw lastErr;
+  if (lastErr) {
+    if (cfg.cookie) {
+      const reason = String((lastErr && lastErr.message) || lastErr || "authenticated stream failed");
+      log(cfg, `authenticated stream failed; falling back to guest: ${reason}`);
+      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader);
+      return;
+    }
+    throw lastErr;
+  }
 }
 
 // ─── 工具调用 / 消息转换 ─────────────────────────────────────────────────────
@@ -2504,10 +2576,28 @@ async function handleCookieRefresh(cfg, env) {
       if (!changedCookieNames.includes(name)) changedCookieNames.push(name);
     }
   };
+  const recordRefreshFailure = async (reason) => {
+    const checkedAt = new Date().toISOString();
+    const record = {
+      cookie,
+      sapisid: cfg.sapisid,
+      auth_user: cfg.auth_user,
+      xsrf_token: cfg.xsrf_token,
+      gemini_bl: cfg.gemini_bl,
+      removed_cookie_count: cfg.removed_cookie_count || 0,
+      updated_at: cfg.cookie_updated_at || checkedAt,
+      refreshed_at: cfg.cookie_refreshed_at || null,
+      refresh_checked_at: checkedAt,
+      refresh_status: "reauth_required",
+      refresh_error: reason,
+    };
+    await writeStoredAuth(env, record);
+    return reauthRequiredResponse(applyStoredAuth(cfg, record));
+  };
 
   try {
     const rotateResponse = await rotateGoogleCookies(cfg);
-    if (rotateResponse.status === 401) return reauthRequiredResponse(cfg);
+    if (rotateResponse.status === 401) return await recordRefreshFailure("rotate_401");
     if (rotateResponse.ok) rememberRotation(mergeRotatedCookies(cookie, getSetCookieValues(rotateResponse.headers)));
   } catch (e) {
     log(cfg, `RotateCookies failed: ${e}`);
@@ -2526,11 +2616,13 @@ async function handleCookieRefresh(cfg, env) {
   });
   const html = await response.text();
   const tokens = extractPageTokens(html);
+  const now = new Date().toISOString();
 
-  if (!response.ok || !tokens.at) return reauthRequiredResponse(cfg);
+  if (!response.ok || !tokens.at) {
+    return await recordRefreshFailure(!response.ok ? `app_${response.status}` : "missing_page_token");
+  }
 
   rememberRotation(mergeRotatedCookies(cookie, getSetCookieValues(response.headers)));
-  const now = new Date().toISOString();
   const auth = parseAuthPayload({
     cookie,
     sapisid: cfg.sapisid,
@@ -2543,6 +2635,9 @@ async function handleCookieRefresh(cfg, env) {
     removed_cookie_count: cfg.removed_cookie_count || 0,
     updated_at: changedCookieNames.length ? now : (cfg.cookie_updated_at || now),
     refreshed_at: now,
+    refresh_checked_at: now,
+    refresh_status: changedCookieNames.length ? "refreshed" : "no_rotation",
+    refresh_error: null,
   };
   await writeStoredAuth(env, record);
 
@@ -3093,7 +3188,10 @@ function dashboardResponse(cfg) {
         ["結構檢查", yn(cookie.structurally_valid), cookie.structurally_valid ? "good" : "bad"],
         ["儲存來源", cookie.source || "—"],
         ["匯入時間", fmtTime(cookie.updated_at)],
-        ["上次重新整理", fmtTime(cookie.refreshed_at)],
+        ["最後檢查", fmtTime(cookie.refresh_checked_at)],
+        ["最近成功", fmtTime(cookie.refreshed_at)],
+        ["刷新狀態", cookie.refresh_status || "—", cookie.refresh_status === "reauth_required" ? "bad" : ""],
+        ["刷新錯誤", cookie.refresh_error || "—", cookie.refresh_error ? "bad" : ""],
         ["Cookie 數量", (cookie.cookie_count != null ? cookie.cookie_count : "—") + (cookie.removed_cookie_count ? "（已過濾 " + cookie.removed_cookie_count + "）" : "")],
         ["大小", cookie.byte_length != null ? cookie.byte_length + " bytes" : "—"],
         ["SAPISID", yn(cookie.sapisid_present), cookie.sapisid_present ? "good" : "bad"],
@@ -3138,13 +3236,16 @@ function dashboardResponse(cfg) {
           healthy ? "有效" : "異常",
           (cookie.session_cookie || "無 session") + " · " + (cookie.cookie_count || 0) + " 條" +
           ((cookie.issues || []).length ? " · " + cookie.issues.length + " 項問題" : ""));
-        var ago = fmtAgo(cookie.refreshed_at);
-        if (!cookie.refreshed_at) {
-          setStat("stat-cron", "warn", "尚未執行", "每 10 分鐘排程 · 還沒有重新整理紀錄");
+        var checkedAgo = fmtAgo(cookie.refresh_checked_at);
+        if (!cookie.refresh_checked_at) {
+          setStat("stat-cron", "warn", "尚未檢查", "每 10 分鐘排程 · 還沒有檢查紀錄");
+        } else if (cookie.refresh_status === "reauth_required") {
+          setStat("stat-cron", "err", "需要重匯入",
+            "每 10 分鐘排程 · 最後檢查：" + checkedAgo + " · Google 已不接受這份 Cookie");
         } else {
-          var overdue = Date.now() - new Date(cookie.refreshed_at).getTime() > 30 * 60000;
+          var overdue = Date.now() - new Date(cookie.refresh_checked_at).getTime() > 30 * 60000;
           setStat("stat-cron", overdue ? "warn" : "ok", overdue ? "已逾期" : "正常",
-            "每 10 分鐘排程 · 上次重新整理：" + ago +
+            "每 10 分鐘排程 · 最後檢查：" + checkedAgo +
             (overdue ? "；請按「手動重新整理」或檢查 Cookie 是否失效" : ""));
         }
       }

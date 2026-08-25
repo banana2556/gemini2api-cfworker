@@ -25,6 +25,40 @@ function googleAuthFetch({
   };
 }
 
+function statusRow(primary, display, category, route) {
+  const row = [];
+  row[0] = primary;
+  row[6] = [route];
+  row[11] = display;
+  row[12] = `${display} description`;
+  row[17] = category;
+  return row;
+}
+
+function modelStatusRaw() {
+  const payload = new Array(16).fill(null);
+  payload[15] = [
+    statusRow("cf41b0e0dd7d53e5", "3.5 Flash-Lite", 6, "8c46e95b1a07cecc"),
+    statusRow("fbb127bbb056c959", "3.6 Flash", 1, "56fdd199312815e2"),
+    statusRow("9d8ca3786ebdfbea", "3.1 Pro", 3, "e6fa609c3fa255c0"),
+  ];
+  return JSON.stringify([["wrb.fr", "otAQ7b", JSON.stringify(payload), null, null]]);
+}
+
+const modelAppHtml = [
+  '{"SNlM0e":"guest-at","cfb2h":"boq_assistant-bard-web-server_test"}',
+  '[["cf41b0e0dd7d53e5","8c46e95b1a07cecc"]]',
+  '[["56fdd199312815e2","fbb127bbb056c959"]]',
+  '[["e6fa609c3fa255c0","9d8ca3786ebdfbea"]]',
+].join("");
+
+function generateRaw(text) {
+  const inner = new Array(43).fill(null);
+  inner[4] = [[null, [text]]];
+  inner[42] = "3.5 Flash-Lite";
+  return JSON.stringify([["wrb.fr", "rpc", JSON.stringify(inner)]]);
+}
+
 function memoryCookieStore() {
   let record = null;
   return {
@@ -80,17 +114,95 @@ test("browser root serves a CSP-protected console and ignores legacy Cookie secr
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type"), /text\/html/);
   assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
-  assert.match(html, /Worker 狀態，一眼看完/);
+  assert.match(html, /Gemini Bridge/);
   assert.match(html, /id="api-key"/);
   assert.doesNotMatch(html, /id="admin-key"|gemini-worker-admin-key|ADMIN_KEY/);
   assert.match(html, /gemini-worker-api-key/);
   assert.doesNotMatch(html, /id="probe-models"|即時探測|\?live=1|\?verify=1/);
-  assert.match(html, /id="verify-cookie"/);
-  assert.match(html, /id="refresh-cookie"/);
+  assert.match(html, /id="do-import"/);
+  assert.match(html, /id="do-refresh"/);
   assert.doesNotMatch(html, /never-render-this|session-secret/);
   const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)?.[1];
   assert.ok(script);
   assert.doesNotThrow(() => new Function(script));
+});
+
+test("model catalog falls back to guest when the stored Cookie is rejected", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    ADMIN_KEY: "admin-test-key",
+    COOKIE_STORE: store,
+    GEMINI_ORIGIN: "https://fallback-gemini.example",
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session" }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async (input, init = {}) => {
+      const url = String(input);
+      const headers = init.headers || {};
+      const cookie = headers instanceof Headers ? headers.get("Cookie") : headers.Cookie;
+      if (url.includes("/app")) {
+        return new Response(cookie ? "<html>Sign in</html>" : modelAppHtml, {
+          headers: { "Content-Type": "text/html" },
+        });
+      }
+      if (url.includes("/batchexecute")) {
+        return new Response(modelStatusRaw(), { headers: { "Content-Type": "application/json" } });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    };
+
+    const response = await worker.fetch(new Request("https://worker.example/v1/models", {
+      headers: { Authorization: "Bearer api-test-key" },
+    }), env);
+    const data = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(data.data.map((model) => model.id), ["gemini-auto", "gemini-auto-thinking"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("authenticated generation falls back to guest when upstream returns no content", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async (input, init = {}) => {
+      const url = String(input);
+      const headers = init.headers || {};
+      const cookie = headers instanceof Headers ? headers.get("Cookie") : headers.Cookie;
+      if (url.includes("/app")) return new Response(cookie ? "<html>Sign in</html>" : modelAppHtml);
+      calls.push(cookie ? "authenticated" : "guest");
+      return new Response(cookie ? "<html>empty</html>" : generateRaw("guest fallback answer with enough padding to pass parser"));
+    };
+
+    const cfg = internals.applyStoredAuth(internals.getConfig({
+      GEMINI_ORIGIN: "https://generate-fallback.example",
+      GEMINI_BL: "boq_assistant-bard-web-server_test",
+      UPSTREAM_SOCKET: "false",
+      RETRY_ATTEMPTS: "1",
+      LOG_REQUESTS: "false",
+    }), { cookie: "SAPISID=sapi; SID=session", sapisid: "sapi" });
+    const result = await internals.generateResult(cfg, "hello", 6, 1, null, null);
+
+    assert.deepEqual(calls, ["authenticated", "guest"]);
+    assert.match(result.text, /guest fallback answer/);
+    assert.equal(result.actualModel, "3.5 Flash-Lite");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("root keeps health JSON compatibility for non-browser clients", async () => {
@@ -225,6 +337,8 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     assert.equal(refreshedData.status, "refreshed");
     assert.deepEqual(refreshedData.changed_cookie_names, ["__Secure-1PSIDTS", "SIDCC", "NID"]);
     assert.ok(refreshedData.cookie.refreshed_at);
+    assert.ok(refreshedData.cookie.refresh_checked_at);
+    assert.equal(refreshedData.cookie.refresh_status, "refreshed");
     assert.doesNotMatch(refreshedText, /rotated-ts|rotated-cc|rotated-nid|ignore-me/);
     assert.match(store.peek().cookie, /__Secure-1PSIDTS=rotated-ts/);
     assert.match(store.peek().cookie, /SIDCC=rotated-cc/);
@@ -247,7 +361,10 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     assert.equal(store.peek().updated_at, validRecord.updated_at);
     assert.equal(store.peek().xsrf_token, "newer-at");
     assert.ok(store.peek().refreshed_at);
+    assert.ok(store.peek().refresh_checked_at);
+    assert.equal(store.peek().refresh_status, "no_rotation");
 
+    const beforeExpired = structuredClone(store.peek());
     globalThis.fetch = googleAuthFetch({
       rotateStatus: 401,
       appCookies: ["SIDCC=must-not-save; Path=/"],
@@ -264,6 +381,10 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     assert.doesNotMatch(expiredText, /must-not-save|rotated-cc|rotated-nid/);
     assert.equal(store.peek().cookie, validRecord.cookie);
     assert.equal(store.peek().xsrf_token, "newer-at");
+    assert.equal(store.peek().refreshed_at, beforeExpired.refreshed_at);
+    assert.ok(store.peek().refresh_checked_at);
+    assert.equal(store.peek().refresh_status, "reauth_required");
+    assert.equal(store.peek().refresh_error, "rotate_401");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -301,6 +422,8 @@ test("scheduled Cookie refresh automatically persists Google rotations", async (
     assert.match(store.peek().cookie, /SIDCC=automatic-cc/);
     assert.equal(store.peek().xsrf_token, "automatic-at");
     assert.ok(store.peek().refreshed_at);
+    assert.ok(store.peek().refresh_checked_at);
+    assert.equal(store.peek().refresh_status, "refreshed");
   } finally {
     globalThis.fetch = originalFetch;
   }
