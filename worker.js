@@ -262,12 +262,23 @@ const FORWARDED_COOKIE_NAMES = [
 ];
 const FORWARDED_COOKIE_SET = new Set(FORWARDED_COOKIE_NAMES);
 
+function normalizePastedCookieText(cookie) {
+  return String(cookie || "")
+    .replace(/\\([_*])/g, "$1")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "");
+}
+
+function normalizeCookieName(name) {
+  const clean = normalizePastedCookieText(name).trim();
+  return /^[_*]+Secure-/.test(clean) ? clean.replace(/^[_*]+Secure-/, "__Secure-") : clean;
+}
+
 function parseCookiePairs(cookie) {
   const pairs = new Map();
   for (const part of String(cookie || "").split(";")) {
     const i = part.indexOf("=");
     if (i <= 0) continue;
-    const name = part.slice(0, i).trim();
+    const name = normalizeCookieName(part.slice(0, i));
     const value = part.slice(i + 1).trim();
     if (name && value) pairs.set(name, value);
   }
@@ -355,6 +366,8 @@ function parseAuthPayload(input, strict = false) {
   const rawCookie = String(payload.cookie ?? "")
     .replace(/^cookie\s*:\s*/i, "")
     .replace(/[\r\n]+[\t ]*/g, " ")
+    .replace(/\\([_*])/g, "$1")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .trim();
   const pairs = parseCookiePairs(rawCookie);
   const forwarded = FORWARDED_COOKIE_NAMES.filter((name) => pairs.has(name));
@@ -844,6 +857,35 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
   return fetch(url, { method, headers, body, signal: timeoutSignal(timeoutMs) });
 }
 
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+async function fetchAppPage(cfg, headers, timeoutMs = 30000) {
+  const origin = cfg.gemini_origin || "https://gemini.google.com";
+  const originUrl = new URL(origin);
+  let url = `${origin}${accountPrefix(cfg)}/app`;
+  const setCookieValues = [];
+  let response = null;
+
+  for (let i = 0; i < 4; i++) {
+    response = await httpFetch(url, { headers, timeoutMs, socket: cfg.upstream_socket });
+    const rotated = getSetCookieValues(response.headers);
+    setCookieValues.push(...rotated);
+    if (rotated.length && headers.Cookie) headers.Cookie = mergeRotatedCookies(headers.Cookie, rotated).cookie || headers.Cookie;
+    if (!REDIRECT_STATUSES.has(response.status)) {
+      return { response, html: await response.text(), setCookieValues };
+    }
+
+    const location = response.headers.get("location");
+    try { await response.text(); } catch (_) {}
+    if (!location) return { response, html: "", setCookieValues };
+    const next = new URL(location, url);
+    if (next.origin !== originUrl.origin) return { response, html: "", setCookieValues };
+    url = next.href;
+  }
+
+  return { response, html: "", setCookieValues };
+}
+
 // ─── 多模态:图片上传(Scotty 续传)───────────────────────────────────────────
 // 说明:图片输入需要从面板匯入登录态。匿名会话上传文件能成功,但带图
 // 生成会被后端以 BardErrorInfo[1100] 拒绝(权限门)。无 cookie 时不上传,
@@ -920,8 +962,8 @@ async function refreshGeminiBl(cfg) {
     applyAccountHeaders(headers, cfg);
     if (cfg.cookie) headers.Cookie = cfg.cookie;
     if (cfg.sapisid) headers.Authorization = await makeSapisidHash(cfg.sapisid);
-    const resp = await httpFetch(origin + accountPrefix(cfg) + "/app", { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
-    const bl = extractGeminiBl(await resp.text());
+    const page = await fetchAppPage(cfg, headers);
+    const bl = extractGeminiBl(page.html);
     if (bl) {
       const expiresAt = Date.now() + GEMINI_BL_CACHE_TTL_SEC * 1000;
       const record = { bl, expiresAt };
@@ -941,7 +983,7 @@ async function refreshGeminiBl(cfg) {
       cfg.gemini_bl = bl;
       return bl;
     }
-    log(cfg, "GEMINI_BL auto-detect returned no build (status=" + resp.status + ")");
+    log(cfg, "GEMINI_BL auto-detect returned no build (status=" + (page.response && page.response.status) + ")");
   } catch (e) {
     log(cfg, "GEMINI_BL auto-detect failed: " + e);
   }
@@ -953,12 +995,9 @@ async function refreshGeminiBl(cfg) {
 async function fetchModelCatalog(cfg, key) {
   const origin = cfg.gemini_origin || "https://gemini.google.com";
   const headers = await buildHeaders(cfg);
-  const appResponse = await httpFetch(`${origin}${accountPrefix(cfg)}/app`, {
-    headers,
-    timeoutMs: 30000,
-    socket: cfg.upstream_socket,
-  });
-  const appHtml = await appResponse.text();
+  const page = await fetchAppPage(cfg, headers);
+  const appResponse = page.response;
+  const appHtml = page.html;
   if (!appResponse.ok) throw new Error(`Gemini /app returned ${appResponse.status}`);
 
   const tokens = extractPageTokens(appHtml);
@@ -1092,9 +1131,8 @@ async function getPageTokens(cfg) {
   if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
   const tokens = cfg.xsrf_token ? { at: cfg.xsrf_token } : {};
   try {
-    const resp = await httpFetch(`${origin}${accountPrefix(cfg)}/app`, { headers, timeoutMs: 30000, socket: cfg.upstream_socket });
-    const html = await resp.text();
-    Object.assign(tokens, extractPageTokens(html));
+    const page = await fetchAppPage(cfg, headers);
+    Object.assign(tokens, extractPageTokens(page.html));
   } catch (e) {
     log(cfg, `getPageTokens failed: ${e}`);
   }
@@ -2608,13 +2646,9 @@ async function handleCookieRefresh(cfg, env) {
   headers.Cookie = cookie;
   if (cfg.sapisid) headers.Authorization = await makeSapisidHash(cfg.sapisid);
 
-  const origin = cfg.gemini_origin || "https://gemini.google.com";
-  const response = await httpFetch(`${origin}${accountPrefix(cfg)}/app`, {
-    headers,
-    timeoutMs: 30000,
-    socket: cfg.upstream_socket,
-  });
-  const html = await response.text();
+  const page = await fetchAppPage(cfg, headers);
+  const response = page.response;
+  const html = page.html;
   const tokens = extractPageTokens(html);
   const now = new Date().toISOString();
 
@@ -2622,7 +2656,7 @@ async function handleCookieRefresh(cfg, env) {
     return await recordRefreshFailure(!response.ok ? `app_${response.status}` : "missing_page_token");
   }
 
-  rememberRotation(mergeRotatedCookies(cookie, getSetCookieValues(response.headers)));
+  rememberRotation(mergeRotatedCookies(cookie, page.setCookieValues));
   const auth = parseAuthPayload({
     cookie,
     sapisid: cfg.sapisid,

@@ -11,6 +11,7 @@ function googleAuthFetch({
   appStatus = 200,
   appCookies = [],
   appBody = '{"SNlM0e":"fresh-at","cfb2h":"boq_assistant-bard-web-server_test"}',
+  appRedirectLocation = "",
 } = {}) {
   return async (input) => {
     const url = String(typeof input === "string" ? input : input.url);
@@ -20,6 +21,10 @@ function googleAuthFetch({
       return new Response(`)]}'\n[["identity.hfcr",600]]`, { status: rotateStatus, headers });
     }
     const headers = new Headers({ "Content-Type": "text/html" });
+    if (appRedirectLocation && url.includes("/u/0/app")) {
+      headers.set("Location", appRedirectLocation);
+      return new Response("", { status: 302, headers });
+    }
     for (const cookie of appCookies) headers.append("Set-Cookie", cookie);
     return new Response(appBody, { status: appStatus, headers });
   };
@@ -385,6 +390,45 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     assert.ok(store.peek().refresh_checked_at);
     assert.equal(store.peek().refresh_status, "reauth_required");
     assert.equal(store.peek().refresh_error, "rotate_401");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Cookie refresh follows same-origin Gemini app redirects", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const adminHeaders = { Authorization: "Bearer api-test-key" };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { ...adminHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ auth: { cookie: "SAPISID=sapi; SID=session", auth_user: 0 } }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = googleAuthFetch({
+      appRedirectLocation: "https://gemini.google.com/app",
+      appBody: '{"SNlM0e":"redirect-at","cfb2h":"boq_assistant-bard-web-server_redirect"}',
+    });
+
+    const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: adminHeaders,
+    }), env);
+    const data = await refreshed.json();
+    assert.equal(refreshed.status, 200);
+    assert.equal(data.status, "no_rotation");
+    assert.equal(data.cookie.refresh_status, "no_rotation");
+    assert.equal(store.peek().xsrf_token, "redirect-at");
+    assert.equal(store.peek().gemini_bl, "boq_assistant-bard-web-server_redirect");
   } finally {
     globalThis.fetch = originalFetch;
   }

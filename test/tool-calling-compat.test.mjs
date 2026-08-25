@@ -152,6 +152,19 @@ test("raw Cookie and gemini-auth JSON preserve account metadata", async () => {
   assert.equal(headers.Referer, "https://gemini.google.com/u/2/app");
 });
 
+test("Cookie import normalizes markdown-escaped browser paste", () => {
+  const parsed = parseAuthPayload(
+    "\\_\\_Secure-BUCKET=bucket; SEARCH\\_SAMESITE=same; SAPISID=sapi\\_value; SID=session; **Secure-3PAPISID=pap; \\_*Secure-3PSIDRTS=ts",
+    true,
+  );
+
+  assert.equal(
+    parsed.cookie,
+    "SID=session; SAPISID=sapi_value; __Secure-BUCKET=bucket; __Secure-3PAPISID=pap; __Secure-3PSIDRTS=ts",
+  );
+  assert.equal(parsed.sapisid, "sapi_value");
+});
+
 test("Cookie validation rejects an incomplete login session", () => {
   assert.throws(() => parseAuthPayload("SAPISID=value", true), /工作階段 Cookie/);
 });
