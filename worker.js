@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.6-worker";
+const VERSION = "1.9.6";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -2837,6 +2837,9 @@ function dashboardResponse(cfg) {
     .brand { display: flex; align-items: center; gap: 11px; }
     .brand svg { width: 30px; height: 30px; flex: none; }
     .brand strong { font-size: 1rem; letter-spacing: .01em; }
+    .brand a { color: inherit; text-decoration: none; }
+    .brand a:hover { color: var(--accent); }
+    .brand .author { color: var(--muted); font-size: .82rem; }
     .brand .ver {
       margin-left: 8px; font: .75rem var(--mono); color: var(--accent);
       border: 1px solid rgba(98, 182, 255, .35); border-radius: 99px; padding: 1.5px 8px;
@@ -2998,7 +3001,8 @@ function dashboardResponse(cfg) {
         </linearGradient></defs>
         <path d="M16 2 L19.5 12.5 L30 16 L19.5 19.5 L16 30 L12.5 19.5 L2 16 L12.5 12.5 Z" fill="url(#spark)"/>
       </svg>
-      <strong>Gemini Bridge</strong>
+      <a href="https://github.com/banana2556/gemini2api-cfworker" target="_blank" rel="noopener noreferrer"><strong>Gemini Bridge</strong></a>
+      <a class="author" href="https://github.com/banana2556" target="_blank" rel="noopener noreferrer">@banana2556</a>
       <span class="ver" id="ver-chip">v—</span>
     </div>
     <nav class="tabs" role="tablist" aria-label="主要區域">

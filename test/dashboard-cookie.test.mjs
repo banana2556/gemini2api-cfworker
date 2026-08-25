@@ -120,6 +120,8 @@ test("browser root serves a CSP-protected console and ignores legacy Cookie secr
   assert.match(response.headers.get("content-type"), /text\/html/);
   assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
   assert.match(html, /Gemini Bridge/);
+  assert.match(html, /href="https:\/\/github\.com\/banana2556\/gemini2api-cfworker"[^>]*><strong>Gemini Bridge<\/strong>/);
+  assert.match(html, /href="https:\/\/github\.com\/banana2556"[^>]*>@banana2556<\/a>/);
   assert.match(html, /id="api-key"/);
   assert.doesNotMatch(html, /id="admin-key"|gemini-worker-admin-key|ADMIN_KEY/);
   assert.match(html, /gemini-worker-api-key/);
@@ -216,7 +218,9 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   const health = await worker.fetch(new Request("https://worker.example/health"), env);
   assert.match(root.headers.get("content-type"), /application\/json/);
   assert.equal((await root.json()).status, "ok");
-  assert.equal((await health.json()).status, "ok");
+  const healthJson = await health.json();
+  assert.equal(healthJson.status, "ok");
+  assert.equal(healthJson.version, "1.9.6");
 });
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
