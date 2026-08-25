@@ -541,6 +541,65 @@ test("Cookie refresh detects auth_user when raw Cookie targets a numbered accoun
   }
 });
 
+test("Cookie refresh accepts Google abuse exemption redirects", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const adminHeaders = { Authorization: "Bearer api-test-key" };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { ...adminHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session" }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    let issuedAbuse = false;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      const cookie = init.headers instanceof Headers ? init.headers.get("Cookie") : init.headers?.Cookie;
+      if (url.includes("/RotateCookies")) {
+        return new Response(`)]}'\n[["identity.hfcr",600]]`, { status: 200 });
+      }
+      if (url.startsWith("https://www.google.com/sorry/")) {
+        issuedAbuse = true;
+        return new Response("", {
+          status: 302,
+          headers: { Location: "https://gemini.google.com/app?google_abuse=GOOGLE_ABUSE_EXEMPTION%3DID%3Dabuse%3B%20path%3D/%3B%20domain%3Dgoogle.com" },
+        });
+      }
+      if (url === "https://gemini.google.com/app" && !issuedAbuse) {
+        return new Response("", {
+          status: 302,
+          headers: { Location: "https://www.google.com/sorry/index?continue=https://gemini.google.com/app" },
+        });
+      }
+      assert.match(cookie || "", /GOOGLE_ABUSE_EXEMPTION=ID=abuse/);
+      return new Response('{"SNlM0e":"abuse-at","cfb2h":"boq_assistant-bard-web-server_abuse"}', {
+        headers: { "Content-Type": "text/html" },
+      });
+    };
+
+    const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: adminHeaders,
+    }), env);
+    const data = await refreshed.json();
+    assert.equal(refreshed.status, 200);
+    assert.equal(data.status, "refreshed");
+    assert.equal(store.peek().xsrf_token, "abuse-at");
+    assert.match(store.peek().cookie, /GOOGLE_ABUSE_EXEMPTION=ID=abuse/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("scheduled Cookie refresh automatically persists Google rotations", async () => {
   const store = memoryCookieStore();
   const env = {

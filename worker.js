@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.5-worker";
+const VERSION = "1.9.6-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -255,7 +255,7 @@ const SESSION_COOKIE_NAMES = ["__Secure-1PSID", "__Secure-3PSID", "SID"];
 const MAX_COOKIE_BYTES = 64 * 1024;
 const FORWARDED_COOKIE_NAMES = [
   "SID", "HSID", "SSID", "APISID", "SAPISID", "LSID", "OSID", "SIDCC",
-  "AEC", "NID", "COMPASS", "__Secure-BUCKET", "__Secure-STRP", "__Secure-ENID",
+  "AEC", "NID", "COMPASS", "GOOGLE_ABUSE_EXEMPTION", "__Secure-BUCKET", "__Secure-STRP", "__Secure-ENID",
   "__Secure-1PAPISID", "__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-1PSIDRTS", "__Secure-1PSIDCC",
   "__Secure-3PAPISID", "__Secure-3PSID", "__Secure-3PSIDTS", "__Secure-3PSIDRTS", "__Secure-3PSIDCC",
   "__Secure-OSID", "__Host-1PLSID", "__Host-3PLSID",
@@ -851,7 +851,7 @@ async function socketHttp(connect, url, { method = "GET", headers = {}, body, ti
 }
 
 // 统一上游入口:socket 优先,失败/不可用则回退 fetch。返回类 Response 对象。
-async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 180000, socket = true } = {}) {
+async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 180000, socket = true, redirect } = {}) {
   if (socket) {
     const connect = await resolveConnect();
     if (connect) {
@@ -862,7 +862,7 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
       }
     }
   }
-  return fetch(url, { method, headers, body, signal: timeoutSignal(timeoutMs) });
+  return fetch(url, { method, headers, body, redirect, signal: timeoutSignal(timeoutMs) });
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -881,7 +881,7 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000, maxRedirects = MAX_
   let response = null;
 
   for (let i = 0; i < maxRedirects; i++) {
-    response = await httpFetch(url, { headers, timeoutMs, socket: false });
+    response = await httpFetch(url, { headers, timeoutMs, socket: cfg.upstream_socket, redirect: "manual" });
     const rotated = getSetCookieValues(response.headers);
     setCookieValues.push(...rotated);
     if (rotated.length && headers.Cookie) headers.Cookie = mergeRotatedCookies(headers.Cookie, rotated).cookie || headers.Cookie;
@@ -894,11 +894,19 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000, maxRedirects = MAX_
     if (!location) return { response, html: "", setCookieValues, redirect_host: "missing_location" };
     const next = new URL(location, url);
     redirectHost = next.hostname.replace(/[^a-z0-9.-]/gi, "_");
+    const abuseCookie = next.searchParams.get("google_abuse");
+    if (abuseCookie) {
+      setCookieValues.push(abuseCookie);
+      headers.Cookie = mergeRotatedCookies(headers.Cookie || "", [abuseCookie]).cookie || headers.Cookie;
+      next.searchParams.delete("google_abuse");
+    }
     if (next.origin !== originUrl.origin && !isGoogleRedirectTarget(next)) return { response, html: "", setCookieValues, redirect_host: redirectHost };
     if (next.origin !== originUrl.origin) {
       delete headers.Authorization;
       delete headers["X-Same-Domain"];
       delete headers.Origin;
+    } else if (cfg.sapisid) {
+      headers.Authorization = await makeSapisidHash(cfg.sapisid);
     }
     url = next.href;
   }
