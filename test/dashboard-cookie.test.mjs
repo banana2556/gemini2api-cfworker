@@ -491,6 +491,56 @@ test("Cookie refresh follows Google account redirects back to Gemini", async () 
   }
 });
 
+test("Cookie refresh detects auth_user when raw Cookie targets a numbered account", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const adminHeaders = { Authorization: "Bearer api-test-key" };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { ...adminHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session" }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async (input) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("/RotateCookies")) {
+        return new Response(`)]}'\n[["identity.hfcr",600]]`, { status: 200 });
+      }
+      if (url === "https://gemini.google.com/u/2/app") {
+        return new Response('{"SNlM0e":"u2-at","cfb2h":"boq_assistant-bard-web-server_u2"}', {
+          headers: { "Content-Type": "text/html" },
+        });
+      }
+      return new Response("", {
+        status: 302,
+        headers: { Location: "https://www.google.com/" },
+      });
+    };
+
+    const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: adminHeaders,
+    }), env);
+    const data = await refreshed.json();
+    assert.equal(refreshed.status, 200);
+    assert.equal(data.status, "no_rotation");
+    assert.equal(data.cookie.auth_user, "2");
+    assert.equal(store.peek().auth_user, "2");
+    assert.equal(store.peek().xsrf_token, "u2-at");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("scheduled Cookie refresh automatically persists Google rotations", async () => {
   const store = memoryCookieStore();
   const env = {

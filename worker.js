@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.2-worker";
+const VERSION = "1.9.3-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -671,6 +671,14 @@ function applyAccountHeaders(headers, cfg) {
   if (cfg.auth_user !== null && cfg.auth_user !== undefined && cfg.auth_user !== "") {
     headers["X-Goog-AuthUser"] = String(cfg.auth_user);
   }
+  return headers;
+}
+
+async function buildAppPageHeaders(cfg, cookie) {
+  const headers = { "User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9" };
+  applyAccountHeaders(headers, cfg);
+  if (cookie) headers.Cookie = cookie;
+  if (cfg.sapisid) headers.Authorization = await makeSapisidHash(cfg.sapisid);
   return headers;
 }
 
@@ -2653,15 +2661,27 @@ async function handleCookieRefresh(cfg, env) {
     log(cfg, `RotateCookies failed: ${e}`);
   }
 
-  const headers = { "User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9" };
-  applyAccountHeaders(headers, cfg);
-  headers.Cookie = cookie;
-  if (cfg.sapisid) headers.Authorization = await makeSapisidHash(cfg.sapisid);
+  let detectedAuthUser = cfg.auth_user;
+  let pageCfg = cfg;
+  let page = await fetchAppPage(pageCfg, await buildAppPageHeaders(pageCfg, cookie));
+  let response = page.response;
+  let tokens = extractPageTokens(page.html);
 
-  const page = await fetchAppPage(cfg, headers);
-  const response = page.response;
-  const html = page.html;
-  const tokens = extractPageTokens(html);
+  if ((!response.ok || !tokens.at) && (cfg.auth_user === null || cfg.auth_user === undefined || cfg.auth_user === "")) {
+    for (const authUser of ["0", "1", "2", "3"]) {
+      const trialCfg = { ...cfg, auth_user: authUser };
+      const trialPage = await fetchAppPage(trialCfg, await buildAppPageHeaders(trialCfg, cookie));
+      const trialTokens = extractPageTokens(trialPage.html);
+      page = trialPage;
+      response = trialPage.response;
+      tokens = trialTokens;
+      if (response.ok && tokens.at) {
+        pageCfg = trialCfg;
+        detectedAuthUser = authUser;
+        break;
+      }
+    }
+  }
   const now = new Date().toISOString();
 
   if (!response.ok || !tokens.at) {
@@ -2673,9 +2693,9 @@ async function handleCookieRefresh(cfg, env) {
   const auth = parseAuthPayload({
     cookie,
     sapisid: cfg.sapisid,
-    auth_user: cfg.auth_user,
+    auth_user: detectedAuthUser,
     xsrf_token: tokens.at,
-    gemini_bl: tokens.bl || cfg.gemini_bl,
+    gemini_bl: tokens.bl || pageCfg.gemini_bl,
   }, true);
   const record = {
     ...auth,
