@@ -119,9 +119,9 @@ test("browser root serves a CSP-protected console and ignores legacy Cookie secr
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type"), /text\/html/);
   assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
-  assert.match(html, /Gemini Bridge/);
-  assert.match(html, /href="https:\/\/github\.com\/banana2556\/gemini2api-cfworker"[^>]*><strong>Gemini Bridge<\/strong>/);
-  assert.match(html, /href="https:\/\/github\.com\/banana2556"[^>]*>@banana2556<\/a>/);
+  assert.match(html, /GeminiWeb2API · Console/);
+  assert.match(html, /href="https:\/\/github\.com\/banana2556\/gemini2api-cfworker"[^>]*><strong>GeminiWeb2API<\/strong>/);
+  assert.match(html, /class="gh"[^>]*>[\s\S]*@banana2556<\/a>/);
   assert.match(html, /id="api-key"/);
   assert.doesNotMatch(html, /id="admin-key"|gemini-worker-admin-key|ADMIN_KEY/);
   assert.match(html, /gemini-worker-api-key/);

@@ -2794,7 +2794,7 @@ function dashboardResponse(cfg) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Gemini Bridge · Console</title>
+  <title>GeminiWeb2API · Console</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23fbad41'/%3E%3Cstop offset='1' stop-color='%23f6821f'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M16 2 L19.5 12.5 L30 16 L19.5 19.5 L16 30 L12.5 19.5 L2 16 L12.5 12.5 Z' fill='url(%23g)'/%3E%3C/svg%3E">
   <style nonce="${nonce}">
     :root {
@@ -2835,13 +2835,14 @@ function dashboardResponse(cfg) {
       background: rgba(10, 14, 21, .82); backdrop-filter: blur(12px);
     }
     .brand { display: flex; align-items: center; gap: 11px; }
-    .brand svg { width: 30px; height: 30px; flex: none; }
+    .brand .logo { width: 30px; height: 30px; flex: none; }
     .brand strong { font-size: 1rem; letter-spacing: .01em; }
     .brand a { color: inherit; text-decoration: none; }
     .brand a:hover { color: var(--accent); }
-    .brand .author { color: var(--muted); font-size: .82rem; }
+    .brand .author { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: .82rem; }
+    .brand .gh { width: 15px; height: 15px; flex: none; }
     .brand .ver {
-      margin-left: 8px; font: .75rem var(--mono); color: var(--accent);
+      font: .75rem var(--mono); color: var(--accent);
       border: 1px solid rgba(98, 182, 255, .35); border-radius: 99px; padding: 1.5px 8px;
       background: rgba(98, 182, 255, .08);
     }
@@ -2995,14 +2996,14 @@ function dashboardResponse(cfg) {
 <body>
   <header class="top">
     <div class="brand">
-      <svg viewBox="0 0 32 32" aria-hidden="true">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
         <defs><linearGradient id="spark" x1="0" y1="0" x2="1" y2="1">
           <stop offset="0" stop-color="#fbad41"/><stop offset="1" stop-color="#f6821f"/>
         </linearGradient></defs>
         <path d="M16 2 L19.5 12.5 L30 16 L19.5 19.5 L16 30 L12.5 19.5 L2 16 L12.5 12.5 Z" fill="url(#spark)"/>
       </svg>
-      <a href="https://github.com/banana2556/gemini2api-cfworker" target="_blank" rel="noopener noreferrer"><strong>Gemini Bridge</strong></a>
-      <a class="author" href="https://github.com/banana2556" target="_blank" rel="noopener noreferrer">@banana2556</a>
+      <a href="https://github.com/banana2556/gemini2api-cfworker" target="_blank" rel="noopener noreferrer"><strong>GeminiWeb2API</strong></a>
+      <a class="author" href="https://github.com/banana2556" target="_blank" rel="noopener noreferrer"><svg class="gh" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 .2a8 8 0 0 0-2.5 15.6c.4.1.5-.2.5-.4v-1.4c-2.1.5-2.6-.9-2.6-.9-.3-.8-.8-1-.8-1-.7-.5.1-.5.1-.5.8.1 1.2.8 1.2.8.7 1.2 1.9.9 2.3.7.1-.5.3-.9.5-1.1-1.7-.2-3.5-.9-3.5-3.9 0-.9.3-1.6.8-2.1-.1-.2-.4-1 .1-2.1 0 0 .7-.2 2.2.8a7.4 7.4 0 0 1 4 0c1.5-1 2.2-.8 2.2-.8.4 1.1.2 1.9.1 2.1.5.6.8 1.3.8 2.1 0 3-1.8 3.6-3.5 3.8.3.2.5.7.5 1.4v2.1c0 .2.1.5.5.4A8 8 0 0 0 8 .2Z"/></svg>@banana2556</a>
       <span class="ver" id="ver-chip">v—</span>
     </div>
     <nav class="tabs" role="tablist" aria-label="主要區域">
