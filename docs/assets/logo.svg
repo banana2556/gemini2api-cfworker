@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-labelledby="title desc">
+  <title id="title">GeminiWeb2API logo</title>
+  <desc id="desc">An orange four-point spark on a dark blue rounded square.</desc>
+  <defs>
+    <linearGradient id="bg" x1="18" y1="14" x2="142" y2="148" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172335"/>
+      <stop offset="1" stop-color="#0a0e15"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="46" y1="43" x2="116" y2="119" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fbad41"/>
+      <stop offset="1" stop-color="#f6821f"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(80 80) rotate(90) scale(64)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#62b6ff" stop-opacity=".16"/>
+      <stop offset="1" stop-color="#62b6ff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="4" y="4" width="152" height="152" rx="34" fill="url(#bg)"/>
+  <rect x="4.5" y="4.5" width="151" height="151" rx="33.5" fill="none" stroke="#314562"/>
+  <circle cx="80" cy="80" r="64" fill="url(#glow)"/>
+  <path d="M80 27 92.5 67.5 133 80 92.5 92.5 80 133 67.5 92.5 27 80 67.5 67.5 80 27Z" fill="url(#spark)"/>
+</svg>
