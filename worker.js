@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.4-worker";
+const VERSION = "1.9.5-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -881,7 +881,7 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000, maxRedirects = MAX_
   let response = null;
 
   for (let i = 0; i < maxRedirects; i++) {
-    response = await httpFetch(url, { headers, timeoutMs, socket: cfg.upstream_socket });
+    response = await httpFetch(url, { headers, timeoutMs, socket: false });
     const rotated = getSetCookieValues(response.headers);
     setCookieValues.push(...rotated);
     if (rotated.length && headers.Cookie) headers.Cookie = mergeRotatedCookies(headers.Cookie, rotated).cookie || headers.Cookie;
