@@ -1,4 +1,7 @@
-# gemini2api-cfworker
+# GeminiWeb2API
+
+[![Version](https://img.shields.io/badge/version-v1.9.6-62b6ff)](https://github.com/banana2556/gemini2api-cfworker)
+[![Author](https://img.shields.io/badge/GitHub-%40banana2556-8b949e?logo=github)](https://github.com/banana2556)
 
 Cloudflare Worker that converts Google Gemini's web StreamGenerate protocol into **OpenAI-compatible** and **Google AI Studio-compatible** APIs. Single-file, zero dependencies.
 
