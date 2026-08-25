@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.1-worker";
+const VERSION = "1.9.2-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -858,6 +858,7 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_APP_REDIRECTS = 10;
 
 function isGoogleRedirectTarget(url) {
   return url.protocol === "https:" && (url.hostname === "google.com" || url.hostname.endsWith(".google.com"));
@@ -868,22 +869,24 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000) {
   const originUrl = new URL(origin);
   let url = `${origin}${accountPrefix(cfg)}/app`;
   const setCookieValues = [];
+  let redirectHost = "";
   let response = null;
 
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < MAX_APP_REDIRECTS; i++) {
     response = await httpFetch(url, { headers, timeoutMs, socket: cfg.upstream_socket });
     const rotated = getSetCookieValues(response.headers);
     setCookieValues.push(...rotated);
     if (rotated.length && headers.Cookie) headers.Cookie = mergeRotatedCookies(headers.Cookie, rotated).cookie || headers.Cookie;
     if (!REDIRECT_STATUSES.has(response.status)) {
-      return { response, html: await response.text(), setCookieValues };
+      return { response, html: await response.text(), setCookieValues, redirect_host: redirectHost };
     }
 
     const location = response.headers.get("location");
     try { await response.text(); } catch (_) {}
-    if (!location) return { response, html: "", setCookieValues };
+    if (!location) return { response, html: "", setCookieValues, redirect_host: "missing_location" };
     const next = new URL(location, url);
-    if (next.origin !== originUrl.origin && !isGoogleRedirectTarget(next)) return { response, html: "", setCookieValues };
+    redirectHost = next.hostname.replace(/[^a-z0-9.-]/gi, "_");
+    if (next.origin !== originUrl.origin && !isGoogleRedirectTarget(next)) return { response, html: "", setCookieValues, redirect_host: redirectHost };
     if (next.origin !== originUrl.origin) {
       delete headers.Authorization;
       delete headers["X-Same-Domain"];
@@ -892,7 +895,7 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000) {
     url = next.href;
   }
 
-  return { response, html: "", setCookieValues };
+  return { response, html: "", setCookieValues, redirect_host: redirectHost || "too_many_redirects" };
 }
 
 // ─── 多模态:图片上传(Scotty 续传)───────────────────────────────────────────
@@ -2662,7 +2665,8 @@ async function handleCookieRefresh(cfg, env) {
   const now = new Date().toISOString();
 
   if (!response.ok || !tokens.at) {
-    return await recordRefreshFailure(!response.ok ? `app_${response.status}` : "missing_page_token");
+    const redirectSuffix = page.redirect_host ? `_to_${page.redirect_host}` : "";
+    return await recordRefreshFailure(!response.ok ? `app_${response.status}${redirectSuffix}` : "missing_page_token");
   }
 
   rememberRotation(mergeRotatedCookies(cookie, page.setCookieValues));
