@@ -434,6 +434,63 @@ test("Cookie refresh follows same-origin Gemini app redirects", async () => {
   }
 });
 
+test("Cookie refresh follows Google account redirects back to Gemini", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const adminHeaders = { Authorization: "Bearer api-test-key" };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { ...adminHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session" }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    let sentToAccounts = false;
+    globalThis.fetch = async (input) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("/RotateCookies")) {
+        return new Response(`)]}'\n[["identity.hfcr",600]]`, { status: 200 });
+      }
+      if (url === "https://gemini.google.com/app" && !sentToAccounts) {
+        sentToAccounts = true;
+        return new Response("", {
+          status: 302,
+          headers: { Location: "https://accounts.google.com/ServiceLogin" },
+        });
+      }
+      if (url.startsWith("https://accounts.google.com/")) {
+        return new Response("", {
+          status: 302,
+          headers: { Location: "https://gemini.google.com/app" },
+        });
+      }
+      return new Response('{"SNlM0e":"accounts-at","cfb2h":"boq_assistant-bard-web-server_accounts"}', {
+        headers: { "Content-Type": "text/html" },
+      });
+    };
+
+    const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: adminHeaders,
+    }), env);
+    const data = await refreshed.json();
+    assert.equal(refreshed.status, 200);
+    assert.equal(data.status, "no_rotation");
+    assert.equal(store.peek().xsrf_token, "accounts-at");
+    assert.equal(store.peek().gemini_bl, "boq_assistant-bard-web-server_accounts");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("scheduled Cookie refresh automatically persists Google rotations", async () => {
   const store = memoryCookieStore();
   const env = {

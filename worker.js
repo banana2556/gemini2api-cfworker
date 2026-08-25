@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.0-worker";
+const VERSION = "1.9.1-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -859,6 +859,10 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+function isGoogleRedirectTarget(url) {
+  return url.protocol === "https:" && (url.hostname === "google.com" || url.hostname.endsWith(".google.com"));
+}
+
 async function fetchAppPage(cfg, headers, timeoutMs = 30000) {
   const origin = cfg.gemini_origin || "https://gemini.google.com";
   const originUrl = new URL(origin);
@@ -879,7 +883,12 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000) {
     try { await response.text(); } catch (_) {}
     if (!location) return { response, html: "", setCookieValues };
     const next = new URL(location, url);
-    if (next.origin !== originUrl.origin) return { response, html: "", setCookieValues };
+    if (next.origin !== originUrl.origin && !isGoogleRedirectTarget(next)) return { response, html: "", setCookieValues };
+    if (next.origin !== originUrl.origin) {
+      delete headers.Authorization;
+      delete headers["X-Same-Domain"];
+      delete headers.Origin;
+    }
     url = next.href;
   }
 
