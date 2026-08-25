@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.6";
+const VERSION = "1.9.7";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -2620,7 +2620,7 @@ function reauthRequiredResponse(cfg) {
   });
 }
 
-async function handleCookieRefresh(cfg, env) {
+async function handleCookieRefresh(cfg, env, verifyPage = true) {
   if (!cookieStoreStub(env)) {
     return privateJsonResponse({
       error: { message: "COOKIE_STORE 尚未綁定；刷新後的 Cookie 無法持久保存。" },
@@ -2664,9 +2664,40 @@ async function handleCookieRefresh(cfg, env) {
   try {
     const rotateResponse = await rotateGoogleCookies(cfg);
     if (rotateResponse.status === 401) return await recordRefreshFailure("rotate_401");
+    if (!rotateResponse.ok && !verifyPage) throw new Error(`RotateCookies returned ${rotateResponse.status}`);
     if (rotateResponse.ok) rememberRotation(mergeRotatedCookies(cookie, getSetCookieValues(rotateResponse.headers)));
   } catch (e) {
     log(cfg, `RotateCookies failed: ${e}`);
+    if (!verifyPage) throw e;
+  }
+
+  if (!verifyPage) {
+    const now = new Date().toISOString();
+    const preserveFailure = cfg.cookie_refresh_status === "reauth_required";
+    const record = {
+      cookie,
+      sapisid: cfg.sapisid,
+      auth_user: cfg.auth_user,
+      xsrf_token: cfg.xsrf_token,
+      gemini_bl: cfg.gemini_bl,
+      removed_cookie_count: cfg.removed_cookie_count || 0,
+      updated_at: changedCookieNames.length ? now : (cfg.cookie_updated_at || now),
+      refreshed_at: preserveFailure ? (cfg.cookie_refreshed_at || null) : now,
+      refresh_checked_at: now,
+      refresh_status: preserveFailure
+        ? "reauth_required"
+        : changedCookieNames.length ? "refreshed" : "no_rotation",
+      refresh_error: preserveFailure ? cfg.cookie_refresh_error : null,
+    };
+    await writeStoredAuth(env, record);
+    const refreshedCfg = applyStoredAuth(cfg, record);
+    return privateJsonResponse({
+      status: record.refresh_status,
+      cookie: cookieSummary(refreshedCfg),
+      changed_cookie_names: changedCookieNames,
+      ignored_cookie_count: ignoredCookieCount,
+      message: "已完成排程 Cookie 輪替；頁面 token 驗證留給手動刷新。",
+    });
   }
 
   let detectedAuthUser = cfg.auth_user;
@@ -3775,7 +3806,7 @@ export default {
     ctx.waitUntil((async () => {
       const cfg = await getRequestConfig(env);
       if (!cfg.cookie || !cookieStoreStub(env)) return;
-      const response = await handleCookieRefresh(cfg, env);
+      const response = await handleCookieRefresh(cfg, env, false);
       const result = await response.json();
       log(cfg, `automatic Cookie refresh: ${result.status || result.error?.message || response.status}`);
     })().catch((e) => log(getConfig(env), `automatic Cookie refresh failed: ${e}`)));

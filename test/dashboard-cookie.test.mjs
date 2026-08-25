@@ -220,7 +220,7 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   assert.equal((await root.json()).status, "ok");
   const healthJson = await health.json();
   assert.equal(healthJson.status, "ok");
-  assert.equal(healthJson.version, "1.9.6");
+  assert.equal(healthJson.version, "1.9.7");
 });
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
@@ -604,7 +604,7 @@ test("Cookie refresh accepts Google abuse exemption redirects", async () => {
   }
 });
 
-test("scheduled Cookie refresh automatically persists Google rotations", async () => {
+test("scheduled Cookie refresh persists rotations without loading the Gemini app page", async () => {
   const store = memoryCookieStore();
   const env = {
     API_KEYS: "api-test-key",
@@ -622,19 +622,22 @@ test("scheduled Cookie refresh automatically persists Google rotations", async (
   const originalFetch = globalThis.fetch;
   internals.__setConnect(null);
   try {
-    globalThis.fetch = googleAuthFetch({
+    const requests = [];
+    const mockFetch = googleAuthFetch({
       rotateCookies: ["__Secure-1PSIDTS=automatic-ts; Path=/; Secure; HttpOnly"],
-      appCookies: ["SIDCC=automatic-cc; Path=/; Secure; HttpOnly"],
-      appBody: '{"SNlM0e":"automatic-at","cfb2h":"boq_assistant-bard-web-server_test"}',
     });
+    globalThis.fetch = async (...args) => {
+      requests.push(String(typeof args[0] === "string" ? args[0] : args[0].url));
+      return mockFetch(...args);
+    };
 
     const tasks = [];
     await worker.scheduled({}, env, { waitUntil(task) { tasks.push(task); } });
     await Promise.all(tasks);
 
     assert.match(store.peek().cookie, /__Secure-1PSIDTS=automatic-ts/);
-    assert.match(store.peek().cookie, /SIDCC=automatic-cc/);
-    assert.equal(store.peek().xsrf_token, "automatic-at");
+    assert.deepEqual(requests, ["https://accounts.google.com/RotateCookies"]);
+    assert.equal(store.peek().xsrf_token, "");
     assert.ok(store.peek().refreshed_at);
     assert.ok(store.peek().refresh_checked_at);
     assert.equal(store.peek().refresh_status, "refreshed");
