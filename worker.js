@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.3-worker";
+const VERSION = "1.9.4-worker";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -866,13 +866,13 @@ async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
-const MAX_APP_REDIRECTS = 10;
+const MAX_APP_REDIRECTS = 6;
 
 function isGoogleRedirectTarget(url) {
   return url.protocol === "https:" && (url.hostname === "google.com" || url.hostname.endsWith(".google.com"));
 }
 
-async function fetchAppPage(cfg, headers, timeoutMs = 30000) {
+async function fetchAppPage(cfg, headers, timeoutMs = 30000, maxRedirects = MAX_APP_REDIRECTS) {
   const origin = cfg.gemini_origin || "https://gemini.google.com";
   const originUrl = new URL(origin);
   let url = `${origin}${accountPrefix(cfg)}/app`;
@@ -880,7 +880,7 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000) {
   let redirectHost = "";
   let response = null;
 
-  for (let i = 0; i < MAX_APP_REDIRECTS; i++) {
+  for (let i = 0; i < maxRedirects; i++) {
     response = await httpFetch(url, { headers, timeoutMs, socket: cfg.upstream_socket });
     const rotated = getSetCookieValues(response.headers);
     setCookieValues.push(...rotated);
@@ -2670,7 +2670,7 @@ async function handleCookieRefresh(cfg, env) {
   if ((!response.ok || !tokens.at) && (cfg.auth_user === null || cfg.auth_user === undefined || cfg.auth_user === "")) {
     for (const authUser of ["0", "1", "2", "3"]) {
       const trialCfg = { ...cfg, auth_user: authUser };
-      const trialPage = await fetchAppPage(trialCfg, await buildAppPageHeaders(trialCfg, cookie));
+      const trialPage = await fetchAppPage(trialCfg, await buildAppPageHeaders(trialCfg, cookie), 30000, 2);
       const trialTokens = extractPageTokens(trialPage.html);
       page = trialPage;
       response = trialPage.response;
