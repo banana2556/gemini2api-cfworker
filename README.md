@@ -312,6 +312,7 @@ Generation endpoints accept:
 - `Authorization: Bearer <key>`
 - `x-api-key: <key>`
 - `x-goog-api-key: <key>`
+- `api-key: <key>` or `apikey: <key>`
 - `?key=<key>` for client compatibility
 
 Prefer headers so keys do not appear in URLs or access logs. Cookie-management

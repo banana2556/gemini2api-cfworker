@@ -2120,17 +2120,28 @@ function parseJson(text) {
   }
 }
 
-// 从多种来源取调用方 key:Bearer / x-api-key / x-goog-api-key / ?key=
-// (分别兼容 OpenAI 客户端、Anthropic 风格、Gemini CLI)。任一匹配即放行。
+function headerApiKeyCandidates(request, includeAdmin = false) {
+  const h = request.headers;
+  const auth = h.get("authorization") || "";
+  const bearer = /^Bearer\s+(.+)$/i.exec(auth);
+  const candidates = [
+    bearer ? bearer[1].trim() : null,
+    h.get("x-api-key"),
+    h.get("x-goog-api-key"),
+    h.get("api-key"),
+    h.get("apikey"),
+  ];
+  if (includeAdmin) candidates.push(h.get("x-admin-key"));
+  return candidates.map((key) => typeof key === "string" ? key.trim() : key);
+}
+
+// 从多种来源取调用方 key:Bearer / API key headers / ?key=
+// (分别兼容 OpenAI 客户端、Anthropic/Gemini 风格与常見代理客戶端)。任一匹配即放行。
 function authorized(request, url, cfg) {
   const keys = cfg.api_keys || [];
   if (!keys.length) return true;
-  const h = request.headers;
-  const auth = h.get("authorization") || "";
   const candidates = [
-    auth.startsWith("Bearer ") ? auth.slice(7) : null,
-    h.get("x-api-key"),
-    h.get("x-goog-api-key"),
+    ...headerApiKeyCandidates(request),
     url ? url.searchParams.get("key") : null,
   ];
   return candidates.some((k) => k && keys.some((valid) => timingSafeEqual(k, valid)));
@@ -2139,12 +2150,7 @@ function authorized(request, url, cfg) {
 function adminAuthorized(request, cfg) {
   const keys = cfg.api_keys || [];
   if (!keys.length) return false;
-  const auth = request.headers.get("authorization") || "";
-  const candidates = [
-    request.headers.get("x-api-key"),
-    request.headers.get("x-admin-key"),
-    auth.startsWith("Bearer ") ? auth.slice(7) : null,
-  ];
+  const candidates = headerApiKeyCandidates(request, true);
   return candidates.some((key) => key && keys.some((valid) => timingSafeEqual(key, valid)));
 }
 

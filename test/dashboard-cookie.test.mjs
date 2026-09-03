@@ -743,6 +743,23 @@ test("Cookie management uses API_KEYS and ignores ADMIN_KEY", async () => {
   assert.equal((await status.json()).cookie.source, "durable_object");
 });
 
+test("API key authentication accepts common header variants", async () => {
+  const env = { API_KEYS: "asdasd", UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false" };
+  for (const headers of [
+    { Authorization: "bearer asdasd" },
+    { "api-key": " asdasd " },
+    { apikey: "asdasd" },
+  ]) {
+    const response = await worker.fetch(new Request("https://worker.example/v1/models", { headers }), env);
+    assert.equal(response.status, 200);
+  }
+
+  const denied = await worker.fetch(new Request("https://worker.example/v1/models", {
+    headers: { "api-key": "wrong" },
+  }), env);
+  assert.equal(denied.status, 401);
+});
+
 test("anonymous catalog is guest auto routing and does not fetch Gemini", async () => {
   const originalFetch = globalThis.fetch;
   let fetches = 0;
