@@ -954,6 +954,30 @@ function extractPageTokens(html) {
   return tokens;
 }
 
+function extractXsrfToken(raw) {
+  const normalized = String(raw || "").replace(/\\"/g, '"');
+  const match = /\[\s*"xsrf"\s*,\s*"([^"]+)"/.exec(normalized);
+  return match ? match[1] : "";
+}
+
+async function probeXsrfToken(cfg, geminiBl) {
+  const probeCfg = {
+    ...cfg,
+    gemini_bl: geminiBl || cfg.gemini_bl,
+    xsrf_token: "",
+  };
+  const response = await httpFetch(getUrl(probeCfg), {
+    method: "POST",
+    headers: await buildHeaders(probeCfg),
+    body: buildPayload("Reply with one word: OK", 1, 1, null, null),
+    timeoutMs: 30000,
+    socket: cfg.upstream_socket,
+  });
+  const token = extractXsrfToken(await response.text());
+  log(cfg, `XSRF probe status=${response.status} token=${token ? "found" : "missing"}`);
+  return token;
+}
+
 async function refreshGeminiBl(cfg) {
   const origin = cfg.gemini_origin || "https://gemini.google.com";
   const now = Date.now();
@@ -1029,7 +1053,8 @@ async function fetchModelCatalog(cfg, key) {
   if (!appResponse.ok) throw new Error(`Gemini /app returned ${appResponse.status}`);
 
   const tokens = extractPageTokens(appHtml);
-  if (cfg.cookie && !tokens.at) throw new Error("Gemini no longer accepts the stored Cookie; re-import is required");
+  const pageToken = tokens.at || cfg.xsrf_token;
+  if (cfg.cookie && !pageToken) throw new Error("Gemini no longer accepts the stored Cookie; re-import is required");
   if (tokens.bl) {
     cfg.gemini_bl = tokens.bl;
     _geminiBlMemory = {
@@ -1048,7 +1073,7 @@ async function fetchModelCatalog(cfg, key) {
   const body = new URLSearchParams({
     "f.req": JSON.stringify([[[MODEL_STATUS_RPC, "[]", null, "generic"]]]),
   });
-  if (tokens.at) body.set("at", tokens.at);
+  if (pageToken) body.set("at", pageToken);
   const statusResponse = await httpFetch(url, {
     method: "POST",
     headers,
@@ -2723,6 +2748,15 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
   }
   const now = new Date().toISOString();
 
+  if (response.ok && !tokens.at) {
+    try {
+      const at = await probeXsrfToken({ ...pageCfg, cookie }, tokens.bl || pageCfg.gemini_bl);
+      if (at) tokens.at = at;
+    } catch (e) {
+      log(cfg, `XSRF probe failed: ${e}`);
+    }
+  }
+
   if (!response.ok || !tokens.at) {
     const redirectSuffix = page.redirect_host ? `_to_${page.redirect_host}` : "";
     return await recordRefreshFailure(!response.ok ? `app_${response.status}${redirectSuffix}` : "missing_page_token");
@@ -3825,7 +3859,7 @@ if (typeof process !== "undefined" && process.versions && process.versions.node)
     buildPayload, getUrl, buildHeaders, cleanText,
     extractTextsFromLine, extractResponseText, extractActualModel, routeStatus, generate, generateResult, generateStream,
     messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
-    makeSapisidHash, parseImageUrl, extractGeminiBl, extractPageTokens, getPageTokens, uploadImage, resolveImages,
+    makeSapisidHash, parseImageUrl, extractGeminiBl, extractPageTokens, extractXsrfToken, getPageTokens, uploadImage, resolveImages,
     __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,
   };
 }

@@ -399,6 +399,54 @@ test("authenticated Cookie refresh persists rotations without exposing values an
   }
 });
 
+test("Cookie refresh recovers the XSRF token from an authenticated upstream error", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const adminHeaders = { Authorization: "Bearer api-test-key" };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { ...adminHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session" }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async (input) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("/RotateCookies")) {
+        return new Response(")]}'\n[[\"identity.hfcr\",600]]", { status: 200 });
+      }
+      if (url.includes("/app")) {
+        return new Response('{"qKIAYe":"push","Ylro7b":"pctx","cfb2h":"boq_assistant-bard-web-server_probe"}', {
+          headers: { "Content-Type": "text/html" },
+        });
+      }
+      if (url.includes("StreamGenerate")) {
+        return new Response(")]}'\n[[\"xsrf\",\"probe-at\"]]", { status: 400 });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    };
+
+    const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: adminHeaders,
+    }), env);
+    const data = await refreshed.json();
+    assert.equal(refreshed.status, 200);
+    assert.equal(data.status, "no_rotation");
+    assert.equal(store.peek().xsrf_token, "probe-at");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Cookie refresh follows same-origin Gemini app redirects", async () => {
   const store = memoryCookieStore();
   const env = {
