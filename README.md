@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.7-62b6ff"></a>
+  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.8-62b6ff"></a>
   <a href="https://workers.cloudflare.com/"><img alt="Cloudflare Workers" src="https://img.shields.io/badge/Cloudflare-Workers-f6821f?logo=cloudflareworkers&logoColor=white"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f6b95c"></a>
   <a href="https://github.com/banana2556"><img alt="Author banana2556" src="https://img.shields.io/badge/GitHub-%40banana2556-8b949e?logo=github"></a>
@@ -220,7 +220,7 @@ current `GetUserStatus` response:
 - Standard aliases use Gemini Web thinking level `1`.
 - Extended Thinking aliases use level `2`.
 - Level `3` is the separate Deep Think feature and is not exposed here.
-- The signed-in catalog is cached for six hours and invalidated when the
+- The signed-in catalog is cached for ten minutes and invalidated when the
   stored Cookie changes.
 - `GET /v1/models?refresh=1` forces a fresh catalog lookup.
 
@@ -345,7 +345,7 @@ Manual refresh returns `refreshed`, `no_rotation`, or
 expired Google login. Re-import the Cookie when Google rejects the session,
 the Cookie is manually removed, or Durable Object storage is deleted.
 
-The six-hour model catalog cache is separate from the ten-minute session
+The ten-minute model catalog cache is separate from the ten-minute session
 refresh cadence.
 
 </details>

@@ -40,8 +40,9 @@ function statusRow(primary, display, category, route) {
   return row;
 }
 
-function modelStatusRaw() {
+function modelStatusRaw(statusCode = null) {
   const payload = new Array(16).fill(null);
+  if (statusCode !== null) payload[14] = statusCode;
   payload[15] = [
     statusRow("cf41b0e0dd7d53e5", "3.5 Flash-Lite", 6, "8c46e95b1a07cecc"),
     statusRow("fbb127bbb056c959", "3.6 Flash", 1, "56fdd199312815e2"),
@@ -181,6 +182,86 @@ test("model catalog falls back to guest when the stored Cookie is rejected", asy
   }
 });
 
+test("model catalog does not trust a stale page token from an unauthenticated app page", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    GEMINI_ORIGIN: "https://stale-token.example",
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: { cookie: "SAPISID=sapi; SID=session", xsrf_token: "stale-at" } }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async (input) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("/app")) return new Response([
+        '<a aria-label="Sign in" href="https://accounts.google.com/ServiceLogin?continue=https://gemini.google.com/app">Sign in</a>',
+        '{"qKIAYe":"feeds/mcudyrk2a4khkz","Ylro7b":"CgcSBWjK7pYx","cfb2h":"boq_assistant-bard-web-server_guest"}',
+      ].join(""));
+      throw new Error(`unexpected fetch ${url}`);
+    };
+
+    const response = await worker.fetch(new Request("https://worker.example/v1/models", {
+      headers: { Authorization: "Bearer api-test-key" },
+    }), env);
+    const data = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(data.data.map((model) => model.id), ["gemini-auto", "gemini-auto-thinking"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("model catalog rejects an unauthenticated GetUserStatus response", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    GEMINI_ORIGIN: "https://status-unauthenticated.example",
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: { cookie: "SAPISID=sapi; SID=session", xsrf_token: "stale-at" } }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async (input) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("/app")) return new Response([
+        '{"qKIAYe":"feeds/mcudyrk2a4khkz","Ylro7b":"CgcSBWjK7pYx","cfb2h":"boq_assistant-bard-web-server_guest"}',
+      ].join(""));
+      if (url.includes("/batchexecute")) return new Response(modelStatusRaw(1016));
+      throw new Error(`unexpected fetch ${url}`);
+    };
+
+    const response = await worker.fetch(new Request("https://worker.example/v1/models", {
+      headers: { Authorization: "Bearer api-test-key" },
+    }), env);
+    const data = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(data.data.map((model) => model.id), ["gemini-auto", "gemini-auto-thinking"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("authenticated generation falls back to guest when upstream returns no content", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -220,7 +301,7 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   assert.equal((await root.json()).status, "ok");
   const healthJson = await health.json();
   assert.equal(healthJson.status, "ok");
-  assert.equal(healthJson.version, "1.9.7");
+  assert.equal(healthJson.version, "1.9.8");
 });
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
@@ -394,6 +475,45 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     assert.ok(store.peek().refresh_checked_at);
     assert.equal(store.peek().refresh_status, "reauth_required");
     assert.equal(store.peek().refresh_error, "rotate_401");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("manual Cookie refresh validates the session when RotateCookies rejects a repeat request", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const adminHeaders = { Authorization: "Bearer api-test-key" };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { ...adminHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session" }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = googleAuthFetch({
+      rotateStatus: 401,
+      appBody: '{"SNlM0e":"still-valid-at"}',
+    });
+
+    const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: adminHeaders,
+    }), env);
+    const data = await refreshed.json();
+
+    assert.equal(refreshed.status, 200);
+    assert.equal(data.status, "no_rotation");
+    assert.equal(data.cookie.refresh_status, "no_rotation");
+    assert.equal(store.peek().xsrf_token, "still-valid-at");
   } finally {
     globalThis.fetch = originalFetch;
   }

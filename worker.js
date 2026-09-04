@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.7";
+const VERSION = "1.9.8";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -75,7 +75,9 @@ const CONFIG = {
 const MODEL_CATEGORIES = [6, 1, 3];
 const GUEST_MODE = 4;
 const MODEL_STATUS_RPC = "otAQ7b";
-const MODEL_CATALOG_TTL_SEC = 6 * 60 * 60;
+const MODEL_CATALOG_TTL_SEC = 10 * 60;
+const MODEL_CATALOG_CACHE_VERSION = "2";
+const UNAUTHENTICATED_STATUS = 1016;
 let _modelCatalogMemory = { key: "", models: null, expiresAt: 0 };
 
 function modelAlias(displayName) {
@@ -85,6 +87,28 @@ function modelAlias(displayName) {
     .replace(/[^a-z0-9.]+/g, "-")
     .replace(/^[.-]+|[.-]+$/g, "");
   return slug ? `gemini-${slug}` : "";
+}
+
+function modelVersion(displayName) {
+  const match = /\b(\d+(?:\.\d+)+)\b/.exec(String(displayName || ""));
+  return match ? match[1].split(".").map(Number) : [];
+}
+
+function compareModelVersions(a, b) {
+  const left = modelVersion(a);
+  const right = modelVersion(b);
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const diff = (left[i] || 0) - (right[i] || 0);
+    if (diff) return diff;
+  }
+  return 0;
+}
+
+function modelDisplayName(row) {
+  return [row?.[11], row?.[19], row?.[1], row?.[10]]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .sort((a, b) => compareModelVersions(b, a) || (Number(/\d/.test(b)) - Number(/\d/.test(a))))[0] || "";
 }
 
 function extractRpcPayload(raw, rpcId) {
@@ -132,14 +156,26 @@ function buildModelCatalog(statusPayload, appHtml) {
   const { capacity, capacity_field } = computeAccountCapacity(statusPayload);
   const models = {};
   for (const category of MODEL_CATEGORIES) {
-    const row = rows.find((item) => Array.isArray(item) && item[17] === category);
-    if (!row) throw new Error(`GetUserStatus missing model category ${category}`);
-    const primaryId = String(row[0] || "");
-    const displayName = String(row[11] || row[19] || row[1] || "").trim();
-    const id = modelAlias(displayName);
-    if (!primaryId || !id) throw new Error(`GetUserStatus returned an invalid model category ${category}`);
-    const submodel = extractRouteVariant(appHtml, primaryId, Array.isArray(row[6]) ? row[6] : []);
-    if (!submodel) throw new Error(`Gemini /app missing route ID for ${displayName}`);
+    const candidates = rows
+      .map((row, index) => ({ row, index }))
+      .filter(({ row }) => Array.isArray(row) && row[17] === category)
+      .sort((a, b) => compareModelVersions(modelDisplayName(b.row), modelDisplayName(a.row)) || a.index - b.index);
+    if (!candidates.length) throw new Error(`GetUserStatus missing model category ${category}`);
+
+    let selected = null;
+    for (const candidate of candidates) {
+      const row = candidate.row;
+      const primaryId = String(row[0] || "");
+      const displayName = modelDisplayName(row);
+      const id = modelAlias(displayName);
+      const submodel = extractRouteVariant(appHtml, primaryId, Array.isArray(row[6]) ? row[6] : []);
+      if (primaryId && id && submodel) {
+        selected = { row, primaryId, displayName, id, submodel };
+        break;
+      }
+    }
+    if (!selected) throw new Error(`GetUserStatus returned no routable model category ${category}`);
+    const { row, primaryId, displayName, id, submodel } = selected;
     const description = String(row[12] || row[2] || displayName).trim();
     models[id] = {
       mode: category,
@@ -697,6 +733,7 @@ async function buildHeaders(cfg, modelHeader) {
     "Content-Type": "application/x-www-form-urlencoded",
     "Origin": "https://gemini.google.com",
     "Referer": `https://gemini.google.com${accountPrefix(cfg)}/app`,
+    "Accept-Language": "en-US,en;q=0.9",
     "X-Same-Domain": "1",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
   };
@@ -954,6 +991,19 @@ function extractPageTokens(html) {
   return tokens;
 }
 
+function hasAuthenticatedPageMarkers(tokens, html = "") {
+  if (tokens && tokens.at) return true;
+  if (!tokens || !tokens.push_id || !tokens.pctx) return false;
+
+  // qKIAYe/Ylro7b are also present in the public guest shell.  A stale
+  // stored XSRF token must not turn that shell into a false authenticated
+  // result, so require that the page does not advertise a Google sign-in.
+  return !(
+    /aria-label\s*=\s*["']Sign in["']/i.test(String(html || ""))
+    || /href\s*=\s*["'][^"']*(?:accounts\.google\.com\/ServiceLogin|gemini\.google\.com\/signin)/i.test(String(html || ""))
+  );
+}
+
 function extractXsrfToken(raw) {
   const normalized = String(raw || "").replace(/\\"/g, '"');
   const match = /\[\s*"xsrf"\s*,\s*"([^"]+)"/.exec(normalized);
@@ -1054,7 +1104,9 @@ async function fetchModelCatalog(cfg, key) {
 
   const tokens = extractPageTokens(appHtml);
   const pageToken = tokens.at || cfg.xsrf_token;
-  if (cfg.cookie && !pageToken) throw new Error("Gemini no longer accepts the stored Cookie; re-import is required");
+  if (cfg.cookie && !hasAuthenticatedPageMarkers(tokens, appHtml)) {
+    throw new Error("Gemini no longer accepts the stored Cookie; re-import is required");
+  }
   if (tokens.bl) {
     cfg.gemini_bl = tokens.bl;
     _geminiBlMemory = {
@@ -1083,7 +1135,11 @@ async function fetchModelCatalog(cfg, key) {
   });
   const raw = await statusResponse.text();
   if (!statusResponse.ok) throw new Error(`GetUserStatus returned ${statusResponse.status}`);
-  return buildModelCatalog(extractRpcPayload(raw, MODEL_STATUS_RPC), appHtml);
+  const statusPayload = extractRpcPayload(raw, MODEL_STATUS_RPC);
+  if (cfg.cookie && statusPayload?.[14] === UNAUTHENTICATED_STATUS) {
+    throw new Error("GetUserStatus rejected the stored Cookie; re-import is required");
+  }
+  return buildModelCatalog(statusPayload, appHtml);
 }
 
 async function getModelCatalog(cfg, force = false) {
@@ -1094,7 +1150,7 @@ async function getModelCatalog(cfg, force = false) {
   if (!force && stale && _modelCatalogMemory.expiresAt > now) return stale;
 
   const cache = globalThis.caches && globalThis.caches.default;
-  const cacheKey = new Request(`https://gemini2api-cache.invalid/model-catalog?account=${key}`);
+  const cacheKey = new Request(`https://gemini2api-cache.invalid/model-catalog?v=${MODEL_CATALOG_CACHE_VERSION}&account=${key}`);
   if (cache) {
     try {
       const cached = await cache.match(cacheKey);
@@ -1151,7 +1207,7 @@ async function invalidateModelCatalog(...configs) {
   try {
     await Promise.all(configs.map(async (cfg) => {
       const key = await authCacheKey(cfg);
-      await cache.delete(new Request(`https://gemini2api-cache.invalid/model-catalog?account=${key}`));
+      await cache.delete(new Request(`https://gemini2api-cache.invalid/model-catalog?v=${MODEL_CATALOG_CACHE_VERSION}&account=${key}`));
     }));
   } catch (_) {}
 }
@@ -2629,6 +2685,7 @@ async function rotateGoogleCookies(cfg) {
     "Content-Type": "application/json",
     Origin: "https://accounts.google.com",
     Referer: "https://accounts.google.com/",
+    "Accept-Language": "en-US,en;q=0.9",
     "User-Agent": _UA,
     Cookie: cfg.cookie,
   };
@@ -2666,6 +2723,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
   let cookie = cfg.cookie;
   const changedCookieNames = [];
   let ignoredCookieCount = 0;
+  let rotationRejected = false;
   const rememberRotation = (merged) => {
     cookie = merged.cookie;
     ignoredCookieCount += merged.ignored_cookie_count;
@@ -2694,7 +2752,11 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
 
   try {
     const rotateResponse = await rotateGoogleCookies(cfg);
-    if (rotateResponse.status === 401) return await recordRefreshFailure("rotate_401");
+    if (rotateResponse.status === 401) {
+      rotationRejected = true;
+      if (!verifyPage) return await recordRefreshFailure("rotate_401");
+      log(cfg, "RotateCookies returned 401; continuing with Gemini /app validation");
+    }
     if (!rotateResponse.ok && !verifyPage) throw new Error(`RotateCookies returned ${rotateResponse.status}`);
     if (rotateResponse.ok) rememberRotation(mergeRotatedCookies(cookie, getSetCookieValues(rotateResponse.headers)));
   } catch (e) {
@@ -2745,7 +2807,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
       page = trialPage;
       response = trialPage.response;
       tokens = trialTokens;
-      if (response.ok && tokens.at) {
+      if (response.ok && hasAuthenticatedPageMarkers(trialTokens, trialPage.html)) {
         pageCfg = trialCfg;
         detectedAuthUser = authUser;
         break;
@@ -2754,7 +2816,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
   }
   const now = new Date().toISOString();
 
-  if (response.ok && !tokens.at) {
+  if (response.ok && !tokens.at && hasAuthenticatedPageMarkers(tokens, page.html)) {
     try {
       const at = await probeXsrfToken({ ...pageCfg, cookie }, tokens.bl || pageCfg.gemini_bl);
       if (at) tokens.at = at;
@@ -2765,7 +2827,9 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
 
   if (!response.ok || !tokens.at) {
     const redirectSuffix = page.redirect_host ? `_to_${page.redirect_host}` : "";
-    return await recordRefreshFailure(!response.ok ? `app_${response.status}${redirectSuffix}` : "missing_page_token");
+    return await recordRefreshFailure(
+      !response.ok ? `app_${response.status}${redirectSuffix}` : rotationRejected ? "rotate_401" : "missing_page_token",
+    );
   }
 
   rememberRotation(mergeRotatedCookies(cookie, page.setCookieValues));

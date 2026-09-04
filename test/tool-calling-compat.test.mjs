@@ -75,6 +75,21 @@ test("GetUserStatus builds exactly three current models with a thinking variant 
   assert.equal(resolveModel("missing-client-alias", "", models).name, "gemini-3.7-flash");
 });
 
+test("GetUserStatus prefers the newest routable rollout in a model category", () => {
+  const older = statusRow("1111111111111111", "3.6 Flash", 1, "2222222222222222");
+  const newer = statusRow("3333333333333333", "3.8 Flash", 1, "4444444444444444");
+  const html = [
+    appHtml,
+    '[["1111111111111111","2222222222222222"]]',
+    '[["3333333333333333","4444444444444444"]]',
+  ].join("");
+  const catalog = buildModelCatalog({ ...statusPayload, 15: [statusPayload[15][0], older, newer, statusPayload[15][2]] }, html);
+
+  assert.equal(catalog["gemini-3.8-flash"].model, "3333333333333333");
+  assert.equal(catalog["gemini-3.8-flash"].submodel, "4444444444444444");
+  assert.equal(catalog["gemini-3.6-flash"], undefined);
+});
+
 test("standard and extended payloads use current route IDs and independent thinking levels", () => {
   for (const [base, route, category] of [
     ["gemini-3.5-flash-lite", "8c46e95b1a07cecc", 6],
