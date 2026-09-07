@@ -2754,10 +2754,11 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
     const rotateResponse = await rotateGoogleCookies(cfg);
     if (rotateResponse.status === 401) {
       rotationRejected = true;
-      if (!verifyPage) return await recordRefreshFailure("rotate_401");
       log(cfg, "RotateCookies returned 401; continuing with Gemini /app validation");
     }
-    if (!rotateResponse.ok && !verifyPage) throw new Error(`RotateCookies returned ${rotateResponse.status}`);
+    if (!rotateResponse.ok && !verifyPage && !rotationRejected) {
+      throw new Error(`RotateCookies returned ${rotateResponse.status}`);
+    }
     if (rotateResponse.ok) rememberRotation(mergeRotatedCookies(cookie, getSetCookieValues(rotateResponse.headers)));
   } catch (e) {
     log(cfg, `RotateCookies failed: ${e}`);
@@ -2780,7 +2781,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
       refresh_status: preserveFailure
         ? "reauth_required"
         : "unverified",
-      refresh_error: preserveFailure ? cfg.cookie_refresh_error : null,
+      refresh_error: preserveFailure ? cfg.cookie_refresh_error : rotationRejected ? "rotate_401" : null,
     };
     await writeStoredAuth(env, record);
     const refreshedCfg = applyStoredAuth(cfg, record);
@@ -2828,7 +2829,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
   if (!response.ok || !tokens.at) {
     const redirectSuffix = page.redirect_host ? `_to_${page.redirect_host}` : "";
     return await recordRefreshFailure(
-      !response.ok ? `app_${response.status}${redirectSuffix}` : rotationRejected ? "rotate_401" : "missing_page_token",
+      !response.ok ? `app_${response.status}${redirectSuffix}` : "missing_page_token",
     );
   }
 
