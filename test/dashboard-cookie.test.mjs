@@ -401,14 +401,14 @@ test("authenticated Cookie refresh persists rotations without exposing values an
   const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
     method: "PUT",
     headers: { ...adminHeaders, "Content-Type": "application/json" },
-    body: JSON.stringify({ auth: "SAPISID=sapi; SID=session; SIDCC=old-cc; NID=old-nid; __Secure-1PSIDTS=old-ts" }),
+    body: JSON.stringify({ auth: "SAPISID=sapi; __Secure-1PSID=session; SIDCC=old-cc; NID=old-nid; __Secure-1PSIDTS=old-ts" }),
   }), env);
   assert.equal(imported.status, 200);
 
   const originalFetch = globalThis.fetch;
   internals.__setConnect(null);
   try {
-    globalThis.fetch = googleAuthFetch({
+    const authFetch = googleAuthFetch({
       rotateCookies: ["__Secure-1PSIDTS=rotated-ts; Path=/; Secure; HttpOnly"],
       appCookies: [
         "SIDCC=rotated-cc; Path=/; Secure; HttpOnly",
@@ -416,6 +416,12 @@ test("authenticated Cookie refresh persists rotations without exposing values an
         "UNRELATED=ignore-me; Path=/",
       ],
     });
+    globalThis.fetch = (input, init) => {
+      if (String(input).includes("/RotateCookies")) {
+        assert.equal(init.headers.Cookie, "__Secure-1PSID=session; __Secure-1PSIDTS=old-ts");
+      }
+      return authFetch(input, init);
+    };
 
     const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
       method: "POST",
@@ -446,13 +452,16 @@ test("authenticated Cookie refresh persists rotations without exposing values an
       method: "POST",
       headers: adminHeaders,
     }), env);
-    assert.equal((await unchanged.json()).status, "no_rotation");
+    const unchangedData = await unchanged.json();
+    assert.equal(unchangedData.status, "no_rotation");
+    assert.equal(unchangedData.cookie.refresh_status, "verified");
+    assert.equal(unchangedData.cookie.refresh_error, "session_not_rotated");
     assert.equal(store.peek().cookie, validRecord.cookie);
     assert.equal(store.peek().updated_at, validRecord.updated_at);
     assert.equal(store.peek().xsrf_token, "newer-at");
     assert.ok(store.peek().refreshed_at);
     assert.ok(store.peek().refresh_checked_at);
-    assert.equal(store.peek().refresh_status, "no_rotation");
+    assert.equal(store.peek().refresh_status, "verified");
 
     const beforeExpired = structuredClone(store.peek());
     globalThis.fetch = googleAuthFetch({
@@ -512,7 +521,8 @@ test("manual Cookie refresh validates the session when RotateCookies rejects a r
 
     assert.equal(refreshed.status, 200);
     assert.equal(data.status, "no_rotation");
-    assert.equal(data.cookie.refresh_status, "no_rotation");
+    assert.equal(data.cookie.refresh_status, "verified");
+    assert.equal(data.cookie.refresh_error, "session_not_rotated");
     assert.equal(store.peek().xsrf_token, "still-valid-at");
   } finally {
     globalThis.fetch = originalFetch;
@@ -598,7 +608,7 @@ test("Cookie refresh follows same-origin Gemini app redirects", async () => {
     const data = await refreshed.json();
     assert.equal(refreshed.status, 200);
     assert.equal(data.status, "no_rotation");
-    assert.equal(data.cookie.refresh_status, "no_rotation");
+    assert.equal(data.cookie.refresh_status, "verified");
     assert.equal(store.peek().xsrf_token, "redirect-at");
     assert.equal(store.peek().gemini_bl, "boq_assistant-bard-web-server_redirect");
   } finally {
@@ -764,7 +774,7 @@ test("Cookie refresh accepts Google abuse exemption redirects", async () => {
     }), env);
     const data = await refreshed.json();
     assert.equal(refreshed.status, 200);
-    assert.equal(data.status, "refreshed");
+    assert.equal(data.status, "no_rotation");
     assert.equal(store.peek().xsrf_token, "abuse-at");
     assert.match(store.peek().cookie, /GOOGLE_ABUSE_EXEMPTION=ID=abuse/);
   } finally {

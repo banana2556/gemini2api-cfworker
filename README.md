@@ -344,7 +344,9 @@ An existing `reauth_required` result is preserved. Opening the console reads
 stored results; use manual refresh to check the current login and page token.
 
 Manual refresh returns `refreshed`, `no_rotation`, or
-`reauth_required`. Rotation can extend a valid session but cannot recreate an
+`reauth_required`. The Cookie details report `refresh_status: verified` with
+`refresh_error: session_not_rotated` when Gemini accepts the login but Google
+does not return a new `__Secure-1PSIDTS`. Rotation can extend a valid session but cannot recreate an
 expired Google login. Re-import the Cookie when Google rejects the session,
 the Cookie is manually removed, or Durable Object storage is deleted.
 

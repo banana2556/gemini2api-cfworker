@@ -2681,13 +2681,21 @@ async function handleAdminStatus(cfg, env, url) {
 }
 
 async function rotateGoogleCookies(cfg) {
+  const pairs = parseCookiePairs(cfg.cookie);
+  const sessionPairs = new Map(
+    ["__Secure-1PSID", "__Secure-1PSIDTS"]
+      .filter((name) => pairs.has(name))
+      .map((name) => [name, pairs.get(name)]),
+  );
   const headers = {
     "Content-Type": "application/json",
     Origin: "https://accounts.google.com",
     Referer: "https://accounts.google.com/",
     "Accept-Language": "en-US,en;q=0.9",
     "User-Agent": _UA,
-    Cookie: cfg.cookie,
+    Cookie: sessionPairs.has("__Secure-1PSID")
+      ? [...sessionPairs].map(([name, value]) => `${name}=${value}`).join("; ")
+      : cfg.cookie,
   };
   applyAccountHeaders(headers, cfg);
   return httpFetch(ROTATE_COOKIES_URL, {
@@ -2768,6 +2776,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
   if (!verifyPage) {
     const now = new Date().toISOString();
     const preserveFailure = cfg.cookie_refresh_status === "reauth_required";
+    const sessionRotated = changedCookieNames.includes("__Secure-1PSIDTS");
     const record = {
       cookie,
       sapisid: cfg.sapisid,
@@ -2781,7 +2790,9 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
       refresh_status: preserveFailure
         ? "reauth_required"
         : "unverified",
-      refresh_error: preserveFailure ? cfg.cookie_refresh_error : rotationRejected ? "rotate_401" : null,
+      refresh_error: preserveFailure
+        ? cfg.cookie_refresh_error
+        : rotationRejected ? "rotate_401" : sessionRotated ? null : "session_not_rotated",
     };
     await writeStoredAuth(env, record);
     const refreshedCfg = applyStoredAuth(cfg, record);
@@ -2834,6 +2845,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
   }
 
   rememberRotation(mergeRotatedCookies(cookie, page.setCookieValues));
+  const sessionRotated = changedCookieNames.includes("__Secure-1PSIDTS");
   const auth = parseAuthPayload({
     cookie,
     sapisid: cfg.sapisid,
@@ -2847,8 +2859,8 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
     updated_at: changedCookieNames.length ? now : (cfg.cookie_updated_at || now),
     refreshed_at: now,
     refresh_checked_at: now,
-    refresh_status: changedCookieNames.length ? "refreshed" : "no_rotation",
-    refresh_error: null,
+    refresh_status: sessionRotated ? "refreshed" : "verified",
+    refresh_error: sessionRotated ? null : "session_not_rotated",
   };
   await writeStoredAuth(env, record);
 
@@ -2859,7 +2871,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
     tokens,
     ts: Date.now(),
   };
-  const rotated = changedCookieNames.length > 0;
+  const rotated = sessionRotated;
   return privateJsonResponse({
     status: rotated ? "refreshed" : "no_rotation",
     cookie: cookieSummary(refreshedCfg),
@@ -2867,7 +2879,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
     ignored_cookie_count: ignoredCookieCount,
     message: rotated
       ? `已保存 Google 輪替的 ${changedCookieNames.length} 個 Cookie。`
-      : "登入態有效；已更新頁面 token，Google 本次沒有輪替 Cookie。",
+      : "登入態目前有效，但 Google 未回傳新的 __Secure-1PSIDTS；session 壽命尚未延長。",
   });
 }
 
@@ -3406,7 +3418,7 @@ function dashboardResponse(cfg) {
         ["匯入時間", fmtTime(cookie.updated_at)],
         ["最後檢查", fmtTime(cookie.refresh_checked_at)],
         ["最近驗證成功", fmtTime(cookie.refreshed_at)],
-        ["上次刷新結果", cookie.refresh_status === "unverified" ? "已輪替檢查，登入未驗證" : cookie.refresh_status || "—", cookie.refresh_status === "reauth_required" ? "bad" : ""],
+        ["上次刷新結果", cookie.refresh_status === "unverified" ? "已輪替檢查，登入未驗證" : cookie.refresh_status === "verified" ? "登入有效，session 未延長" : cookie.refresh_status || "—", cookie.refresh_status === "reauth_required" || cookie.refresh_error === "session_not_rotated" ? "bad" : ""],
         ["刷新錯誤", cookie.refresh_error || "—", cookie.refresh_error ? "bad" : ""],
         ["Cookie 數量", (cookie.cookie_count != null ? cookie.cookie_count : "—") + (cookie.removed_cookie_count ? "（已過濾 " + cookie.removed_cookie_count + "）" : "")],
         ["大小", cookie.byte_length != null ? cookie.byte_length + " bytes" : "—"],
