@@ -806,9 +806,23 @@ test("scheduled Cookie refresh persists rotations without loading the Gemini app
     assert.match(store.peek().cookie, /__Secure-1PSIDTS=automatic-ts/);
     assert.deepEqual(requests, ["https://accounts.google.com/RotateCookies"]);
     assert.equal(store.peek().xsrf_token, "");
-    assert.ok(store.peek().refreshed_at);
+    assert.equal(store.peek().refreshed_at, null);
     assert.ok(store.peek().refresh_checked_at);
-    assert.equal(store.peek().refresh_status, "refreshed");
+    assert.equal(store.peek().refresh_status, "unverified");
+
+    // Rotation success does not prove that Gemini still accepts the login.
+    globalThis.fetch = googleAuthFetch({ appBody: "<html>Sign in</html>" });
+    const expired = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: { "X-Admin-Key": "api-test-key" },
+    }), env);
+    assert.equal((await expired.json()).cookie.refresh_error, "missing_page_token");
+    const retryTasks = [];
+    await worker.scheduled({}, env, { waitUntil(task) { retryTasks.push(task); } });
+    await Promise.all(retryTasks);
+    assert.equal(store.peek().refresh_status, "reauth_required");
+    assert.equal(store.peek().refresh_error, "missing_page_token");
+    assert.equal(store.peek().refreshed_at, null);
   } finally {
     globalThis.fetch = originalFetch;
   }

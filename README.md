@@ -337,8 +337,11 @@ key is configured.
 <summary><strong>Automatic refresh behavior</strong></summary>
 
 Every ten minutes, the Cron Trigger calls Google's `RotateCookies` endpoint,
-loads the signed-in Gemini app page, stores the newest page token, merges only
-approved `Set-Cookie` rotations, and persists the result.
+merges approved `Set-Cookie` rotations, and persists the result. It does not
+validate the Gemini page token: successful rotation checks are marked
+`unverified` and do not advance the last successful verification time.
+An existing `reauth_required` result is preserved. Opening the console reads
+stored results; use manual refresh to check the current login and page token.
 
 Manual refresh returns `refreshed`, `no_rotation`, or
 `reauth_required`. Rotation can extend a valid session but cannot recreate an

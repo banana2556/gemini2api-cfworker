@@ -2775,11 +2775,11 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
       gemini_bl: cfg.gemini_bl,
       removed_cookie_count: cfg.removed_cookie_count || 0,
       updated_at: changedCookieNames.length ? now : (cfg.cookie_updated_at || now),
-      refreshed_at: preserveFailure ? (cfg.cookie_refreshed_at || null) : now,
+      refreshed_at: cfg.cookie_refreshed_at || null,
       refresh_checked_at: now,
       refresh_status: preserveFailure
         ? "reauth_required"
-        : changedCookieNames.length ? "refreshed" : "no_rotation",
+        : "unverified",
       refresh_error: preserveFailure ? cfg.cookie_refresh_error : null,
     };
     await writeStoredAuth(env, record);
@@ -3404,8 +3404,8 @@ function dashboardResponse(cfg) {
         ["儲存來源", cookie.source || "—"],
         ["匯入時間", fmtTime(cookie.updated_at)],
         ["最後檢查", fmtTime(cookie.refresh_checked_at)],
-        ["最近成功", fmtTime(cookie.refreshed_at)],
-        ["刷新狀態", cookie.refresh_status || "—", cookie.refresh_status === "reauth_required" ? "bad" : ""],
+        ["最近驗證成功", fmtTime(cookie.refreshed_at)],
+        ["上次刷新結果", cookie.refresh_status === "unverified" ? "已輪替檢查，登入未驗證" : cookie.refresh_status || "—", cookie.refresh_status === "reauth_required" ? "bad" : ""],
         ["刷新錯誤", cookie.refresh_error || "—", cookie.refresh_error ? "bad" : ""],
         ["Cookie 數量", (cookie.cookie_count != null ? cookie.cookie_count : "—") + (cookie.removed_cookie_count ? "（已過濾 " + cookie.removed_cookie_count + "）" : "")],
         ["大小", cookie.byte_length != null ? cookie.byte_length + " bytes" : "—"],
@@ -3447,16 +3447,20 @@ function dashboardResponse(cfg) {
         setStat("stat-cron", "idle", "待命", "每 10 分鐘排程運行，目前沒有可重新整理的 Cookie");
       } else {
         var healthy = cookie.structurally_valid && cookie.sapisid_present;
-        setStat("stat-cookie", healthy ? "ok" : "warn",
-          healthy ? "有效" : "異常",
+        var rejected = cookie.refresh_status === "reauth_required";
+        setStat("stat-cookie", rejected ? "err" : "warn",
+          rejected ? "需要重匯入" : healthy ? "格式正常" : "格式異常",
           (cookie.session_cookie || "無 session") + " · " + (cookie.cookie_count || 0) + " 條" +
-          ((cookie.issues || []).length ? " · " + cookie.issues.length + " 項問題" : ""));
+          ((cookie.issues || []).length ? " · " + cookie.issues.length + " 項問題" : "") + " · 即時登入狀態請手動刷新");
         var checkedAgo = fmtAgo(cookie.refresh_checked_at);
         if (!cookie.refresh_checked_at) {
           setStat("stat-cron", "warn", "尚未檢查", "每 10 分鐘排程 · 還沒有檢查紀錄");
         } else if (cookie.refresh_status === "reauth_required") {
           setStat("stat-cron", "err", "需要重匯入",
             "每 10 分鐘排程 · 最後檢查：" + checkedAgo + " · Google 已不接受這份 Cookie");
+        } else if (cookie.refresh_status === "unverified") {
+          setStat("stat-cron", "warn", "登入未驗證",
+            "最後輪替檢查：" + checkedAgo + " · 請手動刷新驗證頁面 token");
         } else {
           var overdue = Date.now() - new Date(cookie.refresh_checked_at).getTime() > 30 * 60000;
           setStat("stat-cron", overdue ? "warn" : "ok", overdue ? "已逾期" : "正常",
