@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.8";
+const VERSION = "1.9.9";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -75,6 +75,8 @@ const CONFIG = {
 const MODEL_CATEGORIES = [6, 1, 3];
 const GUEST_MODE = 4;
 const MODEL_STATUS_RPC = "otAQ7b";
+const ACTIVITY_RPC = "ESY5D";
+const ACTIVITY_PAYLOAD = '[[["bard_activity_enabled"]]]';
 const MODEL_CATALOG_TTL_SEC = 10 * 60;
 const MODEL_CATALOG_CACHE_VERSION = "2";
 const UNAUTHENTICATED_STATUS = 1016;
@@ -289,6 +291,15 @@ function envOr(env, key, fallback) {
 
 const SESSION_COOKIE_NAMES = ["__Secure-1PSID", "__Secure-3PSID", "SID"];
 const MAX_COOKIE_BYTES = 64 * 1024;
+const COOKIE_JAR_VERSION = 1;
+const DEFAULT_COOKIE_DOMAIN = ".google.com";
+const DEFAULT_COOKIE_PATH = "/";
+const ROTATION_COOLDOWN_MS = 60 * 1000;
+const ROTATION_INTERVAL_MS = 10 * 60 * 1000;
+const ROTATION_JITTER_MS = 15 * 1000;
+const ACTIVITY_MIN_INTERVAL_MS = 60 * 1000;
+const ACTIVITY_MAX_INTERVAL_MS = 120 * 1000;
+const MAINTENANCE_LOCK_MS = 5 * 60 * 1000;
 const FORWARDED_COOKIE_NAMES = [
   "SID", "HSID", "SSID", "APISID", "SAPISID", "LSID", "OSID", "SIDCC",
   "AEC", "NID", "COMPASS", "GOOGLE_ABUSE_EXEMPTION", "__Secure-BUCKET", "__Secure-STRP", "__Secure-ENID",
@@ -328,12 +339,316 @@ function serializeCookiePairs(pairs) {
     .join("; ");
 }
 
+function normalizeCookieExpiry(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number" || /^\d+(?:\.\d+)?$/.test(String(value))) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) return null;
+    return Math.floor(numeric > 1e12 ? numeric / 1000 : numeric);
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : null;
+}
+
+function normalizeCookieDomain(domain, fallbackHost = "google.com") {
+  let value = String(domain || "").trim().toLowerCase();
+  if (!value) value = `.${String(fallbackHost || "google.com").replace(/^\./, "")}`;
+  return value;
+}
+
+function isGoogleCookieDomain(domain) {
+  const value = String(domain || "").replace(/^\./, "").toLowerCase();
+  return value === "google.com" || value.endsWith(".google.com");
+}
+
+function defaultCookiePath(url) {
+  let pathname = "/";
+  try { pathname = new URL(url).pathname || "/"; } catch (_) {}
+  if (!pathname.startsWith("/") || pathname === "/") return "/";
+  const end = pathname.lastIndexOf("/");
+  return end <= 0 ? "/" : pathname.slice(0, end);
+}
+
+function importedCookieJar(cookie) {
+  return [...parseCookiePairs(cookie)]
+    .filter(([name]) => FORWARDED_COOKIE_SET.has(name))
+    .map(([name, value]) => ({
+      name,
+      value,
+      domain: DEFAULT_COOKIE_DOMAIN,
+      path: DEFAULT_COOKIE_PATH,
+      expires: null,
+      secure: true,
+      http_only: false,
+      same_site: null,
+      host_only: false,
+      updated_at: 0,
+    }));
+}
+
+// Cookie Sync exports appear in three common shapes: a raw Cookie header, an
+// array of {name, value, ...} records, or a flat {name: value} object. Keep
+// the parser permissive at the edge, then run every form through the same
+// domain/path/expiry validation below.
+function cookieObjectEntries(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return Object.entries(value)
+    .filter(([name, item]) => typeof name === "string" && typeof item === "string")
+    .map(([name, item]) => ({ name, value: item }));
+}
+
+function extractCookieInput(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { cookieList: null, rawCookie: "" };
+  }
+
+  const candidates = [payload.cookie_jar, payload.cookies, payload.cookie];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return { cookieList: candidate, rawCookie: "" };
+    const entries = cookieObjectEntries(candidate);
+    if (entries) return { cookieList: entries, rawCookie: "" };
+  }
+
+  // A flat object such as {SAPISID: "...", "__Secure-1PSID": "..."} is
+  // accepted by the reference client. Only treat it as a cookie map when at
+  // least one approved cookie name is present, so auth metadata remains safe.
+  const flatNames = Object.keys(payload)
+    .filter((name) => FORWARDED_COOKIE_SET.has(normalizeCookieName(name)));
+  if (flatNames.length) {
+    return {
+      cookieList: flatNames.map((name) => ({ name, value: payload[name] })),
+      rawCookie: "",
+    };
+  }
+
+  return { cookieList: null, rawCookie: String(payload.cookie ?? "") };
+}
+
+function normalizeCookieJar(cookieJar, fallbackCookie = "", nowMs = Date.now()) {
+  const source = Array.isArray(cookieJar) && cookieJar.length
+    ? cookieJar
+    : importedCookieJar(fallbackCookie);
+  const normalized = new Map();
+  const nowSeconds = Math.floor(nowMs / 1000);
+
+  for (const raw of source) {
+    if (!raw || typeof raw !== "object") continue;
+    const name = normalizeCookieName(raw.name);
+    const value = String(raw.value ?? "").trim();
+    const domain = normalizeCookieDomain(raw.domain, "google.com");
+    const path = String(raw.path || DEFAULT_COOKIE_PATH).startsWith("/")
+      ? String(raw.path || DEFAULT_COOKIE_PATH)
+      : DEFAULT_COOKIE_PATH;
+    const expires = normalizeCookieExpiry(raw.expires ?? raw.expirationDate ?? raw.expiration);
+    if (!name || !value || !FORWARDED_COOKIE_SET.has(name) || !isGoogleCookieDomain(domain)) continue;
+    if (expires !== null && expires <= nowSeconds) continue;
+    const hostOnly = raw.host_only === true || (raw.hostOnly === true);
+    const key = `${name}\n${domain}\n${path}`;
+    normalized.set(key, {
+      name,
+      value,
+      domain,
+      path,
+      expires,
+      secure: raw.secure !== false,
+      http_only: raw.http_only === true || raw.httpOnly === true,
+      same_site: raw.same_site || raw.sameSite || null,
+      host_only: hostOnly,
+      updated_at: Number(raw.updated_at || raw.updatedAt) || 0,
+    });
+  }
+  return [...normalized.values()];
+}
+
+function cookieDomainMatches(hostname, cookie) {
+  const host = String(hostname || "").toLowerCase();
+  const domain = String(cookie.domain || "").replace(/^\./, "").toLowerCase();
+  if (!host || !domain) return false;
+  return cookie.host_only ? host === domain : (host === domain || host.endsWith(`.${domain}`));
+}
+
+function cookiePathMatches(requestPath, cookiePath) {
+  const request = requestPath || "/";
+  const path = cookiePath || "/";
+  if (request === path) return true;
+  if (!request.startsWith(path)) return false;
+  return path.endsWith("/") || request.charAt(path.length) === "/";
+}
+
+function cookieHeaderForUrl(cookieJar, url, names = null, nowMs = Date.now()) {
+  let target;
+  try { target = new URL(url); } catch (_) { return ""; }
+  const nowSeconds = Math.floor(nowMs / 1000);
+  const allowedNames = names ? new Set(names) : null;
+  const matches = normalizeCookieJar(cookieJar, "", nowMs)
+    .filter((cookie) => (!allowedNames || allowedNames.has(cookie.name)))
+    .filter((cookie) => cookie.expires === null || cookie.expires > nowSeconds)
+    .filter((cookie) => !cookie.secure || target.protocol === "https:")
+    .filter((cookie) => cookieDomainMatches(target.hostname, cookie))
+    .filter((cookie) => cookiePathMatches(target.pathname || "/", cookie.path))
+    .sort((a, b) => {
+      const exactA = a.host_only && a.domain.replace(/^\./, "") === target.hostname ? 1 : 0;
+      const exactB = b.host_only && b.domain.replace(/^\./, "") === target.hostname ? 1 : 0;
+      return exactB - exactA || b.path.length - a.path.length || b.updated_at - a.updated_at;
+    });
+
+  if (names) {
+    const byName = new Map();
+    for (const cookie of matches) if (!byName.has(cookie.name)) byName.set(cookie.name, cookie);
+    return names.filter((name) => byName.has(name)).map((name) => {
+      const cookie = byName.get(name);
+      return `${cookie.name}=${cookie.value}`;
+    }).join("; ");
+  }
+  return matches.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+}
+
+function serializeCookieJar(cookieJar, nowMs = Date.now()) {
+  const jar = normalizeCookieJar(cookieJar, "", nowMs);
+  const best = new Map();
+  for (const cookie of jar) {
+    const previous = best.get(cookie.name);
+    if (!previous || cookie.updated_at > previous.updated_at
+      || (cookie.updated_at === previous.updated_at && cookie.domain === DEFAULT_COOKIE_DOMAIN && previous.domain !== DEFAULT_COOKIE_DOMAIN)
+      || (cookie.updated_at === previous.updated_at && cookie.path === "/" && previous.path !== "/")) {
+      best.set(cookie.name, cookie);
+    }
+  }
+  return FORWARDED_COOKIE_NAMES
+    .filter((name) => best.has(name))
+    .map((name) => `${name}=${best.get(name).value}`)
+    .join("; ");
+}
+
+function parseSetCookie(line, responseUrl, nowMs = Date.now()) {
+  const parts = String(line || "").split(";");
+  const first = parts.shift() || "";
+  const separator = first.indexOf("=");
+  if (separator <= 0) return null;
+  const name = normalizeCookieName(first.slice(0, separator));
+  const value = first.slice(separator + 1).trim();
+  if (!name || !FORWARDED_COOKIE_SET.has(name)) return { ignored: true };
+
+  let target;
+  try { target = new URL(responseUrl); } catch (_) { return { ignored: true }; }
+  let domain = target.hostname.toLowerCase();
+  let hostOnly = true;
+  let path = defaultCookiePath(target.href);
+  let expires = null;
+  let maxAge = null;
+  let secure = false;
+  let httpOnly = false;
+  let sameSite = null;
+
+  for (const attribute of parts) {
+    const i = attribute.indexOf("=");
+    const key = (i < 0 ? attribute : attribute.slice(0, i)).trim().toLowerCase();
+    const attrValue = i < 0 ? "" : attribute.slice(i + 1).trim();
+    if (key === "domain" && attrValue) {
+      domain = normalizeCookieDomain(attrValue, target.hostname);
+      hostOnly = false;
+    } else if (key === "path" && attrValue.startsWith("/")) {
+      path = attrValue;
+    } else if (key === "max-age") {
+      const parsed = Number(attrValue);
+      if (Number.isFinite(parsed)) maxAge = parsed;
+    } else if (key === "expires") {
+      expires = normalizeCookieExpiry(attrValue);
+    } else if (key === "secure") {
+      secure = true;
+    } else if (key === "httponly") {
+      httpOnly = true;
+    } else if (key === "samesite") {
+      sameSite = attrValue || null;
+    }
+  }
+
+  const bareDomain = domain.replace(/^\./, "");
+  const targetHost = target.hostname.toLowerCase();
+  if (!isGoogleCookieDomain(domain)
+    || !(targetHost === bareDomain || targetHost.endsWith(`.${bareDomain}`))) {
+    return { ignored: true };
+  }
+  if (maxAge !== null) expires = Math.floor(nowMs / 1000 + maxAge);
+  const remove = !value || (maxAge !== null && maxAge <= 0)
+    || (expires !== null && expires <= Math.floor(nowMs / 1000));
+  return {
+    ignored: false,
+    remove,
+    cookie: { name, value, domain, path, expires, secure, http_only: httpOnly, same_site: sameSite, host_only: hostOnly, updated_at: nowMs },
+  };
+}
+
+function mergeCookieJar(cookieJar, setCookieValues, responseUrl = "https://accounts.google.com/RotateCookies", nowMs = Date.now()) {
+  const jar = normalizeCookieJar(cookieJar, "", nowMs);
+  const changed = new Set();
+  const valueChanged = new Set();
+  const renewed = new Set();
+  let ignoredCookieCount = 0;
+
+  for (const line of setCookieValues || []) {
+    const parsed = parseSetCookie(line, responseUrl, nowMs);
+    if (!parsed || parsed.ignored) {
+      ignoredCookieCount += 1;
+      continue;
+    }
+    const next = parsed.cookie;
+    const index = jar.findIndex((cookie) => cookie.name === next.name
+      && cookie.domain === next.domain && cookie.path === next.path);
+    if (parsed.remove) {
+      if (index >= 0) {
+        jar.splice(index, 1);
+        changed.add(next.name);
+        valueChanged.add(next.name);
+      }
+      continue;
+    }
+
+    if (index < 0) {
+      jar.push(next);
+      changed.add(next.name);
+      valueChanged.add(next.name);
+      continue;
+    }
+    const previous = jar[index];
+    const same = previous.value === next.value
+      && previous.expires === next.expires
+      && previous.secure === next.secure
+      && previous.http_only === next.http_only
+      && previous.same_site === next.same_site
+      && previous.host_only === next.host_only;
+    if (same) continue;
+    jar[index] = next;
+    changed.add(next.name);
+    if (previous.value !== next.value) valueChanged.add(next.name);
+    else if (next.expires !== null && (previous.expires === null || next.expires > previous.expires)) renewed.add(next.name);
+  }
+
+  const normalized = normalizeCookieJar(jar, "", nowMs);
+  return {
+    cookie_jar: normalized,
+    cookie: serializeCookieJar(normalized, nowMs),
+    changed_cookie_names: [...changed],
+    value_changed_cookie_names: [...valueChanged],
+    renewed_cookie_names: [...renewed],
+    ignored_cookie_count: ignoredCookieCount,
+  };
+}
+
 function getSetCookieValues(headers) {
   if (!headers) return [];
   let values = [];
-  if (typeof headers.getSetCookie === "function") {
-    values = headers.getSetCookie() || [];
+  // Cloudflare's Headers implementation exposes repeated Set-Cookie values
+  // through getAll() on some compatibility dates, while standard runtimes
+  // expose getSetCookie(). Read both before falling back to a combined header.
+  if (typeof headers.getAll === "function") {
+    try { values = headers.getAll("set-cookie") || []; } catch (_) {}
   }
+  if (!Array.isArray(values)) values = [values];
+  if (typeof headers.getSetCookie === "function") {
+    if (!values.length) values = headers.getSetCookie() || [];
+  }
+  if (!Array.isArray(values)) values = [values];
   if (!values.length) {
     const combined = headers.get && headers.get("set-cookie");
     if (combined) values = [combined];
@@ -343,72 +658,42 @@ function getSetCookieValues(headers) {
   );
 }
 
-function mergeRotatedCookies(cookie, setCookieValues) {
-  const pairs = parseCookiePairs(cookie);
-  const changed = new Set();
-  let ignoredCookieCount = 0;
-
-  for (const line of setCookieValues || []) {
-    const parts = String(line || "").split(";");
-    const first = parts.shift() || "";
-    const i = first.indexOf("=");
-    if (i <= 0) continue;
-    const name = first.slice(0, i).trim();
-    const value = first.slice(i + 1).trim();
-    if (!FORWARDED_COOKIE_SET.has(name)) {
-      ignoredCookieCount += 1;
-      continue;
-    }
-
-    let remove = !value;
-    for (const attribute of parts) {
-      const j = attribute.indexOf("=");
-      const key = (j < 0 ? attribute : attribute.slice(0, j)).trim().toLowerCase();
-      const attrValue = j < 0 ? "" : attribute.slice(j + 1).trim();
-      if (key === "max-age" && Number(attrValue) <= 0) remove = true;
-      if (key === "expires") {
-        const expiresAt = Date.parse(attrValue);
-        if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) remove = true;
-      }
-    }
-
-    if (remove) {
-      if (pairs.delete(name)) changed.add(name);
-    } else if (pairs.get(name) !== value) {
-      pairs.set(name, value);
-      changed.add(name);
-    }
-  }
-
-  return {
-    cookie: serializeCookiePairs(pairs),
-    changed_cookie_names: [...changed],
-    ignored_cookie_count: ignoredCookieCount,
-  };
+function mergeRotatedCookies(cookie, setCookieValues, responseUrl, cookieJar = null, nowMs = Date.now()) {
+  return mergeCookieJar(
+    normalizeCookieJar(cookieJar, cookie, nowMs),
+    setCookieValues,
+    responseUrl || ROTATE_COOKIES_URL,
+    nowMs,
+  );
 }
 
 function parseAuthPayload(input, strict = false) {
   let payload = input;
   if (typeof payload === "string") {
     const raw = payload.trim();
-    if (raw.startsWith("{")) {
+    if (raw.startsWith("{") || raw.startsWith("[")) {
       try { payload = JSON.parse(raw); } catch (_) { payload = { cookie: raw }; }
     } else {
       payload = { cookie: raw };
     }
   }
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = {};
+  if (Array.isArray(payload)) payload = { cookies: payload };
+  if (!payload || typeof payload !== "object") payload = {};
 
-  const rawCookie = String(payload.cookie ?? "")
+  const cookieInput = extractCookieInput(payload);
+  const cookieList = cookieInput.cookieList;
+  const rawCookie = cookieInput.rawCookie
     .replace(/^cookie\s*:\s*/i, "")
     .replace(/[\r\n]+[\t ]*/g, " ")
     .replace(/\\([_*])/g, "$1")
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .trim();
-  const pairs = parseCookiePairs(rawCookie);
+  const cookieJar = normalizeCookieJar(cookieList, rawCookie);
+  const cookie = serializeCookieJar(cookieJar) || serializeCookiePairs(parseCookiePairs(rawCookie));
+  const pairs = parseCookiePairs(cookie);
   const forwarded = FORWARDED_COOKIE_NAMES.filter((name) => pairs.has(name));
-  const cookie = serializeCookiePairs(pairs);
-  const removedCookieCount = Math.max(0, pairs.size - forwarded.length);
+  const suppliedCount = cookieList ? cookieList.length : parseCookiePairs(rawCookie).size;
+  const removedCookieCount = Math.max(0, suppliedCount - cookieJar.length);
   const embeddedSapisid = pairs.get("SAPISID") || "";
   const explicitSapisid = String(payload.sapisid ?? "").trim();
   const sapisid = explicitSapisid || embeddedSapisid;
@@ -418,8 +703,8 @@ function parseAuthPayload(input, strict = false) {
   const geminiBl = String(payload.gemini_bl ?? payload.geminiBl ?? "").trim();
 
   if (strict) {
-    if (!rawCookie) throw new Error("Cookie 不可為空");
-    if (new TextEncoder().encode(rawCookie).length > MAX_COOKIE_BYTES) throw new Error("Cookie 超過 64 KiB 上限");
+    if (!cookie) throw new Error("Cookie 不可為空");
+    if (new TextEncoder().encode(rawCookie || JSON.stringify(cookieList)).length > MAX_COOKIE_BYTES) throw new Error("Cookie 超過 64 KiB 上限");
     if (!sapisid) throw new Error("缺少 SAPISID");
     if (explicitSapisid && embeddedSapisid && !timingSafeEqual(explicitSapisid, embeddedSapisid)) {
       throw new Error("JSON 內的 sapisid 與 Cookie 中的 SAPISID 不一致");
@@ -432,6 +717,8 @@ function parseAuthPayload(input, strict = false) {
 
   return {
     cookie,
+    cookie_jar: cookieJar,
+    cookie_jar_version: COOKIE_JAR_VERSION,
     sapisid,
     auth_user: authUser,
     xsrf_token: xsrfToken,
@@ -441,8 +728,16 @@ function parseAuthPayload(input, strict = false) {
 }
 
 function cookieSummary(cfg) {
-  const pairs = parseCookiePairs(cfg.cookie);
+  const jar = normalizeCookieJar(cfg.cookie_jar, cfg.cookie);
+  const pairs = parseCookiePairs(serializeCookieJar(jar) || cfg.cookie);
   const sessionCookie = SESSION_COOKIE_NAMES.find((name) => pairs.has(name)) || null;
+  const psidtsNames = ["__Secure-1PSIDTS", "__Secure-3PSIDTS"]
+    .filter((name) => pairs.has(name));
+  const lifetimeCookie = ["__Secure-1PSIDTS", "__Secure-3PSIDTS", "__Secure-1PSID", "__Secure-3PSID"]
+    .map((name) => jar.find((cookie) => cookie.name === name && cookie.expires !== null))
+    .find(Boolean) || null;
+  const sessionExpiresAt = lifetimeCookie ? new Date(lifetimeCookie.expires * 1000).toISOString() : null;
+  const remainingSeconds = lifetimeCookie ? Math.max(0, lifetimeCookie.expires - Math.floor(Date.now() / 1000)) : null;
   const issues = [];
   if (cfg.cookie && !pairs.has("SAPISID") && !cfg.sapisid) issues.push("missing_sapisid");
   if (cfg.cookie && !sessionCookie) issues.push("missing_session_cookie");
@@ -451,14 +746,35 @@ function cookieSummary(cfg) {
     source: cfg.cookie_source || "none",
     updated_at: cfg.cookie_updated_at || null,
     refreshed_at: cfg.cookie_refreshed_at || null,
+    verified_at: cfg.cookie_verified_at || cfg.cookie_refreshed_at || null,
+    rotated_at: cfg.cookie_rotated_at || null,
     refresh_checked_at: cfg.cookie_refresh_checked_at || null,
     refresh_status: cfg.cookie_refresh_status || null,
     refresh_error: cfg.cookie_refresh_error || null,
+    session_expires_at: sessionExpiresAt,
+    session_remaining_seconds: remainingSeconds,
+    expiry_known: !!sessionExpiresAt,
+    jar_version: cfg.cookie_jar_version || COOKIE_JAR_VERSION,
+    last_rotation_attempt_at: cfg.last_rotation_attempt_at || null,
+    next_rotation_at: cfg.next_rotation_at || null,
+    rotation_status: cfg.rotation_status || null,
+    rotation_http_status: cfg.rotation_http_status ?? null,
+    rotation_transport: cfg.rotation_transport || null,
+    rotation_error: cfg.rotation_error || null,
+    last_activity_at: cfg.last_activity_at || null,
+    last_activity_attempt_at: cfg.last_activity_attempt_at || null,
+    next_activity_at: cfg.next_activity_at || null,
+    activity_status: cfg.activity_status || null,
+    activity_error: cfg.activity_error || null,
+    maintenance_lock_until: cfg.maintenance_lock_until || null,
+    maintenance_kind: cfg.maintenance_kind || null,
     byte_length: cfg.cookie ? new TextEncoder().encode(cfg.cookie).length : 0,
-    cookie_count: pairs.size,
+    cookie_count: new Set(jar.map((cookie) => cookie.name)).size,
     removed_cookie_count: cfg.removed_cookie_count || 0,
     sapisid_present: !!cfg.sapisid,
     session_cookie: sessionCookie,
+    psidts_present: psidtsNames.length > 0,
+    psidts_cookie_names: psidtsNames,
     xsrf_token_present: !!cfg.xsrf_token,
     auth_user: cfg.auth_user,
     structurally_valid: !!cfg.cookie && !issues.length,
@@ -483,15 +799,35 @@ function getConfig(env) {
     enable_debug: parseBool(envOr(env, "ENABLE_DEBUG", CONFIG.ENABLE_DEBUG), true),
     api_keys: parseApiKeys(envOr(env, "API_KEYS", CONFIG.API_KEYS)),
     cookie: "",
+    cookie_jar: [],
+    cookie_jar_version: COOKIE_JAR_VERSION,
     sapisid: "",
     auth_user: null,
     xsrf_token: "",
+    gemini_session_id: "",
+    gemini_language: "en",
     cookie_source: "none",
     cookie_updated_at: null,
     cookie_refreshed_at: null,
+    cookie_verified_at: null,
+    cookie_rotated_at: null,
     cookie_refresh_checked_at: null,
     cookie_refresh_status: null,
     cookie_refresh_error: null,
+    last_rotation_attempt_at: null,
+    next_rotation_at: null,
+    rotation_status: null,
+    rotation_http_status: null,
+    rotation_transport: null,
+    rotation_error: null,
+    last_activity_at: null,
+    last_activity_attempt_at: null,
+    next_activity_at: null,
+    activity_status: null,
+    activity_error: null,
+    maintenance_lock_until: null,
+    maintenance_kind: null,
+    session_key: null,
     removed_cookie_count: 0,
   };
 }
@@ -499,25 +835,88 @@ function getConfig(env) {
 function applyStoredAuth(cfg, record) {
   if (!record || !record.cookie) return cfg;
   const auth = parseAuthPayload(record);
+  const cookieJar = normalizeCookieJar(record.cookie_jar || auth.cookie_jar, auth.cookie);
+  const cookie = cookieHeaderForUrl(cookieJar, "https://gemini.google.com/app") || auth.cookie;
   return {
     ...cfg,
-    cookie: auth.cookie,
+    cookie,
+    cookie_jar: cookieJar,
+    cookie_jar_version: record.cookie_jar_version || COOKIE_JAR_VERSION,
     sapisid: auth.sapisid,
     auth_user: auth.auth_user,
     xsrf_token: auth.xsrf_token,
+    gemini_session_id: record.gemini_session_id || "",
+    gemini_language: record.gemini_language || "en",
     gemini_bl: auth.gemini_bl || cfg.gemini_bl,
     cookie_source: "durable_object",
     cookie_updated_at: record.updated_at || null,
     cookie_refreshed_at: record.refreshed_at || null,
+    cookie_verified_at: record.verified_at || record.refreshed_at || null,
+    cookie_rotated_at: record.rotated_at || null,
     cookie_refresh_checked_at: record.refresh_checked_at || null,
     cookie_refresh_status: record.refresh_status || null,
     cookie_refresh_error: record.refresh_error || null,
+    last_rotation_attempt_at: record.last_rotation_attempt_at || null,
+    next_rotation_at: record.next_rotation_at || null,
+    rotation_status: record.rotation_status || null,
+    rotation_http_status: record.rotation_http_status ?? null,
+    rotation_transport: record.rotation_transport || null,
+    rotation_error: record.rotation_error || null,
+    last_activity_at: record.last_activity_at || null,
+    last_activity_attempt_at: record.last_activity_attempt_at || null,
+    next_activity_at: record.next_activity_at || null,
+    activity_status: record.activity_status || null,
+    activity_error: record.activity_error || null,
+    maintenance_lock_until: record.maintenance_lock_until || null,
+    maintenance_kind: record.maintenance_kind || null,
+    session_key: record.session_key || null,
     removed_cookie_count: record.removed_cookie_count || auth.removed_cookie_count || 0,
   };
 }
 
+function storedAuthRecord(cfg, overrides = {}) {
+  const cookieJar = normalizeCookieJar(overrides.cookie_jar || cfg.cookie_jar, overrides.cookie || cfg.cookie);
+  const cookie = serializeCookieJar(cookieJar) || overrides.cookie || cfg.cookie;
+  const record = {
+    sapisid: cfg.sapisid,
+    auth_user: cfg.auth_user,
+    xsrf_token: cfg.xsrf_token,
+    gemini_session_id: cfg.gemini_session_id || "",
+    gemini_language: cfg.gemini_language || "en",
+    gemini_bl: cfg.gemini_bl,
+    removed_cookie_count: cfg.removed_cookie_count || 0,
+    updated_at: cfg.cookie_updated_at || null,
+    refreshed_at: cfg.cookie_refreshed_at || null,
+    verified_at: cfg.cookie_verified_at || cfg.cookie_refreshed_at || null,
+    rotated_at: cfg.cookie_rotated_at || null,
+    refresh_checked_at: cfg.cookie_refresh_checked_at || null,
+    refresh_status: cfg.cookie_refresh_status || null,
+    refresh_error: cfg.cookie_refresh_error || null,
+    last_rotation_attempt_at: cfg.last_rotation_attempt_at || null,
+    next_rotation_at: cfg.next_rotation_at || null,
+    rotation_status: cfg.rotation_status || null,
+    rotation_http_status: cfg.rotation_http_status ?? null,
+    rotation_transport: cfg.rotation_transport || null,
+    rotation_error: cfg.rotation_error || null,
+    last_activity_at: cfg.last_activity_at || null,
+    last_activity_attempt_at: cfg.last_activity_attempt_at || null,
+    next_activity_at: cfg.next_activity_at || null,
+    activity_status: cfg.activity_status || null,
+    activity_error: cfg.activity_error || null,
+    maintenance_lock_until: null,
+    maintenance_kind: null,
+    session_key: cfg.session_key || null,
+    ...overrides,
+  };
+  record.cookie = cookie;
+  record.cookie_jar = cookieJar;
+  record.cookie_jar_version = COOKIE_JAR_VERSION;
+  return record;
+}
+
 function switchToGuest(cfg, reason) {
   cfg.cookie = "";
+  cfg.cookie_jar = [];
   cfg.sapisid = "";
   cfg.auth_user = null;
   cfg.xsrf_token = "";
@@ -540,15 +939,82 @@ async function readStoredAuth(env) {
   return response.json();
 }
 
-async function writeStoredAuth(env, record) {
+async function writeStoredAuth(env, record, expectedSessionKey = null, expectedUpdatedAt = null) {
   const stub = cookieStoreStub(env);
   if (!stub) throw new Error("COOKIE_STORE Durable Object 尚未綁定");
+  const headers = { "Content-Type": "application/json" };
+  if (expectedSessionKey) headers["X-Expected-Session-Key"] = expectedSessionKey;
+  if (expectedUpdatedAt) headers["X-Expected-Updated-At"] = expectedUpdatedAt;
   const response = await stub.fetch("https://cookie-store.internal/auth", {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(record),
   });
+  if (response.status === 409) throw new Error("Cookie session changed while refresh was running");
   if (!response.ok) throw new Error(`Cookie store write failed (${response.status})`);
+}
+
+function randomizedNextAt(nowMs, minimumMs, maximumMs = minimumMs) {
+  const span = Math.max(0, maximumMs - minimumMs);
+  return new Date(nowMs + minimumMs + Math.floor(Math.random() * (span + 1))).toISOString();
+}
+
+async function cookieSessionKey(cfg) {
+  if (cfg.session_key) return cfg.session_key;
+  const jar = normalizeCookieJar(cfg.cookie_jar, cfg.cookie);
+  const identity = cookieHeaderForUrl(
+    jar,
+    ROTATE_COOKIES_URL,
+    ["__Secure-1PSID", "__Secure-3PSID", "SID"],
+  ) || serializeCookieJar(jar);
+  if (!identity) return "";
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
+  return [...new Uint8Array(digest)].slice(0, 16).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function claimStoredMaintenance(env, cfg, kind, scheduled = false) {
+  const stub = cookieStoreStub(env);
+  if (!stub) throw new Error("COOKIE_STORE Durable Object 尚未綁定");
+  const sessionKey = await cookieSessionKey(cfg);
+  const requestBody = { kind, scheduled, session_key: sessionKey };
+  const response = await stub.fetch("https://cookie-store.internal/maintenance/claim", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  });
+  if (response.ok) {
+    const result = await response.json();
+    return { ...result, cfg: result.record ? applyStoredAuth(cfg, result.record) : cfg, session_key: sessionKey };
+  }
+  if (![404, 405].includes(response.status)) {
+    if (response.status === 409) return { claimed: false, reason: "session_changed", cfg, session_key: sessionKey };
+    throw new Error(`Cookie maintenance claim failed (${response.status})`);
+  }
+
+  // Older/mocked stores do not have the atomic claim endpoint. Keep the same
+  // policy locally and persist the timestamp before contacting Google.
+  const nowMs = Date.now();
+  const attemptField = kind === "rotation" ? "last_rotation_attempt_at" : "last_activity_attempt_at";
+  const nextField = kind === "rotation" ? "next_rotation_at" : "next_activity_at";
+  const lastAttempt = Date.parse(cfg[attemptField] || "");
+  const nextAttempt = Date.parse(cfg[nextField] || "");
+  const minimum = kind === "rotation" ? ROTATION_COOLDOWN_MS : ACTIVITY_MIN_INTERVAL_MS;
+  if (Number.isFinite(lastAttempt) && nowMs - lastAttempt < minimum) {
+    return { claimed: false, reason: "cooldown", cfg, session_key: sessionKey };
+  }
+  if (scheduled && Number.isFinite(nextAttempt) && nextAttempt > nowMs) {
+    return { claimed: false, reason: "not_due", cfg, session_key: sessionKey };
+  }
+  const nextAt = kind === "rotation"
+    ? randomizedNextAt(nowMs, ROTATION_INTERVAL_MS - ROTATION_JITTER_MS, ROTATION_INTERVAL_MS + ROTATION_JITTER_MS)
+    : randomizedNextAt(nowMs, ACTIVITY_MIN_INTERVAL_MS, ACTIVITY_MAX_INTERVAL_MS);
+  const record = storedAuthRecord(cfg, {
+    session_key: sessionKey,
+    [attemptField]: new Date(nowMs).toISOString(),
+    [nextField]: nextAt,
+  });
+  await writeStoredAuth(env, record, cfg.session_key || null, cfg.cookie_updated_at || null);
+  return { claimed: true, reason: null, cfg: applyStoredAuth(cfg, record), record, session_key: sessionKey };
 }
 
 async function clearStoredAuth(env) {
@@ -567,6 +1033,7 @@ export class CookieStore {
   constructor(state) { this.state = state; }
 
   async fetch(request) {
+    const url = new URL(request.url);
     if (request.method === "GET") {
       const auth = await this.state.storage.get("auth");
       return auth
@@ -575,8 +1042,60 @@ export class CookieStore {
     }
     if (request.method === "PUT") {
       const auth = await request.json();
+      const expectedSessionKey = request.headers.get("X-Expected-Session-Key");
+      const expectedUpdatedAt = request.headers.get("X-Expected-Updated-At");
+      if (expectedSessionKey || expectedUpdatedAt) {
+        const current = await this.state.storage.get("auth");
+        if (expectedSessionKey && current?.session_key && current.session_key !== expectedSessionKey) {
+          return new Response(null, { status: 409 });
+        }
+        if (expectedUpdatedAt && current?.updated_at && current.updated_at !== expectedUpdatedAt) {
+          return new Response(null, { status: 409 });
+        }
+      }
       await this.state.storage.put("auth", auth);
       return new Response(null, { status: 204 });
+    }
+    if (request.method === "POST" && url.pathname === "/maintenance/claim") {
+      const input = await request.json();
+      const kind = input?.kind === "activity" ? "activity" : "rotation";
+      const scheduled = input?.scheduled === true;
+      const sessionKey = String(input?.session_key || "");
+      const nowMs = Date.now();
+      const result = await this.state.storage.transaction(async (txn) => {
+        const auth = await txn.get("auth");
+        if (!auth) return { status: 404 };
+        if (auth.session_key && sessionKey && auth.session_key !== sessionKey) return { status: 409 };
+        const lockUntil = Date.parse(auth.maintenance_lock_until || "");
+        if (Number.isFinite(lockUntil) && lockUntil > nowMs) {
+          return { status: 200, body: { claimed: false, reason: "in_progress", record: auth } };
+        }
+        const attemptField = kind === "rotation" ? "last_rotation_attempt_at" : "last_activity_attempt_at";
+        const nextField = kind === "rotation" ? "next_rotation_at" : "next_activity_at";
+        const minimum = kind === "rotation" ? ROTATION_COOLDOWN_MS : ACTIVITY_MIN_INTERVAL_MS;
+        const lastAttempt = Date.parse(auth[attemptField] || "");
+        const nextAttempt = Date.parse(auth[nextField] || "");
+        if (Number.isFinite(lastAttempt) && nowMs - lastAttempt < minimum) {
+          return { status: 200, body: { claimed: false, reason: "cooldown", record: auth } };
+        }
+        if (scheduled && Number.isFinite(nextAttempt) && nextAttempt > nowMs) {
+          return { status: 200, body: { claimed: false, reason: "not_due", record: auth } };
+        }
+        auth.session_key = sessionKey || auth.session_key || null;
+        auth.maintenance_kind = kind;
+        auth.maintenance_lock_until = new Date(nowMs + MAINTENANCE_LOCK_MS).toISOString();
+        auth[attemptField] = new Date(nowMs).toISOString();
+        auth[nextField] = kind === "rotation"
+          ? randomizedNextAt(nowMs, ROTATION_INTERVAL_MS - ROTATION_JITTER_MS, ROTATION_INTERVAL_MS + ROTATION_JITTER_MS)
+          : randomizedNextAt(nowMs, ACTIVITY_MIN_INTERVAL_MS, ACTIVITY_MAX_INTERVAL_MS);
+        await txn.put("auth", auth);
+        return { status: 200, body: { claimed: true, reason: null, record: auth } };
+      });
+      if (!result.body) return new Response(null, { status: result.status });
+      return new Response(JSON.stringify(result.body), {
+        status: result.status,
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+      });
     }
     if (request.method === "DELETE") {
       await this.state.storage.delete("auth");
@@ -703,6 +1222,27 @@ function accountPrefix(cfg) {
     : `/u/${cfg.auth_user}`;
 }
 
+function logicalCookieUrl(cfg, url) {
+  try {
+    const target = new URL(url);
+    const configured = new URL(cfg.gemini_origin || "https://gemini.google.com");
+    if (target.origin === configured.origin) {
+      return new URL(`${target.pathname}${target.search}`, "https://gemini.google.com").href;
+    }
+    return target.href;
+  } catch (_) {
+    return url;
+  }
+}
+
+function requestCookieHeader(cfg, url, names = null) {
+  return cookieHeaderForUrl(
+    normalizeCookieJar(cfg.cookie_jar, cfg.cookie),
+    logicalCookieUrl(cfg, url),
+    names,
+  );
+}
+
 function applyAccountHeaders(headers, cfg) {
   if (cfg.auth_user !== null && cfg.auth_user !== undefined && cfg.auth_user !== "") {
     headers["X-Goog-AuthUser"] = String(cfg.auth_user);
@@ -713,7 +1253,11 @@ function applyAccountHeaders(headers, cfg) {
 async function buildAppPageHeaders(cfg, cookie) {
   const headers = { "User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9" };
   applyAccountHeaders(headers, cfg);
-  if (cookie) headers.Cookie = cookie;
+  const appUrl = `${cfg.gemini_origin || "https://gemini.google.com"}${accountPrefix(cfg)}/app`;
+  const scopedCookie = requestCookieHeader(cfg, appUrl) || cookie;
+  if (scopedCookie) headers.Cookie = scopedCookie;
+  // Keep the SAPISIDHASH on the navigation as a compatibility fallback for
+  // Worker egresses where Google does not associate the Cookie jar alone.
   if (cfg.sapisid) headers.Authorization = await makeSapisidHash(cfg.sapisid);
   return headers;
 }
@@ -738,7 +1282,8 @@ async function buildHeaders(cfg, modelHeader) {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
   };
   applyAccountHeaders(headers, cfg);
-  if (cfg.cookie) headers["Cookie"] = cfg.cookie;
+  const scopedCookie = requestCookieHeader(cfg, getUrl(cfg));
+  if (scopedCookie || cfg.cookie) headers["Cookie"] = scopedCookie || cfg.cookie;
   if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
   if (modelHeader) {
     headers["x-goog-ext-525001261-jspb"] = modelHeader;
@@ -914,30 +1459,36 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000, maxRedirects = MAX_
   const originUrl = new URL(origin);
   let url = `${origin}${accountPrefix(cfg)}/app`;
   const setCookieValues = [];
+  let cookieJar = normalizeCookieJar(cfg.cookie_jar, headers.Cookie || cfg.cookie);
   let redirectHost = "";
   let response = null;
 
   for (let i = 0; i < maxRedirects; i++) {
+    const scopedCookie = cookieHeaderForUrl(cookieJar, logicalCookieUrl(cfg, url));
+    if (scopedCookie) headers.Cookie = scopedCookie;
+    else delete headers.Cookie;
     response = await httpFetch(url, { headers, timeoutMs, socket: cfg.upstream_socket, redirect: "manual" });
     const rotated = getSetCookieValues(response.headers);
     setCookieValues.push(...rotated);
-    if (rotated.length && headers.Cookie) headers.Cookie = mergeRotatedCookies(headers.Cookie, rotated).cookie || headers.Cookie;
+    if (rotated.length) cookieJar = mergeCookieJar(cookieJar, rotated, logicalCookieUrl(cfg, url)).cookie_jar;
     if (!REDIRECT_STATUSES.has(response.status)) {
-      return { response, html: await response.text(), setCookieValues, redirect_host: redirectHost };
+      return { response, html: await response.text(), setCookieValues, cookieJar, redirect_host: redirectHost };
     }
 
     const location = response.headers.get("location");
     try { await response.text(); } catch (_) {}
-    if (!location) return { response, html: "", setCookieValues, redirect_host: "missing_location" };
+    if (!location) return { response, html: "", setCookieValues, cookieJar, redirect_host: "missing_location" };
     const next = new URL(location, url);
     redirectHost = next.hostname.replace(/[^a-z0-9.-]/gi, "_");
     const abuseCookie = next.searchParams.get("google_abuse");
     if (abuseCookie) {
       setCookieValues.push(abuseCookie);
-      headers.Cookie = mergeRotatedCookies(headers.Cookie || "", [abuseCookie]).cookie || headers.Cookie;
+      cookieJar = mergeCookieJar(cookieJar, [abuseCookie], logicalCookieUrl(cfg, url)).cookie_jar;
       next.searchParams.delete("google_abuse");
     }
-    if (next.origin !== originUrl.origin && !isGoogleRedirectTarget(next)) return { response, html: "", setCookieValues, redirect_host: redirectHost };
+    if (next.origin !== originUrl.origin && !isGoogleRedirectTarget(next)) {
+      return { response, html: "", setCookieValues, cookieJar, redirect_host: redirectHost };
+    }
     if (next.origin !== originUrl.origin) {
       delete headers.Authorization;
       delete headers["X-Same-Domain"];
@@ -948,7 +1499,7 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000, maxRedirects = MAX_
     url = next.href;
   }
 
-  return { response, html: "", setCookieValues, redirect_host: redirectHost || "too_many_redirects" };
+  return { response, html: "", setCookieValues, cookieJar, redirect_host: redirectHost || "too_many_redirects" };
 }
 
 // ─── 多模态:图片上传(Scotty 续传)───────────────────────────────────────────
@@ -982,6 +1533,8 @@ function extractPageTokens(html) {
     ["push_id", /"qKIAYe":"([^"]+)"/],
     ["pctx", /"Ylro7b":"([^"]+)"/],
     ["at", /"SNlM0e":"([^"]+)"/],
+    ["session_id", /"FdrFJe":"([^"]+)"/],
+    ["language", /"TuX5cc":"([^"]+)"/],
   ]) {
     const match = pattern.exec(html || "");
     if (match) tokens[key] = match[1];
@@ -991,17 +1544,25 @@ function extractPageTokens(html) {
   return tokens;
 }
 
+function pageShowsSignIn(html) {
+  // Gemini includes localized sign-in strings inside large JavaScript bundles
+  // even for authenticated users. Remove inert script/template markup before
+  // looking for an actual sign-in link or form in the returned page.
+  const markup = String(html || "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<template\b[^>]*>[\s\S]*?<\/template>/gi, "");
+  return /<a\b[^>]*(?:aria-label\s*=\s*["']Sign in["']|href\s*=\s*["'][^"']*(?:accounts\.google\.com\/ServiceLogin|gemini\.google\.com\/signin))/i.test(markup)
+    || /<form\b[^>]*action\s*=\s*["'][^"']*accounts\.google\.com/i.test(markup);
+}
+
 function hasAuthenticatedPageMarkers(tokens, html = "") {
+  if (pageShowsSignIn(html)) return false;
   if (tokens && tokens.at) return true;
   if (!tokens || !tokens.push_id || !tokens.pctx) return false;
 
-  // qKIAYe/Ylro7b are also present in the public guest shell.  A stale
-  // stored XSRF token must not turn that shell into a false authenticated
-  // result, so require that the page does not advertise a Google sign-in.
-  return !(
-    /aria-label\s*=\s*["']Sign in["']/i.test(String(html || ""))
-    || /href\s*=\s*["'][^"']*(?:accounts\.google\.com\/ServiceLogin|gemini\.google\.com\/signin)/i.test(String(html || ""))
-  );
+  // qKIAYe/Ylro7b also appear in the public guest shell. The explicit
+  // sign-in controls were rejected above, so the remaining pair is usable.
+  return true;
 }
 
 function extractXsrfToken(raw) {
@@ -1060,10 +1621,7 @@ async function refreshGeminiBl(cfg) {
   }
 
   try {
-    const headers = { "User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9" };
-    applyAccountHeaders(headers, cfg);
-    if (cfg.cookie) headers.Cookie = cfg.cookie;
-    if (cfg.sapisid) headers.Authorization = await makeSapisidHash(cfg.sapisid);
+    const headers = await buildAppPageHeaders(cfg, cfg.cookie);
     const page = await fetchAppPage(cfg, headers);
     const bl = extractGeminiBl(page.html);
     if (bl) {
@@ -1092,6 +1650,76 @@ async function refreshGeminiBl(cfg) {
 
   if (stale) cfg.gemini_bl = stale;
   return cfg.gemini_bl;
+}
+
+async function executeBatchRpc(cfg, rpcId, payload, accessToken = cfg.xsrf_token || "") {
+  const origin = cfg.gemini_origin || "https://gemini.google.com";
+  const reqid = (nowSec() * 1000 + Math.floor(Math.random() * 1000)) % 10000000;
+  const sourcePath = `${accountPrefix(cfg)}/app`;
+  const params = new URLSearchParams({
+    rpcids: rpcId,
+    "source-path": sourcePath,
+    bl: cfg.gemini_bl,
+    hl: cfg.gemini_language || "en",
+    _reqid: String(reqid),
+    rt: "c",
+  });
+  if (cfg.gemini_session_id) params.set("f.sid", cfg.gemini_session_id);
+  const body = new URLSearchParams({
+    "f.req": JSON.stringify([[[rpcId, payload, null, "generic"]]]),
+  });
+  if (accessToken) body.set("at", accessToken);
+  const response = await httpFetch(`${origin}${accountPrefix(cfg)}/_/BardChatUi/data/batchexecute?${params}`, {
+    method: "POST",
+    headers: await buildHeaders(cfg),
+    body: body.toString(),
+    timeoutMs: 30000,
+    socket: cfg.upstream_socket,
+  });
+  return { response, raw: await response.text() };
+}
+
+async function verifySessionWithRpc(cfg, accessToken) {
+  try {
+    const { response, raw } = await executeBatchRpc(cfg, MODEL_STATUS_RPC, "[]", accessToken);
+    if (!response.ok) return { valid: null, error: `get_user_status_${response.status}` };
+    const statusPayload = extractRpcPayload(raw, MODEL_STATUS_RPC);
+    if (statusPayload?.[14] === UNAUTHENTICATED_STATUS) {
+      return { valid: false, error: "get_user_status_unauthenticated" };
+    }
+    return { valid: true, error: null, payload: statusPayload };
+  } catch (e) {
+    return { valid: null, error: `get_user_status_unreadable:${String((e && e.message) || e)}` };
+  }
+}
+
+async function syncGeminiActivity(cfg, discoverToken = true) {
+  if (!cfg.cookie) return { ok: false, skipped: "no_cookie" };
+  const accessToken = cfg.xsrf_token || (discoverToken ? (await getPageTokens(cfg)).at : "") || "";
+  if (!accessToken) return { ok: false, skipped: "missing_page_token" };
+  try {
+    const { response } = await executeBatchRpc(cfg, ACTIVITY_RPC, ACTIVITY_PAYLOAD, accessToken);
+    return response.ok
+      ? { ok: true, status: response.status }
+      : { ok: false, status: response.status, error: `activity_http_${response.status}` };
+  } catch (e) {
+    return { ok: false, error: `activity_network:${String((e && e.message) || e)}` };
+  }
+}
+
+async function runScheduledActivity(cfg, env) {
+  const claim = await claimStoredMaintenance(env, cfg, "activity", true);
+  if (!claim.claimed) return { status: claim.reason || "skipped" };
+  const activeCfg = claim.cfg;
+  const result = await syncGeminiActivity(activeCfg, false);
+  const now = new Date(Date.now()).toISOString();
+  const record = storedAuthRecord(activeCfg, {
+    last_activity_at: result.ok ? now : activeCfg.last_activity_at,
+    activity_status: result.ok ? "ok" : (result.skipped || "retrying"),
+    activity_error: result.ok ? null : (result.error || result.skipped || "activity_failed"),
+  });
+  await writeStoredAuth(env, record, claim.session_key || null, activeCfg.cookie_updated_at || null);
+  return { status: record.activity_status, result };
 }
 
 async function fetchModelCatalog(cfg, key) {
@@ -1236,7 +1864,9 @@ async function getPageTokens(cfg) {
   if (_pageTokens.key === key && _pageTokens.tokens && now - _pageTokens.ts < 600000) return _pageTokens.tokens;
   const headers = { "User-Agent": _UA };
   applyAccountHeaders(headers, cfg);
-  if (cfg.cookie) headers["Cookie"] = cfg.cookie;
+  const appUrl = `${origin}${accountPrefix(cfg)}/app`;
+  const scopedCookie = requestCookieHeader(cfg, appUrl);
+  if (scopedCookie || cfg.cookie) headers["Cookie"] = scopedCookie || cfg.cookie;
   if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
   const tokens = cfg.xsrf_token ? { at: cfg.xsrf_token } : {};
   try {
@@ -2680,31 +3310,101 @@ async function handleAdminStatus(cfg, env, url) {
   });
 }
 
+async function readRotationResponse(response, transport) {
+  const result = {
+    ok: !!response.ok,
+    status: Number(response.status) || 0,
+    set_cookie_values: getSetCookieValues(response.headers),
+    transport,
+  };
+  try { await response.text(); } catch (_) {}
+  return result;
+}
+
 async function rotateGoogleCookies(cfg) {
-  const pairs = parseCookiePairs(cfg.cookie);
-  const sessionPairs = new Map(
-    ["__Secure-1PSID", "__Secure-1PSIDTS"]
-      .filter((name) => pairs.has(name))
-      .map((name) => [name, pairs.get(name)]),
-  );
+  const cookie = requestCookieHeader(
+    cfg,
+    ROTATE_COOKIES_URL,
+    ["__Secure-1PSID", "__Secure-1PSIDTS"],
+  ) || cfg.cookie;
   const headers = {
     "Content-Type": "application/json",
     Origin: "https://accounts.google.com",
-    Referer: "https://accounts.google.com/",
-    "Accept-Language": "en-US,en;q=0.9",
-    "User-Agent": _UA,
-    Cookie: sessionPairs.has("__Secure-1PSID")
-      ? [...sessionPairs].map(([name, value]) => `${name}=${value}`).join("; ")
-      : cfg.cookie,
+    Cookie: cookie,
   };
-  applyAccountHeaders(headers, cfg);
-  return httpFetch(ROTATE_COOKIES_URL, {
-    method: "POST",
-    headers,
-    body: ROTATE_COOKIES_BODY,
-    timeoutMs: 15000,
-    socket: cfg.upstream_socket,
-  });
+  let nativeResult = null;
+  let nativeError = null;
+  try {
+    const response = await fetch(ROTATE_COOKIES_URL, {
+      method: "POST",
+      headers,
+      body: ROTATE_COOKIES_BODY,
+      redirect: "manual",
+      signal: timeoutSignal(15000),
+    });
+    nativeResult = await readRotationResponse(response, "fetch");
+    if (nativeResult.status !== 429 && nativeResult.status < 500) return nativeResult;
+  } catch (e) {
+    nativeError = e;
+  }
+
+  if (cfg.upstream_socket) {
+    const connect = await resolveConnect();
+    if (connect) {
+      try {
+        const response = await socketHttp(connect, ROTATE_COOKIES_URL, {
+          method: "POST",
+          headers,
+          body: ROTATE_COOKIES_BODY,
+          timeoutMs: 15000,
+        });
+        return await readRotationResponse(response, "socket");
+      } catch (e) {
+        if (!nativeResult) nativeError = e;
+      }
+    }
+  }
+  if (nativeResult) return nativeResult;
+  throw nativeError || new Error("RotateCookies transport unavailable");
+}
+
+const _rotationLocks = new Map();
+
+async function runCookieRotation(cfg, env, scheduled = false) {
+  const sessionKey = await cookieSessionKey(cfg);
+  const lockKey = sessionKey || "unknown-session";
+  if (_rotationLocks.has(lockKey)) {
+    return { ...(await _rotationLocks.get(lockKey)), shared: true };
+  }
+  const task = (async () => {
+    const claim = await claimStoredMaintenance(env, cfg, "rotation", scheduled);
+    if (!claim.claimed) return { ...claim, attempted: false };
+    try {
+      return {
+        ...claim,
+        attempted: true,
+        result: await rotateGoogleCookies(claim.cfg),
+      };
+    } catch (e) {
+      return {
+        ...claim,
+        attempted: true,
+        result: {
+          ok: false,
+          status: 0,
+          set_cookie_values: [],
+          transport: null,
+          error: String((e && e.message) || e),
+        },
+      };
+    }
+  })();
+  _rotationLocks.set(lockKey, task);
+  try {
+    return await task;
+  } finally {
+    if (_rotationLocks.get(lockKey) === task) _rotationLocks.delete(lockKey);
+  }
 }
 
 function reauthRequiredResponse(cfg) {
@@ -2714,6 +3414,20 @@ function reauthRequiredResponse(cfg) {
     changed_cookie_names: [],
     message: "Google 已不接受這份登入態；Worker 無法自行重新登入，請從瀏覽器重新匯入 Cookie。",
   });
+}
+
+function cookieJarChangedNames(before, after) {
+  const signature = (cookie) => `${cookie.name}\n${cookie.domain}\n${cookie.path}`;
+  const left = new Map(normalizeCookieJar(before).map((cookie) => [signature(cookie), JSON.stringify(cookie)]));
+  const right = new Map(normalizeCookieJar(after).map((cookie) => [signature(cookie), JSON.stringify(cookie)]));
+  const names = new Set();
+  for (const cookie of normalizeCookieJar(before)) {
+    if (right.get(signature(cookie)) !== JSON.stringify(cookie)) names.add(cookie.name);
+  }
+  for (const cookie of normalizeCookieJar(after)) {
+    if (left.get(signature(cookie)) !== JSON.stringify(cookie)) names.add(cookie.name);
+  }
+  return [...names];
 }
 
 async function handleCookieRefresh(cfg, env, verifyPage = true) {
@@ -2728,94 +3442,192 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
     }, 400);
   }
 
-  let cookie = cfg.cookie;
+  const scheduled = !verifyPage;
+  const originalSessionKey = await cookieSessionKey(cfg);
+  let activeCfg = cfg;
+  let cookieJar = normalizeCookieJar(cfg.cookie_jar, cfg.cookie);
+  let cookie = serializeCookieJar(cookieJar) || cfg.cookie;
   const changedCookieNames = [];
   let ignoredCookieCount = 0;
-  let rotationRejected = false;
+  let sessionExtended = false;
+  let rotation = null;
   const rememberRotation = (merged) => {
+    cookieJar = merged.cookie_jar;
     cookie = merged.cookie;
     ignoredCookieCount += merged.ignored_cookie_count;
     for (const name of merged.changed_cookie_names) {
       if (!changedCookieNames.includes(name)) changedCookieNames.push(name);
     }
   };
-  const recordRefreshFailure = async (reason) => {
-    const checkedAt = new Date().toISOString();
-    const record = {
+  const persistPageIssue = async (reason, hardFailure = false) => {
+    const checkedAt = new Date(Date.now()).toISOString();
+    const existing = activeCfg.cookie_refresh_status;
+    const usableStatus = ["verified", "refreshed", "rotation_ok"].includes(existing)
+      ? (existing === "refreshed" ? "verified" : existing)
+      : "retrying";
+    const record = storedAuthRecord(activeCfg, {
       cookie,
-      sapisid: cfg.sapisid,
-      auth_user: cfg.auth_user,
-      xsrf_token: cfg.xsrf_token,
-      gemini_bl: cfg.gemini_bl,
-      removed_cookie_count: cfg.removed_cookie_count || 0,
-      updated_at: cfg.cookie_updated_at || checkedAt,
-      refreshed_at: cfg.cookie_refreshed_at || null,
+      cookie_jar: cookieJar,
+      updated_at: activeCfg.cookie_updated_at || checkedAt,
       refresh_checked_at: checkedAt,
-      refresh_status: "reauth_required",
+      refresh_status: hardFailure ? "reauth_required" : usableStatus,
       refresh_error: reason,
-    };
-    await writeStoredAuth(env, record);
-    return reauthRequiredResponse(applyStoredAuth(cfg, record));
-  };
-
-  try {
-    const rotateResponse = await rotateGoogleCookies(cfg);
-    if (rotateResponse.status === 401) {
-      rotationRejected = true;
-      log(cfg, "RotateCookies returned 401; continuing with Gemini /app validation");
-    }
-    if (!rotateResponse.ok && !verifyPage && !rotationRejected) {
-      throw new Error(`RotateCookies returned ${rotateResponse.status}`);
-    }
-    if (rotateResponse.ok) rememberRotation(mergeRotatedCookies(cookie, getSetCookieValues(rotateResponse.headers)));
-  } catch (e) {
-    log(cfg, `RotateCookies failed: ${e}`);
-    if (!verifyPage) throw e;
-  }
-
-  if (!verifyPage) {
-    const now = new Date().toISOString();
-    const preserveFailure = cfg.cookie_refresh_status === "reauth_required";
-    const sessionRotated = changedCookieNames.includes("__Secure-1PSIDTS");
-    const record = {
-      cookie,
-      sapisid: cfg.sapisid,
-      auth_user: cfg.auth_user,
-      xsrf_token: cfg.xsrf_token,
-      gemini_bl: cfg.gemini_bl,
-      removed_cookie_count: cfg.removed_cookie_count || 0,
-      updated_at: changedCookieNames.length ? now : (cfg.cookie_updated_at || now),
-      refreshed_at: cfg.cookie_refreshed_at || null,
-      refresh_checked_at: now,
-      refresh_status: preserveFailure
-        ? "reauth_required"
-        : "unverified",
-      refresh_error: preserveFailure
-        ? cfg.cookie_refresh_error
-        : rotationRejected ? "rotate_401" : sessionRotated ? null : "session_not_rotated",
-    };
-    await writeStoredAuth(env, record);
-    const refreshedCfg = applyStoredAuth(cfg, record);
+    });
+    record.session_key = await cookieSessionKey({ ...applyStoredAuth(activeCfg, record), session_key: null });
+    await writeStoredAuth(env, record, originalSessionKey || null, cfg.cookie_updated_at || null);
+    const refreshedCfg = applyStoredAuth(activeCfg, record);
+    if (hardFailure) return reauthRequiredResponse(refreshedCfg);
     return privateJsonResponse({
-      status: record.refresh_status,
+      status: "retrying",
       cookie: cookieSummary(refreshedCfg),
       changed_cookie_names: changedCookieNames,
       ignored_cookie_count: ignoredCookieCount,
-      message: "已完成排程 Cookie 輪替；頁面 token 驗證留給手動刷新。",
+      message: "Cookie 仍保留；這次無法完成頁面驗證，下一輪會重試。",
+    });
+  };
+
+  rotation = await runCookieRotation(cfg, env, scheduled);
+  activeCfg = rotation.cfg || cfg;
+  cookieJar = normalizeCookieJar(activeCfg.cookie_jar, activeCfg.cookie);
+  cookie = serializeCookieJar(cookieJar) || activeCfg.cookie;
+
+  if (rotation.shared || (!rotation.attempted && (rotation.reason === "in_progress" || rotation.reason === "session_changed"))) {
+    return privateJsonResponse({
+      status: "in_progress",
+      cookie: cookieSummary(activeCfg),
+      changed_cookie_names: [],
+      ignored_cookie_count: 0,
+      message: "同一份 Cookie 已有刷新工作執行中；本次沒有重複送出請求。",
     });
   }
 
-  let detectedAuthUser = cfg.auth_user;
-  let pageCfg = cfg;
-  let page = await fetchAppPage(pageCfg, await buildAppPageHeaders(pageCfg, cookie));
+  if (rotation.attempted) {
+    const result = rotation.result;
+    const checkedAt = activeCfg.last_rotation_attempt_at || new Date(Date.now()).toISOString();
+    log(cfg, `Cookie rotation status=${result.status} transport=${result.transport || "none"} names=${(result.set_cookie_values || []).map((line) => line.split("=")[0]).join(",")}`);
+    activeCfg = {
+      ...activeCfg,
+      rotation_http_status: result.status || null,
+      rotation_transport: result.transport || null,
+      rotation_error: null,
+    };
+    if (result.ok) {
+      const merged = mergeCookieJar(cookieJar, result.set_cookie_values, ROTATE_COOKIES_URL);
+      rememberRotation(merged);
+      const rotatedSessionNames = ["__Secure-1PSIDTS", "__Secure-3PSIDTS"];
+      sessionExtended = rotatedSessionNames.some((name) => merged.value_changed_cookie_names.includes(name)
+        || merged.renewed_cookie_names.includes(name));
+      activeCfg = {
+        ...activeCfg,
+        cookie,
+        cookie_jar: cookieJar,
+        cookie_updated_at: changedCookieNames.length ? checkedAt : activeCfg.cookie_updated_at,
+        cookie_rotated_at: sessionExtended ? checkedAt : activeCfg.cookie_rotated_at,
+        cookie_refresh_status: sessionExtended ? "refreshed" : "rotation_ok",
+        cookie_refresh_error: null,
+        rotation_status: sessionExtended ? "rotated" : "no_change",
+      };
+    } else {
+      const rotationError = result.status ? `rotate_http_${result.status}` : "rotate_network_error";
+      activeCfg = {
+        ...activeCfg,
+        rotation_status: result.status ? `http_${result.status}` : "network_error",
+        rotation_error: result.error || rotationError,
+      };
+      log(cfg, `RotateCookies will retry later: ${rotationError}`);
+    }
+  } else {
+    log(cfg, `Cookie rotation skipped: ${rotation.reason || "unknown"}`);
+  }
+
+  if (!verifyPage) {
+    if (!rotation.attempted) {
+      return privateJsonResponse({
+        status: rotation.reason || "skipped",
+        cookie: cookieSummary(activeCfg),
+        changed_cookie_names: [],
+        ignored_cookie_count: 0,
+        message: rotation.reason === "not_due" ? "尚未到下一次 Cookie 輪替時間。" : "60 秒內已送過輪替請求，本次略過。",
+      });
+    }
+    const result = rotation.result;
+    const checkedAt = activeCfg.last_rotation_attempt_at || new Date(Date.now()).toISOString();
+    let refreshStatus = cfg.cookie_refresh_status || "retrying";
+    let refreshError = result.status ? `rotate_http_${result.status}` : "rotate_network_error";
+    if (result.ok) {
+      const previouslyVerified = ["verified", "refreshed", "rotation_ok"].includes(cfg.cookie_refresh_status);
+      refreshStatus = sessionExtended ? "refreshed" : (previouslyVerified ? "verified" : "rotation_ok");
+      refreshError = null;
+    }
+    const record = storedAuthRecord(activeCfg, {
+      cookie,
+      cookie_jar: cookieJar,
+      updated_at: changedCookieNames.length ? checkedAt : (cfg.cookie_updated_at || checkedAt),
+      refresh_checked_at: checkedAt,
+      refresh_status: refreshStatus,
+      refresh_error: refreshError,
+    });
+    record.session_key = await cookieSessionKey({ ...applyStoredAuth(activeCfg, record), session_key: null });
+    await writeStoredAuth(env, record, originalSessionKey || null, cfg.cookie_updated_at || null);
+    const refreshedCfg = applyStoredAuth(cfg, record);
+    return privateJsonResponse({
+      status: result.ok ? (sessionExtended ? "refreshed" : "no_rotation") : "retrying",
+      cookie: cookieSummary(refreshedCfg),
+      changed_cookie_names: changedCookieNames,
+      ignored_cookie_count: ignoredCookieCount,
+      message: result.ok
+        ? (sessionExtended ? "排程已延長登入 session。" : "Google 接受輪替請求；本次沒有更新 PSIDTS，會在下一輪再試。")
+        : "輪替暫時失敗；現有 Cookie 未被刪除，會在下一輪重試。",
+    });
+  }
+
+  let detectedAuthUser = activeCfg.auth_user;
+  let pageCfg = { ...activeCfg, cookie, cookie_jar: cookieJar };
+  let page;
+  try {
+    page = await fetchAppPage(pageCfg, await buildAppPageHeaders(pageCfg, cookie));
+  } catch (e) {
+    log(cfg, `Cookie page validation failed: ${e}`);
+    return await persistPageIssue("app_network_error", false);
+  }
   let response = page.response;
   let tokens = extractPageTokens(page.html);
+  const logPage = (candidateCfg, candidatePage, candidateTokens) => log(cfg, `Cookie page account=${candidateCfg.auth_user ?? "default"} status=${candidatePage.response.status} redirect=${candidatePage.redirect_host || "none"} bytes=${candidatePage.html.length} tokens=${Object.keys(candidateTokens).join(",")} authenticated=${hasAuthenticatedPageMarkers(candidateTokens, candidatePage.html)} signin=${/accounts\.google\.com\/ServiceLogin|gemini\.google\.com\/signin|aria-label=["']Sign in/i.test(candidatePage.html)}`);
+  logPage(pageCfg, page, tokens);
 
-  if ((!response.ok || !tokens.at) && (cfg.auth_user === null || cfg.auth_user === undefined || cfg.auth_user === "")) {
+  // Browser navigations use Cookie authentication, without an RPC SAPISIDHASH.
+  // Try a coherent first-party cookie set when a mixed, older browser export
+  // resolves to the signed-out shell. Persist it only after fresh verification.
+  if (response.ok && !hasAuthenticatedPageMarkers(tokens, page.html)) {
+    if (cookieJar.some((item) => item.name === "__Secure-1PSID")) {
+      const firstPartyJar = cookieJar.filter((item) => item.name.startsWith("__Secure-1P") || ["SAPISID", "NID", "AEC", "GOOGLE_ABUSE_EXEMPTION"].includes(item.name));
+      const firstPartyCookie = serializeCookieJar(firstPartyJar);
+      for (const socket of [activeCfg.upstream_socket, false].filter((value, i, values) => values.indexOf(value) === i)) {
+        const trialCfg = { ...activeCfg, cookie: firstPartyCookie, cookie_jar: firstPartyJar, upstream_socket: socket };
+        const trialHeaders = await buildAppPageHeaders(trialCfg, firstPartyCookie);
+        delete trialHeaders.Authorization;
+        const trialPage = await fetchAppPage(trialCfg, trialHeaders);
+        const trialTokens = extractPageTokens(trialPage.html);
+        logPage({ auth_user: `first_party_${socket ? "socket" : "fetch"}` }, trialPage, trialTokens);
+        if (trialPage.response.ok && hasAuthenticatedPageMarkers(trialTokens, trialPage.html)) {
+          page = trialPage;
+          response = trialPage.response;
+          tokens = trialTokens;
+          pageCfg = trialCfg;
+          cookie = firstPartyCookie;
+          cookieJar = firstPartyJar;
+          break;
+        }
+      }
+    }
+  }
+
+  if ((!response.ok || !tokens.at) && (activeCfg.auth_user === null || activeCfg.auth_user === undefined || activeCfg.auth_user === "")) {
     for (const authUser of ["0", "1", "2", "3"]) {
-      const trialCfg = { ...cfg, auth_user: authUser };
+      const trialCfg = { ...activeCfg, cookie, cookie_jar: cookieJar, auth_user: authUser };
       const trialPage = await fetchAppPage(trialCfg, await buildAppPageHeaders(trialCfg, cookie), 30000, 2);
       const trialTokens = extractPageTokens(trialPage.html);
+      logPage(trialCfg, trialPage, trialTokens);
       page = trialPage;
       response = trialPage.response;
       tokens = trialTokens;
@@ -2826,7 +3638,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
       }
     }
   }
-  const now = new Date().toISOString();
+  const now = new Date(Date.now()).toISOString();
 
   if (response.ok && !tokens.at && hasAuthenticatedPageMarkers(tokens, page.html)) {
     try {
@@ -2837,41 +3649,81 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
     }
   }
 
-  if (!response.ok || !tokens.at) {
-    const redirectSuffix = page.redirect_host ? `_to_${page.redirect_host}` : "";
-    return await recordRefreshFailure(
-      !response.ok ? `app_${response.status}${redirectSuffix}` : "missing_page_token",
-    );
+  let rpcVerification = null;
+  if (response.ok && !tokens.at && activeCfg.xsrf_token) {
+    rpcVerification = await verifySessionWithRpc({ ...pageCfg, cookie, cookie_jar: page.cookieJar || cookieJar }, activeCfg.xsrf_token);
+    if (rpcVerification.valid) tokens.at = activeCfg.xsrf_token;
   }
 
-  rememberRotation(mergeRotatedCookies(cookie, page.setCookieValues));
-  const sessionRotated = changedCookieNames.includes("__Secure-1PSIDTS");
+  if (!response.ok || !tokens.at) {
+    const redirectSuffix = page.redirect_host ? `_to_${page.redirect_host}` : "";
+    const reason = !response.ok ? `app_${response.status}${redirectSuffix}` : "missing_page_token";
+    const hardFailure = rpcVerification?.valid === false
+      || pageShowsSignIn(page.html)
+      || ([401, 403].includes(response.status) && rotation.result?.status === 401);
+    return await persistPageIssue(reason, hardFailure);
+  }
+
+  const pageJar = normalizeCookieJar(page.cookieJar, cookie);
+  for (const name of cookieJarChangedNames(cookieJar, pageJar)) {
+    if (!changedCookieNames.includes(name)) changedCookieNames.push(name);
+  }
+  cookieJar = pageJar;
+  cookie = serializeCookieJar(cookieJar) || cookie;
+  const pagePsidtsChanged = ["__Secure-1PSIDTS", "__Secure-3PSIDTS"]
+    .some((name) => changedCookieNames.includes(name));
+  sessionExtended = sessionExtended || pagePsidtsChanged;
   const auth = parseAuthPayload({
     cookie,
-    sapisid: cfg.sapisid,
+    cookie_jar: cookieJar,
+    sapisid: activeCfg.sapisid,
     auth_user: detectedAuthUser,
     xsrf_token: tokens.at,
     gemini_bl: tokens.bl || pageCfg.gemini_bl,
   }, true);
-  const record = {
+  let record = storedAuthRecord({
+    ...activeCfg,
+    cookie: auth.cookie,
+    cookie_jar: auth.cookie_jar,
+    sapisid: auth.sapisid,
+    auth_user: auth.auth_user,
+    xsrf_token: auth.xsrf_token,
+    gemini_bl: auth.gemini_bl || activeCfg.gemini_bl,
+    gemini_session_id: tokens.session_id || activeCfg.gemini_session_id,
+    gemini_language: tokens.language || activeCfg.gemini_language,
+  }, {
     ...auth,
-    removed_cookie_count: cfg.removed_cookie_count || 0,
-    updated_at: changedCookieNames.length ? now : (cfg.cookie_updated_at || now),
+    removed_cookie_count: activeCfg.removed_cookie_count || 0,
+    updated_at: changedCookieNames.length ? now : (activeCfg.cookie_updated_at || now),
     refreshed_at: now,
+    verified_at: now,
+    rotated_at: sessionExtended ? now : activeCfg.cookie_rotated_at,
     refresh_checked_at: now,
-    refresh_status: sessionRotated ? "refreshed" : "verified",
-    refresh_error: sessionRotated ? null : "session_not_rotated",
-  };
-  await writeStoredAuth(env, record);
+    refresh_status: sessionExtended ? "refreshed" : "verified",
+    refresh_error: null,
+    gemini_session_id: tokens.session_id || activeCfg.gemini_session_id || "",
+    gemini_language: tokens.language || activeCfg.gemini_language || "en",
+  });
+  const sessionKey = await cookieSessionKey({ ...applyStoredAuth(activeCfg, record), session_key: null });
+  record.session_key = sessionKey;
 
-  const refreshedCfg = applyStoredAuth(cfg, record);
+  let refreshedCfg = applyStoredAuth(activeCfg, record);
+  const activity = await syncGeminiActivity(refreshedCfg, false);
+  record.last_activity_attempt_at = now;
+  record.last_activity_at = activity.ok ? now : record.last_activity_at;
+  record.next_activity_at = randomizedNextAt(Date.now(), ACTIVITY_MIN_INTERVAL_MS, ACTIVITY_MAX_INTERVAL_MS);
+  record.activity_status = activity.ok ? "ok" : (activity.skipped || "retrying");
+  record.activity_error = activity.ok ? null : (activity.error || activity.skipped || "activity_failed");
+  await writeStoredAuth(env, record, originalSessionKey || null, cfg.cookie_updated_at || null);
+
+  refreshedCfg = applyStoredAuth(activeCfg, record);
   await invalidateModelCatalog(cfg, refreshedCfg);
   _pageTokens = {
     key: await authCacheKey(refreshedCfg),
     tokens,
     ts: Date.now(),
   };
-  const rotated = sessionRotated;
+  const rotated = sessionExtended;
   return privateJsonResponse({
     status: rotated ? "refreshed" : "no_rotation",
     cookie: cookieSummary(refreshedCfg),
@@ -2879,7 +3731,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
     ignored_cookie_count: ignoredCookieCount,
     message: rotated
       ? `已保存 Google 輪替的 ${changedCookieNames.length} 個 Cookie。`
-      : "登入態目前有效，但 Google 未回傳新的 __Secure-1PSIDTS；session 壽命尚未延長。",
+      : "登入態與 page token 均已驗證；Google 本次未更新 PSIDTS，會在下一輪繼續嘗試。",
   });
 }
 
@@ -2900,7 +3752,30 @@ async function handleCookieImport(request, cfg, env) {
   try {
     const input = body && Object.prototype.hasOwnProperty.call(body, "auth") ? body.auth : body;
     const auth = parseAuthPayload(input, true);
-    const record = { ...auth, updated_at: new Date().toISOString() };
+    const now = new Date(Date.now()).toISOString();
+    const sessionKey = await cookieSessionKey({ ...cfg, ...auth, session_key: null });
+    const record = {
+      ...auth,
+      updated_at: now,
+      refreshed_at: null,
+      verified_at: null,
+      rotated_at: null,
+      refresh_checked_at: null,
+      refresh_status: null,
+      refresh_error: null,
+      last_rotation_attempt_at: null,
+      next_rotation_at: null,
+      rotation_status: null,
+      rotation_http_status: null,
+      rotation_transport: null,
+      rotation_error: null,
+      last_activity_at: null,
+      last_activity_attempt_at: null,
+      next_activity_at: null,
+      activity_status: null,
+      activity_error: null,
+      session_key: sessionKey,
+    };
     await writeStoredAuth(env, record);
     const importedCfg = applyStoredAuth(cfg, record);
     await invalidateModelCatalog(importedCfg);
@@ -3418,12 +4293,17 @@ function dashboardResponse(cfg) {
         ["匯入時間", fmtTime(cookie.updated_at)],
         ["最後檢查", fmtTime(cookie.refresh_checked_at)],
         ["最近驗證成功", fmtTime(cookie.refreshed_at)],
-        ["上次刷新結果", cookie.refresh_status === "unverified" ? "已輪替檢查，登入未驗證" : cookie.refresh_status === "verified" ? "登入有效，session 未延長" : cookie.refresh_status || "—", cookie.refresh_status === "reauth_required" || cookie.refresh_error === "session_not_rotated" ? "bad" : ""],
+        ["最近延長 Session", fmtTime(cookie.rotated_at)],
+        ["Cookie 到期", cookie.expiry_known ? fmtTime(cookie.session_expires_at) : "瀏覽器匯出未含到期資訊"],
+        ["下次輪替", fmtTime(cookie.next_rotation_at)],
+        ["輪替傳輸", cookie.rotation_transport || "—"],
+        ["上次刷新結果", cookie.refresh_status === "rotation_ok" ? "輪替成功，等待頁面驗證" : cookie.refresh_status === "retrying" ? "暫時失敗，將重試" : cookie.refresh_status === "verified" ? "登入有效" : cookie.refresh_status || "—", cookie.refresh_status === "reauth_required" ? "bad" : ""],
         ["刷新錯誤", cookie.refresh_error || "—", cookie.refresh_error ? "bad" : ""],
         ["Cookie 數量", (cookie.cookie_count != null ? cookie.cookie_count : "—") + (cookie.removed_cookie_count ? "（已過濾 " + cookie.removed_cookie_count + "）" : "")],
         ["大小", cookie.byte_length != null ? cookie.byte_length + " bytes" : "—"],
         ["SAPISID", yn(cookie.sapisid_present), cookie.sapisid_present ? "good" : "bad"],
         ["Session Cookie", cookie.session_cookie || "—"],
+        ["PSIDTS 可輪替 Cookie", cookie.psidts_present ? (cookie.psidts_cookie_names || []).join(", ") : "未提供"],
         ["XSRF Token", yn(cookie.xsrf_token_present)],
         ["Auth User", cookie.auth_user != null && cookie.auth_user !== "" ? String(cookie.auth_user) : "—"],
       ];
@@ -3457,7 +4337,7 @@ function dashboardResponse(cfg) {
 
       if (!cookie.configured) {
         setStat("stat-cookie", "warn", "未設定", "尚未匯入 Cookie，僅能使用訪客路由");
-        setStat("stat-cron", "idle", "待命", "每 10 分鐘排程運行，目前沒有可重新整理的 Cookie");
+        setStat("stat-cron", "idle", "待命", "每分鐘檢查排程，目前沒有可重新整理的 Cookie");
       } else {
         var healthy = cookie.structurally_valid && cookie.sapisid_present;
         var rejected = cookie.refresh_status === "reauth_required";
@@ -3467,17 +4347,17 @@ function dashboardResponse(cfg) {
           ((cookie.issues || []).length ? " · " + cookie.issues.length + " 項問題" : "") + " · 即時登入狀態請手動刷新");
         var checkedAgo = fmtAgo(cookie.refresh_checked_at);
         if (!cookie.refresh_checked_at) {
-          setStat("stat-cron", "warn", "尚未檢查", "每 10 分鐘排程 · 還沒有檢查紀錄");
+          setStat("stat-cron", "warn", "尚未檢查", "每分鐘檢查、約每 10 分鐘輪替 · 還沒有檢查紀錄");
         } else if (cookie.refresh_status === "reauth_required") {
           setStat("stat-cron", "err", "需要重匯入",
-            "每 10 分鐘排程 · 最後檢查：" + checkedAgo + " · Google 已不接受這份 Cookie");
-        } else if (cookie.refresh_status === "unverified") {
-          setStat("stat-cron", "warn", "登入未驗證",
-            "最後輪替檢查：" + checkedAgo + " · 請手動刷新驗證頁面 token");
+            "排程最後檢查：" + checkedAgo + " · Google 已明確拒絕這份 Cookie");
+        } else if (cookie.refresh_status === "retrying") {
+          setStat("stat-cron", "warn", "等待重試",
+            "最後檢查：" + checkedAgo + " · 現有 Cookie 已保留");
         } else {
           var overdue = Date.now() - new Date(cookie.refresh_checked_at).getTime() > 30 * 60000;
           setStat("stat-cron", overdue ? "warn" : "ok", overdue ? "已逾期" : "正常",
-            "每 10 分鐘排程 · 最後檢查：" + checkedAgo +
+            "排程最後檢查：" + checkedAgo +
             (overdue ? "；請按「手動重新整理」或檢查 Cookie 是否失效" : ""));
         }
       }
@@ -3582,12 +4462,13 @@ function dashboardResponse(cfg) {
     $("do-import").addEventListener("click", function () {
       var raw = $("import-input").value.trim();
       if (!raw) { importNote("請先貼上 Cookie 內容。", true); return; }
-      importAction(this, function () {
-        return api("/admin/cookie", {
+      importAction(this, async function () {
+        await api("/admin/cookie", {
           method: "PUT",
           headers: headersFor(true),
           body: JSON.stringify({ auth: raw }),
         });
+        return api("/admin/cookie/refresh", { method: "POST", headers: headersFor(false) });
       });
     });
     $("do-refresh").addEventListener("click", function () {
@@ -3836,6 +4717,14 @@ export default {
       return jsonResponse({ error: { message: "invalid api key" } }, 401);
     }
 
+    if (!adminPath && method === "POST" && cfg.cookie && ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(
+        runScheduledActivity(cfg, env)
+          .then((result) => log(cfg, `request activity heartbeat: ${result.status}`))
+          .catch((e) => log(cfg, `request activity heartbeat failed: ${e}`)),
+      );
+    }
+
     try {
       if (adminPath) {
         if (path === "/admin/status" && method === "GET") return await handleAdminStatus(cfg, env, url);
@@ -3930,6 +4819,10 @@ export default {
       const response = await handleCookieRefresh(cfg, env, false);
       const result = await response.json();
       log(cfg, `automatic Cookie refresh: ${result.status || result.error?.message || response.status}`);
+      if (result.status === "reauth_required") return;
+      const refreshedCfg = await getRequestConfig(env);
+      const activity = await runScheduledActivity(refreshedCfg, env);
+      log(refreshedCfg, `automatic activity heartbeat: ${activity.status}`);
     })().catch((e) => log(getConfig(env), `automatic Cookie refresh failed: ${e}`)));
   },
 };
@@ -3942,11 +4835,12 @@ if (typeof process !== "undefined" && process.versions && process.versions.node)
     computeAccountCapacity, buildModelSelectHeader,
     guestModelCatalog, defaultModelName, modelNameForCategory, resolveModel, getConfig, getRequestConfig, getModelCatalog, applyStoredAuth,
     parseAuthPayload, cookieSummary, authCacheKey,
-    getSetCookieValues, mergeRotatedCookies,
+    getSetCookieValues, importedCookieJar, normalizeCookieJar, cookieHeaderForUrl, serializeCookieJar,
+    parseSetCookie, mergeCookieJar, mergeRotatedCookies, cookieSessionKey,
     buildPayload, getUrl, buildHeaders, cleanText,
     extractTextsFromLine, extractResponseText, extractActualModel, routeStatus, generate, generateResult, generateStream,
     messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
-    makeSapisidHash, parseImageUrl, extractGeminiBl, extractPageTokens, extractXsrfToken, getPageTokens, uploadImage, resolveImages,
+    makeSapisidHash, parseImageUrl, extractGeminiBl, extractPageTokens, hasAuthenticatedPageMarkers, extractXsrfToken, getPageTokens, uploadImage, resolveImages,
     __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,
   };
 }

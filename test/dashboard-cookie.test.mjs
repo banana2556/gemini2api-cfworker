@@ -222,6 +222,16 @@ test("model catalog does not trust a stale page token from an unauthenticated ap
   }
 });
 
+test("embedded sign-in template text does not reject an authenticated page", async () => {
+  const html = '<script>const label = "Sign in"; const href = "https://accounts.google.com/ServiceLogin";</script>{"qKIAYe":"push","Ylro7b":"pctx"}';
+  assert.equal(internals.hasAuthenticatedPageMarkers(internals.extractPageTokens(html), html), true);
+});
+
+test("an explicit sign-in control wins over a page token", () => {
+  const html = '<a aria-label="Sign in" href="https://accounts.google.com/ServiceLogin">Sign in</a>{"SNlM0e":"guest-at","qKIAYe":"push","Ylro7b":"pctx"}';
+  assert.equal(internals.hasAuthenticatedPageMarkers(internals.extractPageTokens(html), html), false);
+});
+
 test("model catalog rejects an unauthenticated GetUserStatus response", async () => {
   const store = memoryCookieStore();
   const env = {
@@ -301,7 +311,7 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   assert.equal((await root.json()).status, "ok");
   const healthJson = await health.json();
   assert.equal(healthJson.status, "ok");
-  assert.equal(healthJson.version, "1.9.8");
+  assert.equal(healthJson.version, "1.9.9");
 });
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
@@ -389,6 +399,95 @@ test("Cookie rotation merges approved values and ignores unrelated Set-Cookie fi
   assert.equal(combined.length, 2);
 });
 
+test("persistent Cookie jar keeps scope and expiry metadata and applies deletions", () => {
+  const now = Date.parse("2026-09-09T00:00:00.000Z");
+  const base = internals.importedCookieJar("SAPISID=sapi; __Secure-1PSID=session; __Secure-1PSIDTS=old-ts");
+  const merged = internals.mergeCookieJar(base, [
+    "__Secure-1PSIDTS=new-ts; Domain=.google.com; Path=/; Max-Age=120; Secure; HttpOnly; SameSite=Lax",
+    "SIDCC=account-only; Path=/RotateCookies; Max-Age=60; Secure",
+    "UNRELATED=ignored; Domain=.google.com; Path=/",
+  ], "https://accounts.google.com/RotateCookies", now);
+
+  const psidts = merged.cookie_jar.find((cookie) => cookie.name === "__Secure-1PSIDTS");
+  assert.deepEqual({
+    value: psidts.value,
+    domain: psidts.domain,
+    path: psidts.path,
+    expires: psidts.expires,
+    secure: psidts.secure,
+    http_only: psidts.http_only,
+    same_site: psidts.same_site,
+  }, {
+    value: "new-ts",
+    domain: ".google.com",
+    path: "/",
+    expires: Math.floor(now / 1000) + 120,
+    secure: true,
+    http_only: true,
+    same_site: "Lax",
+  });
+  assert.match(internals.cookieHeaderForUrl(merged.cookie_jar, "https://accounts.google.com/RotateCookies", null, now), /SIDCC=account-only/);
+  assert.doesNotMatch(internals.cookieHeaderForUrl(merged.cookie_jar, "https://gemini.google.com/app", null, now), /SIDCC=account-only/);
+  assert.equal(merged.ignored_cookie_count, 1);
+
+  const removed = internals.mergeCookieJar(merged.cookie_jar, [
+    "__Secure-1PSIDTS=; Domain=.google.com; Path=/; Max-Age=0",
+  ], "https://accounts.google.com/RotateCookies", now + 1000);
+  assert.equal(removed.cookie_jar.some((cookie) => cookie.name === "__Secure-1PSIDTS"), false);
+  assert.deepEqual(removed.changed_cookie_names, ["__Secure-1PSIDTS"]);
+});
+
+test("Cookie Sync arrays preserve browser metadata on import", async () => {
+  const store = memoryCookieStore();
+  const response = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: { cookies: [
+      { name: "SAPISID", value: "top-secret-sapi", domain: ".google.com", path: "/", secure: true, expirationDate: 1900000000 },
+      { name: "__Secure-1PSID", value: "top-secret-session", domain: ".google.com", path: "/", secure: true, expirationDate: 1900000100 },
+      { name: "UNRELATED", value: "top-secret-discard", domain: ".google.com", path: "/" },
+    ] } }),
+  }), { API_KEYS: "api-test-key", COOKIE_STORE: store });
+  const text = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.equal(store.peek().cookie_jar.length, 2);
+  assert.equal(store.peek().cookie_jar.find((cookie) => cookie.name === "__Secure-1PSID").expires, 1900000100);
+  assert.equal(store.peek().cookie_jar_version, 1);
+  assert.doesNotMatch(text, /top-secret-sapi|top-secret-session|top-secret-discard/);
+});
+
+test("Cookie import accepts the flat map formats used by the reference client", async () => {
+  const store = memoryCookieStore();
+  const env = { API_KEYS: "api-test-key", COOKIE_STORE: store };
+  const response = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: {
+      cookies: {
+        SAPISID: "flat-sapi",
+        "__Secure-1PSID": "flat-session",
+        "__Secure-1PSIDTS": "flat-ts",
+      },
+    } }),
+  }), env);
+  assert.equal(response.status, 200);
+  assert.equal(store.peek().cookie_jar.length, 3);
+  assert.match(store.peek().cookie, /__Secure-1PSIDTS=flat-ts/);
+
+  const flatResponse = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-api-key": "api-test-key" },
+    body: JSON.stringify({ auth: {
+      SAPISID: "flat-sapi-2",
+      "__Secure-1PSID": "flat-session-2",
+    } }),
+  }), env);
+  assert.equal(flatResponse.status, 200);
+  assert.equal(store.peek().cookie_jar.length, 2);
+  assert.match(store.peek().cookie, /__Secure-1PSID=flat-session-2/);
+});
+
 test("authenticated Cookie refresh persists rotations without exposing values and rejects expired login", async () => {
   const store = memoryCookieStore();
   const env = {
@@ -419,6 +518,8 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     globalThis.fetch = (input, init) => {
       if (String(input).includes("/RotateCookies")) {
         assert.equal(init.headers.Cookie, "__Secure-1PSID=session; __Secure-1PSIDTS=old-ts");
+        assert.deepEqual(Object.keys(init.headers).sort(), ["Content-Type", "Cookie", "Origin"]);
+        assert.equal(init.body, '[000,"-0000000000000000000"]');
       }
       return authFetch(input, init);
     };
@@ -445,7 +546,7 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     const validRecord = structuredClone(store.peek());
     globalThis.fetch = googleAuthFetch({
       rotateCookies: ["__Secure-1PSIDTS=rotated-ts; Path=/; Secure; HttpOnly"],
-      appCookies: ["SIDCC=rotated-cc; Path=/"],
+      appCookies: ["SIDCC=rotated-cc; Path=/; Secure; HttpOnly"],
       appBody: '{"SNlM0e":"newer-at"}',
     });
     const unchanged = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
@@ -455,7 +556,7 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     const unchangedData = await unchanged.json();
     assert.equal(unchangedData.status, "no_rotation");
     assert.equal(unchangedData.cookie.refresh_status, "verified");
-    assert.equal(unchangedData.cookie.refresh_error, "session_not_rotated");
+    assert.equal(unchangedData.cookie.refresh_error, null);
     assert.equal(store.peek().cookie, validRecord.cookie);
     assert.equal(store.peek().updated_at, validRecord.updated_at);
     assert.equal(store.peek().xsrf_token, "newer-at");
@@ -467,7 +568,7 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     globalThis.fetch = googleAuthFetch({
       rotateStatus: 401,
       appCookies: ["SIDCC=must-not-save; Path=/"],
-      appBody: "<html>Sign in</html>",
+      appBody: '<a aria-label="Sign in" href="https://accounts.google.com/ServiceLogin">Sign in</a>',
     });
     const expired = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
       method: "POST",
@@ -522,8 +623,94 @@ test("manual Cookie refresh validates the session when RotateCookies rejects a r
     assert.equal(refreshed.status, 200);
     assert.equal(data.status, "no_rotation");
     assert.equal(data.cookie.refresh_status, "verified");
-    assert.equal(data.cookie.refresh_error, "session_not_rotated");
+    assert.equal(data.cookie.refresh_error, null);
     assert.equal(store.peek().xsrf_token, "still-valid-at");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("overlapping manual refreshes send only one RotateCookies request", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; __Secure-1PSID=session; __Secure-1PSIDTS=old-ts" }),
+  }), env);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    let rotateCalls = 0;
+    globalThis.fetch = async (input) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("/RotateCookies")) {
+        rotateCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        return new Response("ok", {
+          headers: { "Set-Cookie": "__Secure-1PSIDTS=new-ts; Domain=.google.com; Path=/; Secure; HttpOnly" },
+        });
+      }
+      return new Response('{"SNlM0e":"fresh-at"}', { headers: { "Content-Type": "text/html" } });
+    };
+
+    const request = () => worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: { Authorization: "Bearer api-test-key" },
+    }), env);
+    const responses = await Promise.all([request(), request()]);
+    assert.equal(rotateCalls, 1);
+    assert.deepEqual((await Promise.all(responses.map(async (response) => (await response.json()).status))).sort(), ["in_progress", "refreshed"]);
+    assert.match(store.peek().cookie, /__Secure-1PSIDTS=new-ts/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a later verified page clears a stale reauthentication result during cooldown", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; __Secure-1PSID=session" }),
+  }), env);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = googleAuthFetch({
+      rotateStatus: 401,
+      appBody: '<a aria-label="Sign in" href="https://accounts.google.com/ServiceLogin">Sign in</a>',
+    });
+    const first = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: { Authorization: "Bearer api-test-key" },
+    }), env);
+    assert.equal((await first.json()).status, "reauth_required");
+    assert.equal(store.peek().refresh_status, "reauth_required");
+
+    globalThis.fetch = googleAuthFetch({ appBody: '{"SNlM0e":"recovered-at"}' });
+    const recovered = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: { Authorization: "Bearer api-test-key" },
+    }), env);
+    const data = await recovered.json();
+    assert.equal(data.status, "no_rotation");
+    assert.equal(store.peek().refresh_status, "verified");
+    assert.equal(store.peek().refresh_error, null);
+    assert.equal(store.peek().xsrf_token, "recovered-at");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -818,28 +1005,198 @@ test("scheduled Cookie refresh persists rotations without loading the Gemini app
     assert.equal(store.peek().xsrf_token, "");
     assert.equal(store.peek().refreshed_at, null);
     assert.ok(store.peek().refresh_checked_at);
-    assert.equal(store.peek().refresh_status, "unverified");
+    assert.equal(store.peek().refresh_status, "refreshed");
 
+    const afterFirst = structuredClone(store.peek());
     globalThis.fetch = googleAuthFetch({ rotateStatus: 401 });
     const rejectedTasks = [];
     await worker.scheduled({}, env, { waitUntil(task) { rejectedTasks.push(task); } });
     await Promise.all(rejectedTasks);
-    assert.equal(store.peek().refresh_status, "unverified");
-    assert.equal(store.peek().refresh_error, "rotate_401");
+    assert.equal(store.peek().last_rotation_attempt_at, afterFirst.last_rotation_attempt_at);
+    assert.equal(store.peek().refresh_status, "refreshed");
+    assert.equal(store.peek().refresh_error, null);
 
-    // Rotation success does not prove that Gemini still accepts the login.
+    // A missing page token without an explicit signed-out marker is retryable.
     globalThis.fetch = googleAuthFetch({ appBody: "<html>Sign in</html>" });
-    const expired = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+    const inconclusive = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
       method: "POST",
       headers: { "X-Admin-Key": "api-test-key" },
     }), env);
-    assert.equal((await expired.json()).cookie.refresh_error, "missing_page_token");
-    const retryTasks = [];
-    await worker.scheduled({}, env, { waitUntil(task) { retryTasks.push(task); } });
-    await Promise.all(retryTasks);
-    assert.equal(store.peek().refresh_status, "reauth_required");
+    assert.equal((await inconclusive.json()).status, "retrying");
+    assert.equal(store.peek().refresh_status, "verified");
     assert.equal(store.peek().refresh_error, "missing_page_token");
     assert.equal(store.peek().refreshed_at, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("scheduled Cookie refresh reads Cloudflare getAll headers and persists consecutive rotations", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "X-Admin-Key": "api-test-key" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; __Secure-1PSID=session; __Secure-1PSIDTS=initial-ts" }),
+  }), env);
+  assert.equal(imported.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  internals.__setConnect(null);
+  try {
+    let now = Date.parse("2026-09-09T00:00:00.000Z");
+    Date.now = () => now;
+    const rotations = ["first-ts", "second-ts"];
+    globalThis.fetch = async (input) => {
+      assert.match(String(input), /\/RotateCookies$/);
+      const value = rotations.shift();
+      return {
+        status: 200,
+        ok: true,
+        headers: {
+          getAll(name) {
+            return name.toLowerCase() === "set-cookie"
+              ? [`__Secure-1PSIDTS=${value}; Path=/; Secure; HttpOnly`]
+              : [];
+          },
+          get() { return null; },
+        },
+        async text() { return `)]}'\n[["identity.hfcr",600]]`; },
+      };
+    };
+
+    for (const expected of ["first-ts", "second-ts"]) {
+      const tasks = [];
+      await worker.scheduled({}, env, { waitUntil(task) { tasks.push(task); } });
+      await Promise.all(tasks);
+      assert.match(store.peek().cookie, new RegExp(`__Secure-1PSIDTS=${expected}`));
+      assert.equal(store.peek().refresh_status, "refreshed");
+      assert.equal(store.peek().refresh_error, null);
+      now += 11 * 60 * 1000;
+    }
+    assert.equal(rotations.length, 0);
+  } finally {
+    Date.now = originalNow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("scheduled 2xx without PSIDTS keeps a verified session and runs the activity heartbeat", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; __Secure-1PSID=session; __Secure-1PSIDTS=current-ts" }),
+  }), env);
+
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  internals.__setConnect(null);
+  try {
+    let now = Date.parse("2026-09-09T00:00:00.000Z");
+    Date.now = () => now;
+    globalThis.fetch = googleAuthFetch({ appBody: '{"SNlM0e":"verified-at"}' });
+    await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST",
+      headers: { Authorization: "Bearer api-test-key" },
+    }), env);
+    const verifiedAt = store.peek().refreshed_at;
+    assert.equal(store.peek().refresh_status, "verified");
+
+    now += 11 * 60 * 1000;
+    let rotationCalls = 0;
+    let heartbeatCalls = 0;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("/RotateCookies")) {
+        rotationCalls += 1;
+        return new Response("ok", { status: 200 });
+      }
+      if (url.includes("rpcids=ESY5D")) {
+        heartbeatCalls += 1;
+        assert.match(String(init.body), /bard_activity_enabled/);
+        return new Response("ok", { status: 200 });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    };
+
+    const tasks = [];
+    await worker.scheduled({}, env, { waitUntil(task) { tasks.push(task); } });
+    await Promise.all(tasks);
+    assert.equal(rotationCalls, 1);
+    assert.equal(heartbeatCalls, 1);
+    assert.equal(store.peek().refresh_status, "verified");
+    assert.equal(store.peek().refresh_error, null);
+    assert.equal(store.peek().refreshed_at, verifiedAt);
+    assert.equal(store.peek().activity_status, "ok");
+    assert.equal(store.peek().rotation_status, "no_change");
+  } finally {
+    Date.now = originalNow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("signed-in API activity schedules a rate-limited heartbeat", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key",
+    COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false",
+    LOG_REQUESTS: "false",
+  };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: {
+      cookie: "SAPISID=sapi; __Secure-1PSID=session",
+      xsrf_token: "stored-at",
+    } }),
+  }), env);
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    let heartbeatCalls = 0;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("rpcids=ESY5D")) {
+        heartbeatCalls += 1;
+        assert.match(String(init.body), /bard_activity_enabled/);
+        return new Response("ok");
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    };
+    const tasks = [];
+    const response = await worker.fetch(new Request("https://worker.example/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer api-test-key", "Content-Type": "application/json" },
+      body: "not-json",
+    }), env, { waitUntil(task) { tasks.push(task); } });
+    await Promise.all(tasks);
+    assert.equal(response.status, 400);
+    assert.equal(heartbeatCalls, 1);
+    assert.equal(store.peek().activity_status, "ok");
+
+    const secondTasks = [];
+    await worker.fetch(new Request("https://worker.example/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer api-test-key", "Content-Type": "application/json" },
+      body: "not-json",
+    }), env, { waitUntil(task) { secondTasks.push(task); } });
+    await Promise.all(secondTasks);
+    assert.equal(heartbeatCalls, 1);
   } finally {
     globalThis.fetch = originalFetch;
   }

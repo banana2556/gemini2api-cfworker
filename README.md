@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.8-62b6ff"></a>
+  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.9-62b6ff"></a>
   <a href="https://workers.cloudflare.com/"><img alt="Cloudflare Workers" src="https://img.shields.io/badge/Cloudflare-Workers-f6821f?logo=cloudflareworkers&logoColor=white"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f6b95c"></a>
   <a href="https://github.com/banana2556"><img alt="Author banana2556" src="https://img.shields.io/badge/GitHub-%40banana2556-8b949e?logo=github"></a>
@@ -62,7 +62,7 @@ requests work without configuration through Gemini's guest auto-routing mode.
 - **Transparent routing metadata** through `upstream_model` / `upstreamModel`
   and `route_status` / `routeStatus`.
 - **Persistent Cookie storage** in a SQLite Durable Object, with an automatic
-  ten-minute refresh Cron Trigger.
+  one-minute maintenance Cron Trigger with an internal ten-minute rotation schedule.
 - **Cloudflare egress fallback** using raw TCP sockets when normal `fetch`
   traffic is rate-limited.
 - **Single-file runtime** with no application dependencies.
@@ -82,7 +82,7 @@ npx wrangler deploy
 ```
 
 The checked-in `wrangler.toml` provisions the `COOKIE_STORE` Durable Object
-and the ten-minute Cron Trigger. Pasting only `worker.js` into Cloudflare
+and the maintenance Cron Trigger. Pasting only `worker.js` into Cloudflare
 Quick Edit supports guest mode, but does not provision persistent Cookie
 storage or scheduled refresh.
 
@@ -254,7 +254,7 @@ flowchart LR
     client["OpenAI / Google AI client"] --> worker["Cloudflare Worker"]
     worker --> gemini["Gemini Web"]
     worker <--> store[("CookieStore Durable Object")]
-    cron["Cron · every 10 min"] --> worker
+    cron["Cron · every minute"] --> worker
 ```
 
 The Worker converts client messages and tools into Gemini Web payloads, streams
@@ -329,6 +329,9 @@ key is configured.
   status responses.
 - Imports are normalized to approved authentication and anti-abuse fields;
   unrelated preference, search, and billing fields are discarded.
+- Pasting a Cookie Sync JSON export preserves each Cookie's domain, path, and
+  expiry. A raw `Cookie:` header contains only names and values, so its exact
+  expiry cannot be recovered or displayed.
 - Page-token caches are isolated by a cryptographic Cookie fingerprint, so
   switching accounts cannot reuse the previous account's XSRF token.
 - Durable Object storage survives normal Worker deployments.
@@ -336,22 +339,30 @@ key is configured.
 <details>
 <summary><strong>Automatic refresh behavior</strong></summary>
 
-Every ten minutes, the Cron Trigger calls Google's `RotateCookies` endpoint,
-merges approved `Set-Cookie` rotations, and persists the result. It does not
-validate the Gemini page token: successful rotation checks are marked
-`unverified` and do not advance the last successful verification time.
-An existing `reauth_required` result is preserved. Opening the console reads
-stored results; use manual refresh to check the current login and page token.
+The Cron Trigger wakes every minute. Its persisted due time calls Google's
+`RotateCookies` endpoint about every ten minutes with ±15-second jitter,
+merges approved `Set-Cookie` values into a persistent domain/path/expiry aware
+Cookie jar, and sends the same lightweight activity RPC used by the reference
+client. A 60-second atomic cooldown prevents overlapping manual and scheduled
+rotation calls. Temporary rotation, network, or page-token failures keep the
+last verified Cookie and are retried; `reauth_required` is recorded only when
+Gemini provides an explicit signed-out signal.
 
 Manual refresh returns `refreshed`, `no_rotation`, or
-`reauth_required`. The Cookie details report `refresh_status: verified` with
-`refresh_error: session_not_rotated` when Gemini accepts the login but Google
-does not return a new `__Secure-1PSIDTS`. Rotation can extend a valid session but cannot recreate an
+`reauth_required`. The Cookie details report `refresh_status: verified` when
+Gemini accepts the login but Google does not
+return a new `__Secure-1PSIDTS`. Rotation can extend a valid session but cannot recreate an
 expired Google login. Re-import the Cookie when Google rejects the session,
 the Cookie is manually removed, or Durable Object storage is deleted.
 
-The ten-minute model catalog cache is separate from the ten-minute session
+The ten-minute model catalog cache is separate from the session
 refresh cadence.
+
+Recent Chromium versions can issue device-bound Google sessions. Those
+Cookies may remain valid for only a few hours and Google may refuse to renew
+them outside the original browser, even when `RotateCookies` returns `200`.
+For a service Cookie, the upstream reference project recommends exporting a
+fresh Firefox session and closing that browser session after export.
 
 </details>
 
