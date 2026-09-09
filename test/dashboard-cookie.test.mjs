@@ -653,7 +653,7 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     assert.equal(store.peek().refreshed_at, beforeExpired.refreshed_at);
     assert.ok(store.peek().refresh_checked_at);
     assert.equal(store.peek().refresh_status, "reauth_required");
-    assert.equal(store.peek().refresh_error, "signed_in_page");
+    assert.equal(store.peek().refresh_error, "sign_in_page");
   } finally {
     globalThis.fetch = originalFetch;
   }

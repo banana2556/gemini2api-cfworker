@@ -3739,7 +3739,7 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
     const reason = !response.ok
       ? `app_${response.status}${redirectSuffix}`
       : pageShowsSignIn(page.html)
-        ? "signed_in_page"
+        ? "sign_in_page"
         : !tokens.at
         ? "missing_page_token"
         : (rpcVerification?.error || "get_user_status_unverified");
