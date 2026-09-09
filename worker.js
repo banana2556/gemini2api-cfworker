@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.9";
+const VERSION = "1.9.10";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -113,11 +113,46 @@ function modelDisplayName(row) {
     .sort((a, b) => compareModelVersions(b, a) || (Number(/\d/.test(b)) - Number(/\d/.test(a))))[0] || "";
 }
 
+function extractRpcResults(raw, rpcId) {
+  const wanted = String(rpcId);
+  const parts = [];
+  const seen = new Set();
+  const visit = (value) => {
+    if (!Array.isArray(value)) return;
+    if (value[0] === "wrb.fr" && String(value[1] || "") === wanted) {
+      const key = JSON.stringify(value);
+      if (!seen.has(key)) { seen.add(key); parts.push(value); }
+    }
+    for (const child of value) visit(child);
+  };
+  const tryParse = (text) => {
+    try { visit(JSON.parse(text)); } catch (_) {}
+  };
+  const source = String(raw || "").trim();
+  if (source) tryParse(source);
+  // batchexecute may prefix each JSON frame with )]}', a byte count, or blank lines.
+  for (const line of source.split(/\r?\n/)) {
+    const candidate = line.trim();
+    if (!candidate || candidate === ")]}'" || /^\d+$/.test(candidate)) continue;
+    if (candidate.startsWith("[")) tryParse(candidate);
+  }
+  return parts.map((part) => {
+    const rejectCode = Array.isArray(part[5]) ? Number(part[5][0]) : null;
+    let payload = null;
+    let payloadError = null;
+    if (typeof part[2] === "string" && part[2]) {
+      try { payload = JSON.parse(part[2]); } catch (e) { payloadError = e; }
+    }
+    return { part, payload, payloadError, rejectCode };
+  });
+}
+
 function extractRpcPayload(raw, rpcId) {
-  const escapedId = String(rpcId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = new RegExp(`\\["wrb\\.fr","${escapedId}","((?:\\\\.|[^"\\\\])*)"`).exec(raw || "");
-  if (!match) throw new Error(`${rpcId} response payload not found`);
-  return JSON.parse(JSON.parse(`"${match[1]}"`));
+  const result = extractRpcResults(raw, rpcId)[0];
+  if (!result) throw new Error(`${rpcId} response payload not found`);
+  if (result.rejectCode === 7) throw new Error(`${rpcId} rejected: unauthenticated`);
+  if (result.payloadError || result.payload == null) throw new Error(`${rpcId} response payload invalid`);
+  return result.payload;
 }
 
 function extractRouteVariant(html, primaryId, candidates) {
@@ -1683,11 +1718,22 @@ async function verifySessionWithRpc(cfg, accessToken) {
   try {
     const { response, raw } = await executeBatchRpc(cfg, MODEL_STATUS_RPC, "[]", accessToken);
     if (!response.ok) return { valid: null, error: `get_user_status_${response.status}` };
-    const statusPayload = extractRpcPayload(raw, MODEL_STATUS_RPC);
-    if (statusPayload?.[14] === UNAUTHENTICATED_STATUS) {
-      return { valid: false, error: "get_user_status_unauthenticated" };
+    const result = extractRpcResults(raw, MODEL_STATUS_RPC)[0];
+    if (!result) return { valid: null, error: "get_user_status_payload_missing" };
+    if (result.rejectCode === 7) return { valid: false, error: "get_user_status_rejected" };
+    if (result.payloadError || !Array.isArray(result.payload)) {
+      return { valid: null, error: "get_user_status_payload_invalid" };
     }
-    return { valid: true, error: null, payload: statusPayload };
+    const statusCode = result.payload[14];
+    if (statusCode != null && Number(statusCode) !== 1000) {
+      return { valid: false, error: `get_user_status_${statusCode}` };
+    }
+    const rows = Array.isArray(result.payload[15]) ? result.payload[15] : [];
+    const categories = new Set(rows.filter(Array.isArray).map((row) => row[17]));
+    if (!MODEL_CATEGORIES.every((category) => categories.has(category))) {
+      return { valid: null, error: "get_user_status_models_missing", payload: result.payload };
+    }
+    return { valid: true, error: null, payload: result.payload };
   } catch (e) {
     return { valid: null, error: `get_user_status_unreadable:${String((e && e.message) || e)}` };
   }
@@ -1698,10 +1744,21 @@ async function syncGeminiActivity(cfg, discoverToken = true) {
   const accessToken = cfg.xsrf_token || (discoverToken ? (await getPageTokens(cfg)).at : "") || "";
   if (!accessToken) return { ok: false, skipped: "missing_page_token" };
   try {
-    const { response } = await executeBatchRpc(cfg, ACTIVITY_RPC, ACTIVITY_PAYLOAD, accessToken);
-    return response.ok
-      ? { ok: true, status: response.status }
-      : { ok: false, status: response.status, error: `activity_http_${response.status}` };
+    const { response, raw } = await executeBatchRpc(cfg, ACTIVITY_RPC, ACTIVITY_PAYLOAD, accessToken);
+    if (!response.ok) return { ok: false, status: response.status, error: `activity_http_${response.status}` };
+    const result = extractRpcResults(raw, ACTIVITY_RPC)[0];
+    // A few Google edge responses are empty/plain acknowledgements. They are
+    // acceptable only when there is no structured rejection; structured RPC
+    // errors (including code 7) are always handled above.
+    if (!result) {
+      const plainAck = String(raw || "").trim();
+      return plainAck === "ok" || plainAck === ""
+        ? { ok: true, status: response.status }
+        : { ok: false, status: response.status, error: "activity_payload_missing" };
+    }
+    if (result.rejectCode === 7) return { ok: false, status: response.status, error: "activity_unauthenticated" };
+    if (result.payloadError) return { ok: false, status: response.status, error: "activity_payload_invalid" };
+    return { ok: true, status: response.status };
   } catch (e) {
     return { ok: false, error: `activity_network:${String((e && e.message) || e)}` };
   }
@@ -1711,6 +1768,22 @@ async function runScheduledActivity(cfg, env) {
   const claim = await claimStoredMaintenance(env, cfg, "activity", true);
   if (!claim.claimed) return { status: claim.reason || "skipped" };
   const activeCfg = claim.cfg;
+  const verification = activeCfg.xsrf_token
+    ? await verifySessionWithRpc(activeCfg, activeCfg.xsrf_token)
+    : { valid: null, error: "missing_page_token" };
+  if (verification.valid === false) {
+    const now = new Date(Date.now()).toISOString();
+    const record = storedAuthRecord(activeCfg, {
+      refresh_checked_at: now,
+      refresh_status: "reauth_required",
+      refresh_error: verification.error || "get_user_status_unauthenticated",
+      last_activity_attempt_at: now,
+      activity_status: "reauth_required",
+      activity_error: verification.error || "get_user_status_unauthenticated",
+    });
+    await writeStoredAuth(env, record, claim.session_key || null, activeCfg.cookie_updated_at || null);
+    return { status: "reauth_required", verification };
+  }
   const result = await syncGeminiActivity(activeCfg, false);
   const now = new Date(Date.now()).toISOString();
   const record = storedAuthRecord(activeCfg, {
@@ -1816,7 +1889,6 @@ async function getModelCatalog(cfg, force = false) {
       log(cfg, `model catalog refresh failed; falling back to guest catalog: ${reason}`);
       const guestCfg = switchToGuest({ ...cfg }, reason);
       const models = await getModelCatalog(guestCfg, force);
-      switchToGuest(cfg, reason);
       return models;
     }
     if (stale) {
@@ -3461,16 +3533,13 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
   };
   const persistPageIssue = async (reason, hardFailure = false) => {
     const checkedAt = new Date(Date.now()).toISOString();
-    const existing = activeCfg.cookie_refresh_status;
-    const usableStatus = ["verified", "refreshed", "rotation_ok"].includes(existing)
-      ? (existing === "refreshed" ? "verified" : existing)
-      : "retrying";
+    const usableStatus = hardFailure ? "reauth_required" : "retrying";
     const record = storedAuthRecord(activeCfg, {
       cookie,
       cookie_jar: cookieJar,
       updated_at: activeCfg.cookie_updated_at || checkedAt,
       refresh_checked_at: checkedAt,
-      refresh_status: hardFailure ? "reauth_required" : usableStatus,
+      refresh_status: usableStatus,
       refresh_error: reason,
     });
     record.session_key = await cookieSessionKey({ ...applyStoredAuth(activeCfg, record), session_key: null });
@@ -3650,14 +3719,30 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
   }
 
   let rpcVerification = null;
-  if (response.ok && !tokens.at && activeCfg.xsrf_token) {
-    rpcVerification = await verifySessionWithRpc({ ...pageCfg, cookie, cookie_jar: page.cookieJar || cookieJar }, activeCfg.xsrf_token);
+  if (response.ok && tokens.at) {
+    // A page token can still be issued to a signed-out shell.  Always verify
+    // GetUserStatus before recording the Cookie as authenticated.
+    rpcVerification = await verifySessionWithRpc(
+      { ...pageCfg, cookie, cookie_jar: page.cookieJar || cookieJar },
+      tokens.at,
+    );
+  } else if (response.ok && activeCfg.xsrf_token) {
+    rpcVerification = await verifySessionWithRpc(
+      { ...pageCfg, cookie, cookie_jar: page.cookieJar || cookieJar },
+      activeCfg.xsrf_token,
+    );
     if (rpcVerification.valid) tokens.at = activeCfg.xsrf_token;
   }
 
-  if (!response.ok || !tokens.at) {
+  if (!response.ok || !tokens.at || rpcVerification?.valid !== true || pageShowsSignIn(page.html)) {
     const redirectSuffix = page.redirect_host ? `_to_${page.redirect_host}` : "";
-    const reason = !response.ok ? `app_${response.status}${redirectSuffix}` : "missing_page_token";
+    const reason = !response.ok
+      ? `app_${response.status}${redirectSuffix}`
+      : pageShowsSignIn(page.html)
+        ? "signed_in_page"
+        : !tokens.at
+        ? "missing_page_token"
+        : (rpcVerification?.error || "get_user_status_unverified");
     const hardFailure = rpcVerification?.valid === false
       || pageShowsSignIn(page.html)
       || ([401, 403].includes(response.status) && rotation.result?.status === 401);

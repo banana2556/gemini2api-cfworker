@@ -20,6 +20,12 @@ function googleAuthFetch({
       for (const cookie of rotateCookies) headers.append("Set-Cookie", cookie);
       return new Response(`)]}'\n[["identity.hfcr",600]]`, { status: rotateStatus, headers });
     }
+    if (url.includes("rpcids=otAQ7b")) {
+      return new Response(modelStatusRaw(), { headers: { "Content-Type": "application/json" } });
+    }
+    if (url.includes("rpcids=ESY5D")) {
+      return new Response(JSON.stringify([["wrb.fr", "ESY5D", "[]", null, null]]), { headers: { "Content-Type": "application/json" } });
+    }
     const headers = new Headers({ "Content-Type": "text/html" });
     if (appRedirectLocation && url.includes("/u/0/app")) {
       headers.set("Location", appRedirectLocation);
@@ -49,6 +55,10 @@ function modelStatusRaw(statusCode = null) {
     statusRow("9d8ca3786ebdfbea", "3.1 Pro", 3, "e6fa609c3fa255c0"),
   ];
   return JSON.stringify([["wrb.fr", "otAQ7b", JSON.stringify(payload), null, null]]);
+}
+
+function modelStatusRejectionRaw(code = 7) {
+  return JSON.stringify([["wrb.fr", "otAQ7b", null, null, null, [code]]]);
 }
 
 const modelAppHtml = [
@@ -272,6 +282,65 @@ test("model catalog rejects an unauthenticated GetUserStatus response", async ()
   }
 });
 
+test("Cookie refresh rejects an HTTP 200 GetUserStatus RPC rejection", async () => {
+  const store = memoryCookieStore();
+  const env = { API_KEYS: "api-test-key", COOKIE_STORE: store, UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false" };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; __Secure-1PSID=session" }),
+  }), env);
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async (input) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("/RotateCookies")) return new Response("ok", { status: 200 });
+      if (url.includes("/app")) return new Response('{"SNlM0e":"fresh-at","cfb2h":"boq_assistant-bard-web-server_test"}');
+      if (url.includes("rpcids=otAQ7b")) return new Response(modelStatusRejectionRaw());
+      throw new Error(`unexpected fetch ${url}`);
+    };
+    const response = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST", headers: { Authorization: "Bearer api-test-key" },
+    }), env);
+    const data = await response.json();
+    assert.equal(data.status, "reauth_required");
+    assert.equal(store.peek().refresh_error, "get_user_status_rejected");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("HTTP 200 GetUserStatus without a payload stays retryable and keeps Cookie configured", async () => {
+  const store = memoryCookieStore();
+  const env = { API_KEYS: "api-test-key", COOKIE_STORE: store, UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false" };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer api-test-key" },
+    body: JSON.stringify({ auth: "SAPISID=sapi; __Secure-1PSID=session" }),
+  }), env);
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    globalThis.fetch = async (input) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("/RotateCookies")) return new Response("ok", { status: 200 });
+      if (url.includes("/app")) return new Response('{"SNlM0e":"fresh-at","cfb2h":"boq_assistant-bard-web-server_test"}');
+      if (url.includes("rpcids=otAQ7b")) return new Response(JSON.stringify([["wrb.fr", "otAQ7b", null, null, null]]));
+      throw new Error(`unexpected fetch ${url}`);
+    };
+    const response = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST", headers: { Authorization: "Bearer api-test-key" },
+    }), env);
+    const data = await response.json();
+    assert.equal(data.status, "retrying");
+    assert.equal(data.cookie.configured, true);
+    assert.equal(store.peek().refresh_status, "retrying");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("authenticated generation falls back to guest when upstream returns no content", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -311,7 +380,7 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   assert.equal((await root.json()).status, "ok");
   const healthJson = await health.json();
   assert.equal(healthJson.status, "ok");
-  assert.equal(healthJson.version, "1.9.9");
+  assert.equal(healthJson.version, "1.9.10");
 });
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
@@ -584,7 +653,7 @@ test("authenticated Cookie refresh persists rotations without exposing values an
     assert.equal(store.peek().refreshed_at, beforeExpired.refreshed_at);
     assert.ok(store.peek().refresh_checked_at);
     assert.equal(store.peek().refresh_status, "reauth_required");
-    assert.equal(store.peek().refresh_error, "missing_page_token");
+    assert.equal(store.peek().refresh_error, "signed_in_page");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -650,6 +719,8 @@ test("overlapping manual refreshes send only one RotateCookies request", async (
     let rotateCalls = 0;
     globalThis.fetch = async (input) => {
       const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("rpcids=otAQ7b")) return new Response(modelStatusRaw());
+      if (url.includes("rpcids=ESY5D")) return new Response("ok");
       if (url.includes("/RotateCookies")) {
         rotateCalls += 1;
         await new Promise((resolve) => setTimeout(resolve, 15));
@@ -737,6 +808,7 @@ test("Cookie refresh recovers the XSRF token from an authenticated upstream erro
   try {
     globalThis.fetch = async (input) => {
       const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("rpcids=otAQ7b")) return new Response(modelStatusRaw());
       if (url.includes("/RotateCookies")) {
         return new Response(")]}'\n[[\"identity.hfcr\",600]]", { status: 200 });
       }
@@ -825,6 +897,8 @@ test("Cookie refresh follows Google account redirects back to Gemini", async () 
     let sentToAccounts = false;
     globalThis.fetch = async (input) => {
       const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("rpcids=otAQ7b")) return new Response(modelStatusRaw());
+      if (url.includes("rpcids=ESY5D")) return new Response("ok");
       if (url.includes("/RotateCookies")) {
         return new Response(`)]}'\n[["identity.hfcr",600]]`, { status: 200 });
       }
@@ -881,6 +955,8 @@ test("Cookie refresh detects auth_user when raw Cookie targets a numbered accoun
   try {
     globalThis.fetch = async (input) => {
       const url = String(typeof input === "string" ? input : input.url);
+      if (url.includes("rpcids=otAQ7b")) return new Response(modelStatusRaw());
+      if (url.includes("rpcids=ESY5D")) return new Response("ok");
       if (url.includes("/RotateCookies")) {
         return new Response(`)]}'\n[["identity.hfcr",600]]`, { status: 200 });
       }
@@ -933,6 +1009,8 @@ test("Cookie refresh accepts Google abuse exemption redirects", async () => {
     globalThis.fetch = async (input, init = {}) => {
       const url = String(typeof input === "string" ? input : input.url);
       const cookie = init.headers instanceof Headers ? init.headers.get("Cookie") : init.headers?.Cookie;
+      if (url.includes("rpcids=otAQ7b")) return new Response(modelStatusRaw());
+      if (url.includes("rpcids=ESY5D")) return new Response("ok");
       if (url.includes("/RotateCookies")) {
         return new Response(`)]}'\n[["identity.hfcr",600]]`, { status: 200 });
       }
@@ -1023,7 +1101,7 @@ test("scheduled Cookie refresh persists rotations without loading the Gemini app
       headers: { "X-Admin-Key": "api-test-key" },
     }), env);
     assert.equal((await inconclusive.json()).status, "retrying");
-    assert.equal(store.peek().refresh_status, "verified");
+    assert.equal(store.peek().refresh_status, "retrying");
     assert.equal(store.peek().refresh_error, "missing_page_token");
     assert.equal(store.peek().refreshed_at, null);
   } finally {
