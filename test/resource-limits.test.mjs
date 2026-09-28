@@ -48,6 +48,44 @@ test('socket reports truncated chunks instead of accepting partial responses', a
   assert.ok(source.closed);
 });
 
+test('socket accepts large Google-style response headers split across packets', async () => {
+  const csp = "script-src " + 'a'.repeat(20 * 1024);
+  const wire = `HTTP/1.1 200 OK\r\nContent-Security-Policy: ${csp}\r\nContent-Length: 2\r\n\r\nOK`;
+  const source = socketSource(wire.match(/[\s\S]{1,1024}/g));
+  const response = await api.socketHttp(source.connect, 'https://example.test', { timeoutMs: 0 });
+  assert.equal(response.headers.get('content-security-policy'), csp);
+  assert.equal(await response.text(), 'OK');
+  assert.ok(source.closed);
+});
+
+test('socket permits the header budget boundary and rejects aggregate overflow', async () => {
+  const prefix = 'HTTP/1.1 200 OK\r\nX-Large: ';
+  const suffix = '\r\nContent-Length: 0\r\n\r\n';
+  const size = 65536 - enc.encode(prefix + suffix).length;
+  const source = socketSource([prefix + 'a'.repeat(size) + suffix]);
+  const response = await api.socketHttp(source.connect, 'https://example.test', { timeoutMs: 0 });
+  assert.equal(await response.text(), '');
+  assert.ok(source.closed);
+
+  // Each header is short, but their combined size exceeds the total budget.
+  const oversized = socketSource(['HTTP/1.1 200 OK\r\n' + ('X-Pad: ' + 'a'.repeat(1024) + '\r\n').repeat(65) + '\r\n']);
+  await assert.rejects(api.socketHttp(oversized.connect, 'https://example.test', { timeoutMs: 0 }),
+    e => e.code === 'resource_limit' && /response headers/.test(e.message));
+  assert.ok(oversized.closed);
+});
+
+test('long trailers share a bounded header budget while chunk-size lines remain small', async () => {
+  const source = socketSource(['HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\nX-Trailer: ' + 'a'.repeat(12 * 1024) + '\r\n\r\n']);
+  const response = await api.socketHttp(source.connect, 'https://example.test', { timeoutMs: 0 });
+  assert.equal(await response.text(), 'x');
+  assert.ok(source.closed);
+
+  const badChunk = socketSource(['HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;' + 'x'.repeat(8192) + '\r\nx\r\n0\r\n\r\n']);
+  const rejected = await api.socketHttp(badChunk.connect, 'https://example.test', { timeoutMs: 0 });
+  await assert.rejects(rejected.text(), e => e.code === 'resource_limit' && /8192/.test(e.message));
+  assert.ok(badChunk.closed);
+});
+
 test('non-stream generation consumes body frames without response.text()', async t => {
   api.__setConnect(null);
   const text = '你好 🌍 cumulative answer';

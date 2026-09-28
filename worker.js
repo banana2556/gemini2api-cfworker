@@ -1455,7 +1455,8 @@ async function socketHttp(connect, url, { method = "GET", headers = {}, body, ti
       return true;
     };
     // Only HTTP framing lines are assembled. Body bytes are never concatenated.
-    const readLine = async () => {
+    let lastLineBytes = 0;
+    const readLine = async (limit = 8192, overflow = "socket: HTTP framing line exceeds 8192 bytes") => {
       const pieces = [];
       let length = 0;
       for (;;) {
@@ -1463,12 +1464,13 @@ async function socketHttp(connect, url, { method = "GET", headers = {}, body, ti
         const lf = pending.indexOf(10);
         const end = lf < 0 ? pending.length : lf + 1;
         length += end;
-        if (length > 8192) throw resourceLimit("socket: HTTP line exceeds 8192 bytes");
+        if (length > limit) throw resourceLimit(overflow);
         pieces.push(decoder.decode(pending.subarray(0, end)));
         pending = pending.subarray(end);
         if (lf >= 0) {
           const line = pieces.join("");
           if (!line.endsWith("\r\n")) throw new Error("socket: invalid HTTP framing");
+          lastLineBytes = length;
           return line.slice(0, -2);
         }
       }
@@ -1478,11 +1480,12 @@ async function socketHttp(connect, url, { method = "GET", headers = {}, body, ti
     if (!match) throw new Error("socket: invalid HTTP status");
     const status = Number(match[1]);
     const respHeaders = new Headers();
-    let headerBytes = statusLine.length + 2;
+    let headerBytes = lastLineBytes;
     for (;;) {
-      const line = await readLine();
-      headerBytes += line.length + 2;
-      if (headerBytes > 65536) throw resourceLimit("socket: response headers exceed 64 KiB");
+      // Google's CSP header alone can exceed 8 KiB. Bound the entire header
+      // section instead; retain the smaller limit for status/chunk framing.
+      const line = await readLine(65536 - headerBytes, "socket: response headers exceed 64 KiB");
+      headerBytes += lastLineBytes;
       if (!line) break;
       const colon = line.indexOf(":");
       if (colon > 0) respHeaders.append(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
@@ -1506,9 +1509,8 @@ async function socketHttp(connect, url, { method = "GET", headers = {}, body, ti
             if (!remaining) {
               let trailerBytes = 0;
               for (;;) {
-                const trailer = await readLine();
-                trailerBytes += trailer.length + 2;
-                if (trailerBytes > 65536) throw resourceLimit("socket: trailers exceed 64 KiB");
+                const trailer = await readLine(65536 - trailerBytes, "socket: trailers exceed 64 KiB");
+                trailerBytes += lastLineBytes;
                 if (!trailer) return;
               }
             }
