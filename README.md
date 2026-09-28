@@ -378,7 +378,44 @@ fresh Firefox session and closing that browser session after export.
 | Cookie refresh reports `reauth_required` | Export a fresh Cookie from a signed-in Gemini browser session |
 
 `GEMINI_BL` is discovered from Gemini's app page and cached for one hour per
-origin. The configured value is only a fallback.
+origin during upstream operations. The configured value is the fallback.
+`/health` reports the in-memory build when available, otherwise that fallback;
+it does not fetch Gemini or verify upstream connectivity.
+
+### Worker CPU or memory limit errors
+
+Workers Free allows 10 ms of CPU per HTTP request. Network waiting does not
+consume that budget, but HTTP framing, JSON parsing, image decoding and payload
+encoding do. Each isolate has 128 MB of memory shared by its concurrent requests.
+Increasing `REQUEST_TIMEOUT_SEC` does not raise either limit. See
+[Cloudflare's resource limits](https://developers.cloudflare.com/workers/platform/limits/).
+
+The Worker consumes generation responses incrementally, parses each frame once,
+and applies backpressure to Socket and SSE streams. Non-streaming requests and
+tool calls keep the final text instead of the complete upstream wire history.
+Chat/Google requests with no tools (including an empty tools array) stream text
+as it arrives. Tool-call and Responses API SSE events still wait for the final
+result. Client cancellation of an active text stream cancels upstream reading,
+including page discovery. Cookie activity maintenance runs through the configured
+Cron Trigger rather than being attached to each chat request.
+
+The following ceilings prevent unbounded buffering:
+
+| Input | Ceiling |
+|---|---|
+| Generation API request body | 8 MiB, including JSON and Base64 images |
+| One decoded image | 20 MiB; inline images also share the request-body ceiling |
+| Buffered discovery / metadata response | 16 MiB |
+| Total upstream generation data | 32 MiB |
+| One upstream protocol line | 2,097,152 JavaScript string code units |
+
+Oversized request bodies or images return `413`. Upstream resource ceilings stop
+the request without retrying or switching to guest mode; non-streaming generation
+returns `502`, while an already-open chat stream reports an upstream error.
+These safeguards reduce resource use but do not guarantee every conversation
+fits the Free plan's CPU budget. If the platform still terminates a request,
+check its invocation outcome for `exceededCpu` or `exceededMemory` and compare
+short text requests with the failing workload.
 
 ## Development
 

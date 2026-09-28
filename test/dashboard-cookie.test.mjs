@@ -1226,7 +1226,7 @@ test("scheduled 2xx without PSIDTS keeps a verified session and runs the activit
   }
 });
 
-test("signed-in API activity schedules a rate-limited heartbeat", async () => {
+test("signed-in API leaves activity maintenance to Cron instead of the chat CPU budget", async () => {
   const store = memoryCookieStore();
   const env = {
     API_KEYS: "api-test-key",
@@ -1264,8 +1264,8 @@ test("signed-in API activity schedules a rate-limited heartbeat", async () => {
     }), env, { waitUntil(task) { tasks.push(task); } });
     await Promise.all(tasks);
     assert.equal(response.status, 400);
-    assert.equal(heartbeatCalls, 1);
-    assert.equal(store.peek().activity_status, "ok");
+    assert.equal(heartbeatCalls, 0);
+    assert.equal(tasks.length, 0);
 
     const secondTasks = [];
     await worker.fetch(new Request("https://worker.example/v1/chat/completions", {
@@ -1274,7 +1274,8 @@ test("signed-in API activity schedules a rate-limited heartbeat", async () => {
       body: "not-json",
     }), env, { waitUntil(task) { secondTasks.push(task); } });
     await Promise.all(secondTasks);
-    assert.equal(heartbeatCalls, 1);
+    assert.equal(heartbeatCalls, 0);
+    assert.equal(secondTasks.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }

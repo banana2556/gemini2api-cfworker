@@ -1196,6 +1196,61 @@ function tokenEst(s) {
 }
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+const MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+const MAX_GENERATION_BYTES = 32 * 1024 * 1024;
+const MAX_FRAME_CHARS = 2 * 1024 * 1024;
+
+function resourceLimit(message, status = 502) {
+  return Object.assign(new Error(message), { code: "resource_limit", status });
+}
+
+// Check while reading, including when Content-Length is absent or inaccurate.
+async function* readLimitedChunks(response, limit, status = 502, signal) {
+  if (Number(response.headers.get("content-length")) > limit) {
+    try { await response.body?.cancel(); } catch (_) {}
+    throw resourceLimit(`body exceeds ${limit} bytes`, status);
+  }
+  if (!response.body) { signal?.throwIfAborted(); return; }
+  const reader = response.body.getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  let total = 0;
+  try {
+    for (;;) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) throw resourceLimit(`body exceeds ${limit} bytes`, status);
+      yield value;
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    try { await reader.cancel(); } catch (_) {}
+    reader.releaseLock();
+  }
+}
+
+async function readLimitedBytes(response, limit, status = 502) {
+  const chunks = [];
+  let total = 0;
+  for await (const bytes of readLimitedChunks(response, limit, status)) { chunks.push(bytes); total += bytes.length; }
+  if (chunks.length === 1) return chunks[0];
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; }
+  return result;
+}
+
+async function readLimitedText(response, limit = MAX_BUFFERED_BYTES, status = 502, signal) {
+  const decoder = new TextDecoder();
+  const parts = [];
+  for await (const bytes of readLimitedChunks(response, limit, status, signal)) parts.push(decoder.decode(bytes, { stream: true }));
+  parts.push(decoder.decode());
+  return parts.join("");
+}
 
 function timingSafeEqual(a, b) {
   const enc = new TextEncoder();
@@ -1346,140 +1401,169 @@ async function resolveConnect() {
 // 测试注入(Node 用 tls 模拟 connect();传 null 可强制走 fetch)。
 function __setConnect(fn) { _connect = fn === undefined ? null : fn; }
 
-function _concatBytes(a, b) {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a, 0);
-  out.set(b, a.length);
-  return out;
-}
-function _findCRLF(buf, from) {
-  for (let i = from; i + 1 < buf.length; i++) if (buf[i] === 13 && buf[i + 1] === 10) return i;
-  return -1;
-}
-function _findDoubleCRLF(buf) {
-  for (let i = 0; i + 3 < buf.length; i++) {
-    if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) return i;
-  }
-  return -1;
-}
-
 // 用裸 socket 发一个 HTTP/1.1 请求,返回类 Response 对象:{status, ok, headers, body, text()}。
 // body 是已解码(去 chunked、identity 编码)的 ReadableStream<Uint8Array>,支持流式。
-async function socketHttp(connect, url, { method = "GET", headers = {}, body, timeoutMs = 180000 } = {}) {
+async function socketHttp(connect, url, { method = "GET", headers = {}, body, timeoutMs = 180000, signal } = {}) {
+  signal?.throwIfAborted();
   const u = new URL(url);
   const secure = u.protocol !== "http:";
-  const port = u.port ? Number(u.port) : (secure ? 443 : 80);
-  const socket = connect({ hostname: u.hostname, port }, { secureTransport: secure ? "on" : "off", allowHalfOpen: false });
-
-  let timer = null;
-  if (timeoutMs) timer = setTimeout(() => { try { socket.close(); } catch (_) {} }, timeoutMs);
-
-  const enc = new TextEncoder();
-  const bodyBytes = body == null ? null : (typeof body === "string" ? enc.encode(body) : new Uint8Array(body));
-  // 自管 Host/Connection/Accept-Encoding(identity 避免 gzip)/Content-Length
-  const reqHeaders = { Host: u.hostname, "Accept-Encoding": "identity", Connection: "close" };
-  for (const [k, v] of Object.entries(headers)) {
-    if (/^(host|connection|accept-encoding|content-length)$/i.test(k)) continue;
-    reqHeaders[k] = v;
-  }
-  if (bodyBytes) reqHeaders["Content-Length"] = String(bodyBytes.length);
-  let head = `${method} ${u.pathname}${u.search} HTTP/1.1\r\n`;
-  for (const [k, v] of Object.entries(reqHeaders)) head += `${k}: ${v}\r\n`;
-  head += "\r\n";
-
-  const writer = socket.writable.getWriter();
-  await writer.write(enc.encode(head));
-  if (bodyBytes) await writer.write(bodyBytes);
-  try { writer.releaseLock(); } catch (_) {}
-
-  const reader = socket.readable.getReader();
-  let buf = new Uint8Array(0);
-  let he = -1;
-  while (he < 0) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf = _concatBytes(buf, value);
-    he = _findDoubleCRLF(buf);
-  }
-  if (he < 0) { if (timer) clearTimeout(timer); throw new Error("socket: incomplete HTTP response headers"); }
-  const headerText = new TextDecoder().decode(buf.slice(0, he));
-  let pending = buf.slice(he + 4);
-  const hlines = headerText.split("\r\n");
-  const status = parseInt((hlines[0] || "").split(" ")[1], 10) || 0;
-  const respHeaders = new Headers();
-  for (let i = 1; i < hlines.length; i++) {
-    const c = hlines[i].indexOf(":");
-    if (c > 0) { try { respHeaders.append(hlines[i].slice(0, c).trim(), hlines[i].slice(c + 1).trim()); } catch (_) {} }
-  }
-  const chunked = /chunked/i.test(respHeaders.get("transfer-encoding") || "");
-  const clen = respHeaders.has("content-length") ? parseInt(respHeaders.get("content-length"), 10) : null;
-
-  const stream = new ReadableStream({
-    async start(controller) {
-      const pull = async () => {
-        const { done, value } = await reader.read();
-        if (done) return false;
-        pending = _concatBytes(pending, value);
-        return true;
-      };
-      try {
-        if (chunked) {
-          for (;;) {
-            let nl = _findCRLF(pending, 0);
-            while (nl < 0) { if (!(await pull())) { controller.close(); return; } nl = _findCRLF(pending, 0); }
-            const size = parseInt(new TextDecoder().decode(pending.slice(0, nl)).trim().split(";")[0], 16);
-            pending = pending.slice(nl + 2);
-            if (!size || Number.isNaN(size)) { controller.close(); return; } // 末块 0
-            while (pending.length < size + 2) { if (!(await pull())) break; }
-            controller.enqueue(pending.slice(0, size));
-            pending = pending.slice(size + 2); // 跳过块尾 \r\n
-          }
-        } else if (clen != null) {
-          let got = 0;
-          if (pending.length) { const t = pending.slice(0, clen); controller.enqueue(t); got += t.length; pending = pending.slice(t.length); }
-          while (got < clen) { const { done, value } = await reader.read(); if (done) break; const need = clen - got; const t = value.length > need ? value.slice(0, need) : value; controller.enqueue(t); got += t.length; }
-          controller.close();
-        } else {
-          if (pending.length) controller.enqueue(pending);
-          for (;;) { const { done, value } = await reader.read(); if (done) break; controller.enqueue(value); }
-          controller.close();
-        }
-      } catch (e) {
-        controller.error(e);
-      } finally {
-        if (timer) clearTimeout(timer);
-        try { reader.releaseLock(); } catch (_) {}
-        try { socket.close(); } catch (_) {}
-      }
-    },
-    cancel() { if (timer) clearTimeout(timer); try { socket.close(); } catch (_) {} },
+  const socket = connect({ hostname: u.hostname, port: u.port ? Number(u.port) : (secure ? 443 : 80) }, {
+    secureTransport: secure ? "on" : "off", allowHalfOpen: false,
   });
-
-  const res = { status, ok: status >= 200 && status < 300, headers: respHeaders, body: stream };
-  res.text = async () => {
-    const r = stream.getReader();
-    const chunks = []; let total = 0;
-    for (;;) { const { done, value } = await r.read(); if (done) break; chunks.push(value); total += value.length; }
-    const merged = new Uint8Array(total); let off = 0;
-    for (const c of chunks) { merged.set(c, off); off += c.length; }
-    return new TextDecoder().decode(merged);
+  let reader, timer, closed = false, failure;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    if (reader) void reader.cancel().catch(() => {});
+    try { Promise.resolve(socket.close()).catch(() => {}); } catch (_) {}
   };
-  return res;
+  const abort = () => { failure = signal.reason || new Error("socket: aborted"); cleanup(); };
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  if (timeoutMs) timer = setTimeout(() => { failure = new Error("socket: timed out"); cleanup(); }, timeoutMs);
+  try {
+    const enc = new TextEncoder();
+    const decoder = new TextDecoder();
+    // Reuse binary upload buffers instead of copying every image.
+    const bodyBytes = body == null ? null : typeof body === "string" ? enc.encode(body)
+      : body instanceof Uint8Array ? body : new Uint8Array(body);
+    const reqHeaders = { Host: u.host, "Accept-Encoding": "identity", Connection: "close" };
+    for (const [k, v] of Object.entries(headers)) {
+      if (!/^(host|connection|accept-encoding|content-length)$/i.test(k)) reqHeaders[k] = v;
+    }
+    if (bodyBytes) reqHeaders["Content-Length"] = String(bodyBytes.length);
+    let head = `${method} ${u.pathname}${u.search} HTTP/1.1\r\n`;
+    for (const [k, v] of Object.entries(reqHeaders)) head += `${k}: ${v}\r\n`;
+    const writer = socket.writable.getWriter();
+    try {
+      await writer.write(enc.encode(head + "\r\n"));
+      if (bodyBytes) await writer.write(bodyBytes);
+    } finally { writer.releaseLock(); }
+    if (failure) throw failure;
+    reader = socket.readable.getReader();
+    let pending = new Uint8Array(0);
+    const fill = async () => {
+      while (!pending.length) {
+        if (failure) throw failure;
+        const { done, value } = await reader.read();
+        if (failure) throw failure;
+        if (done) return false;
+        pending = value;
+      }
+      return true;
+    };
+    // Only HTTP framing lines are assembled. Body bytes are never concatenated.
+    const readLine = async () => {
+      const pieces = [];
+      let length = 0;
+      for (;;) {
+        if (!(await fill())) throw new Error("socket: incomplete HTTP framing");
+        const lf = pending.indexOf(10);
+        const end = lf < 0 ? pending.length : lf + 1;
+        length += end;
+        if (length > 8192) throw resourceLimit("socket: HTTP line exceeds 8192 bytes");
+        pieces.push(decoder.decode(pending.subarray(0, end)));
+        pending = pending.subarray(end);
+        if (lf >= 0) {
+          const line = pieces.join("");
+          if (!line.endsWith("\r\n")) throw new Error("socket: invalid HTTP framing");
+          return line.slice(0, -2);
+        }
+      }
+    };
+    const statusLine = await readLine();
+    const match = /^HTTP\/1\.[01] (\d{3})\b/.exec(statusLine);
+    if (!match) throw new Error("socket: invalid HTTP status");
+    const status = Number(match[1]);
+    const respHeaders = new Headers();
+    let headerBytes = statusLine.length + 2;
+    for (;;) {
+      const line = await readLine();
+      headerBytes += line.length + 2;
+      if (headerBytes > 65536) throw resourceLimit("socket: response headers exceed 64 KiB");
+      if (!line) break;
+      const colon = line.indexOf(":");
+      if (colon > 0) respHeaders.append(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
+    }
+    const chunked = /chunked/i.test(respHeaders.get("transfer-encoding") || "");
+    const lengthHeader = respHeaders.get("content-length");
+    const contentLength = lengthHeader == null ? null : Number(lengthHeader);
+    if (contentLength !== null && (!Number.isSafeInteger(contentLength) || contentLength < 0)) {
+      throw new Error("socket: invalid content length");
+    }
+    async function* bodyChunks() {
+      try {
+        if (method === "HEAD" || status === 204 || status === 304) return;
+        let remaining = chunked ? 0 : contentLength;
+        for (;;) {
+          if (chunked && remaining === 0) {
+            const sizeText = (await readLine()).split(";", 1)[0];
+            if (!/^[0-9a-f]+$/i.test(sizeText)) throw new Error("socket: invalid chunk size");
+            remaining = Number.parseInt(sizeText, 16);
+            if (!Number.isSafeInteger(remaining)) throw new Error("socket: invalid chunk size");
+            if (!remaining) {
+              let trailerBytes = 0;
+              for (;;) {
+                const trailer = await readLine();
+                trailerBytes += trailer.length + 2;
+                if (trailerBytes > 65536) throw resourceLimit("socket: trailers exceed 64 KiB");
+                if (!trailer) return;
+              }
+            }
+          }
+          if (remaining === 0) return;
+          if (!(await fill())) {
+            if (remaining === null) return;
+            throw new Error("socket: truncated HTTP body");
+          }
+          const count = remaining === null ? pending.length : Math.min(remaining, pending.length);
+          const bytes = pending.subarray(0, count);
+          pending = pending.subarray(count);
+          if (remaining !== null) remaining -= count;
+          yield bytes;
+          if (chunked && remaining === 0 && await readLine() !== "") {
+            throw new Error("socket: invalid chunk terminator");
+          }
+        }
+      } finally { cleanup(); }
+    }
+    const iterator = bodyChunks();
+    const stream = new ReadableStream({
+      async pull(controller) {
+        try {
+          const { done, value } = await iterator.next();
+          if (done) controller.close();
+          else controller.enqueue(value);
+        } catch (e) { controller.error(e); }
+      },
+      async cancel() {
+        // Cancel pending reads before returning the iterator (which may be waiting).
+        cleanup();
+        await iterator.return();
+      },
+    }, { highWaterMark: 0 });
+    const response = { status, ok: status >= 200 && status < 300, headers: respHeaders, body: stream };
+    response.text = () => readLimitedText(response);
+    return response;
+  } catch (e) { cleanup(); throw e; }
 }
 
 // 统一上游入口:socket 优先,失败/不可用则回退 fetch。返回类 Response 对象。
-async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 180000, socket = true, redirect } = {}) {
+async function httpFetch(url, { method = "GET", headers = {}, body, timeoutMs = 180000, socket = true, redirect, signal } = {}) {
   if (socket) {
     const connect = await resolveConnect();
     if (connect) {
       try {
-        return await socketHttp(connect, url, { method, headers, body, timeoutMs });
+        return await socketHttp(connect, url, { method, headers, body, timeoutMs, signal });
       } catch (e) {
+        if (signal?.aborted || e.code === "resource_limit") throw e;
         // socket 连接层失败(非 HTTP 错误)-> 回退 fetch
       }
     }
   }
-  return fetch(url, { method, headers, body, redirect, signal: timeoutSignal(timeoutMs) });
+  return fetch(url, { method, headers, body, redirect, signal: signal ? AbortSignal.any([signal, timeoutSignal(timeoutMs)]) : timeoutSignal(timeoutMs) });
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -1489,7 +1573,7 @@ function isGoogleRedirectTarget(url) {
   return url.protocol === "https:" && (url.hostname === "google.com" || url.hostname.endsWith(".google.com"));
 }
 
-async function fetchAppPage(cfg, headers, timeoutMs = 30000, maxRedirects = MAX_APP_REDIRECTS) {
+async function fetchAppPage(cfg, headers, timeoutMs = 30000, maxRedirects = MAX_APP_REDIRECTS, signal) {
   const origin = cfg.gemini_origin || "https://gemini.google.com";
   const originUrl = new URL(origin);
   let url = `${origin}${accountPrefix(cfg)}/app`;
@@ -1502,16 +1586,16 @@ async function fetchAppPage(cfg, headers, timeoutMs = 30000, maxRedirects = MAX_
     const scopedCookie = cookieHeaderForUrl(cookieJar, logicalCookieUrl(cfg, url));
     if (scopedCookie) headers.Cookie = scopedCookie;
     else delete headers.Cookie;
-    response = await httpFetch(url, { headers, timeoutMs, socket: cfg.upstream_socket, redirect: "manual" });
+    response = await httpFetch(url, { headers, timeoutMs, socket: cfg.upstream_socket, redirect: "manual", signal });
     const rotated = getSetCookieValues(response.headers);
     setCookieValues.push(...rotated);
     if (rotated.length) cookieJar = mergeCookieJar(cookieJar, rotated, logicalCookieUrl(cfg, url)).cookie_jar;
     if (!REDIRECT_STATUSES.has(response.status)) {
-      return { response, html: await response.text(), setCookieValues, cookieJar, redirect_host: redirectHost };
+      return { response, html: await readLimitedText(response, MAX_BUFFERED_BYTES, 502, signal), setCookieValues, cookieJar, redirect_host: redirectHost };
     }
 
     const location = response.headers.get("location");
-    try { await response.text(); } catch (_) {}
+    try { await response.body?.cancel(); } catch (_) {}
     if (!location) return { response, html: "", setCookieValues, cookieJar, redirect_host: "missing_location" };
     const next = new URL(location, url);
     redirectHost = next.hostname.replace(/[^a-z0-9.-]/gi, "_");
@@ -1619,12 +1703,12 @@ async function probeXsrfToken(cfg, geminiBl) {
     timeoutMs: 30000,
     socket: cfg.upstream_socket,
   });
-  const token = extractXsrfToken(await response.text());
+  const token = extractXsrfToken(await readLimitedText(response));
   log(cfg, `XSRF probe status=${response.status} token=${token ? "found" : "missing"}`);
   return token;
 }
 
-async function refreshGeminiBl(cfg) {
+async function refreshGeminiBl(cfg, signal) {
   const origin = cfg.gemini_origin || "https://gemini.google.com";
   const now = Date.now();
   let stale = "";
@@ -1657,7 +1741,7 @@ async function refreshGeminiBl(cfg) {
 
   try {
     const headers = await buildAppPageHeaders(cfg, cfg.cookie);
-    const page = await fetchAppPage(cfg, headers);
+    const page = await fetchAppPage(cfg, headers, undefined, undefined, signal);
     const bl = extractGeminiBl(page.html);
     if (bl) {
       const expiresAt = Date.now() + GEMINI_BL_CACHE_TTL_SEC * 1000;
@@ -1680,6 +1764,7 @@ async function refreshGeminiBl(cfg) {
     }
     log(cfg, "GEMINI_BL auto-detect returned no build (status=" + (page.response && page.response.status) + ")");
   } catch (e) {
+    if (signal?.aborted || e.code === "resource_limit") throw e;
     log(cfg, "GEMINI_BL auto-detect failed: " + e);
   }
 
@@ -1711,7 +1796,7 @@ async function executeBatchRpc(cfg, rpcId, payload, accessToken = cfg.xsrf_token
     timeoutMs: 30000,
     socket: cfg.upstream_socket,
   });
-  return { response, raw: await response.text() };
+  return { response, raw: await readLimitedText(response) };
 }
 
 async function verifySessionWithRpc(cfg, accessToken) {
@@ -1834,7 +1919,7 @@ async function fetchModelCatalog(cfg, key) {
     timeoutMs: 30000,
     socket: cfg.upstream_socket,
   });
-  const raw = await statusResponse.text();
+  const raw = await readLimitedText(statusResponse);
   if (!statusResponse.ok) throw new Error(`GetUserStatus returned ${statusResponse.status}`);
   const statusPayload = extractRpcPayload(raw, MODEL_STATUS_RPC);
   if (cfg.cookie && statusPayload?.[14] === UNAUTHENTICATED_STATUS) {
@@ -1884,6 +1969,7 @@ async function getModelCatalog(cfg, force = false) {
     }
     return models;
   } catch (e) {
+    if (e.code === "resource_limit") throw e;
     if (cfg.cookie) {
       const reason = String((e && e.message) || e);
       log(cfg, `model catalog refresh failed; falling back to guest catalog: ${reason}`);
@@ -1929,7 +2015,7 @@ function parseImageUrl(url) {
 }
 
 // 抓取 gemini.google.com/app 页面里的上传 token(带 10 分钟缓存)。
-async function getPageTokens(cfg) {
+async function getPageTokens(cfg, signal) {
   const now = Date.now();
   const origin = cfg.gemini_origin || "https://gemini.google.com";
   const key = await authCacheKey(cfg);
@@ -1942,9 +2028,10 @@ async function getPageTokens(cfg) {
   if (cfg.sapisid) headers["Authorization"] = await makeSapisidHash(cfg.sapisid);
   const tokens = cfg.xsrf_token ? { at: cfg.xsrf_token } : {};
   try {
-    const page = await fetchAppPage(cfg, headers);
+    const page = await fetchAppPage(cfg, headers, undefined, undefined, signal);
     Object.assign(tokens, extractPageTokens(page.html));
   } catch (e) {
+    if (signal?.aborted || e.code === "resource_limit") throw e;
     log(cfg, `getPageTokens failed: ${e}`);
   }
   if (Object.keys(tokens).length) {
@@ -1975,6 +2062,7 @@ async function uploadImage(cfg, bytes, mime) {
 
   const r1 = await httpFetch("https://content-push.googleapis.com/upload/", { method: "POST", headers: startHeaders, body: "", timeoutMs: 30000, socket: cfg.upstream_socket });
   const uploadUrl = r1.headers.get("x-goog-upload-url");
+  try { await r1.body?.cancel(); } catch (_) {}
   if (!uploadUrl) throw new Error(`no upload URL (status ${r1.status})`);
 
   const r2 = await httpFetch(uploadUrl, {
@@ -1984,7 +2072,7 @@ async function uploadImage(cfg, bytes, mime) {
     timeoutMs: 60000,
     socket: cfg.upstream_socket,
   });
-  const fileRef = (await r2.text()).trim();
+  const fileRef = (await readLimitedText(r2, 64 * 1024)).trim();
   if (!fileRef.startsWith("/")) throw new Error(`invalid file ref: ${fileRef.slice(0, 120)}`);
   return fileRef;
 }
@@ -2002,18 +2090,17 @@ async function resolveImages(cfg, images) {
       let bytes, mime;
       if (img.url) {
         const r = await fetch(img.url, { signal: timeoutSignal(cfg.request_timeout_sec * 1000) });
-        const cl = parseInt(r.headers.get("content-length") || "0", 10);
-        if (cl > MAX_IMAGE_BYTES) throw new Error(`image too large: ${cl} bytes (max ${MAX_IMAGE_BYTES})`);
-        const ab = await r.arrayBuffer();
-        if (ab.byteLength > MAX_IMAGE_BYTES) throw new Error(`image too large: ${ab.byteLength} bytes (max ${MAX_IMAGE_BYTES})`);
-        bytes = new Uint8Array(ab);
+        bytes = await readLimitedBytes(r, MAX_IMAGE_BYTES, 413);
         mime = img.mime || r.headers.get("content-type") || "image/png";
       } else {
+        if (img.b64.length > 4 * Math.ceil(MAX_IMAGE_BYTES / 3)) throw resourceLimit("image exceeds 20 MiB", 413);
         bytes = base64ToBytes(img.b64);
+        if (bytes.length > MAX_IMAGE_BYTES) throw resourceLimit("image exceeds 20 MiB", 413);
         mime = img.mime || "image/png";
       }
       refs.push(await uploadImage(cfg, bytes, mime));
     } catch (e) {
+    if (e.code === "resource_limit") throw e;
       log(cfg, `image upload failed: ${e}`);
     }
   }
@@ -2035,59 +2122,93 @@ function cleanText(text) {
   return stripArtifacts(text).trim();
 }
 
-/** 解析单行 `wrb.fr`,返回其中包含的文本字符串。 */
-function extractTextsFromLine(line) {
-  if (!line.includes('"wrb.fr"') || line.length < 200) return [];
+const ACTUAL_MODEL_RE = /^(?:Gemini\s+)?\d+(?:\.\d+)?\s+(?:Flash|Pro)\b[- A-Za-z0-9.()]{0,40}$/i;
+
+// Decode the envelope and its payload once for both text and model metadata.
+function parseGeminiLine(line) {
+  const texts = [];
+  let actualModel = "";
+  if (!line.includes('"wrb.fr"')) return { texts, actualModel };
   try {
-    const arr = JSON.parse(line);
-    const innerStr = arr[0][2];
-    if (!innerStr || innerStr.length < 50) return [];
-    const inner = JSON.parse(innerStr);
-    if (!(Array.isArray(inner) && inner.length > 4 && inner[4])) return [];
-    const texts = [];
-    for (const part of inner[4]) {
-      if (Array.isArray(part) && part.length > 1 && part[1] && Array.isArray(part[1])) {
-        for (const t of part[1]) {
-          if (typeof t === "string" && t) texts.push(t);
+    const rows = JSON.parse(line);
+    if (!Array.isArray(rows)) return { texts, actualModel };
+    for (const row of rows) {
+      if (!Array.isArray(row) || row[0] !== "wrb.fr" || typeof row[2] !== "string") continue;
+      let inner;
+      try { inner = JSON.parse(row[2]); } catch (_) { continue; }
+      if (!Array.isArray(inner)) continue;
+      const label = inner.find(v => typeof v === "string" && ACTUAL_MODEL_RE.test(v));
+      if (label) actualModel = label;
+      if (!Array.isArray(inner[4])) continue;
+      for (const part of inner[4]) {
+        if (Array.isArray(part) && Array.isArray(part[1])) {
+          for (const value of part[1]) if (typeof value === "string" && value) texts.push(value);
         }
       }
     }
-    return texts;
-  } catch (_) {
-    return [];
-  }
+  } catch (_) {}
+  return { texts, actualModel };
 }
+
+function extractTextsFromLine(line) { return parseGeminiLine(line).texts; }
+function extractActualModelFromLine(line) { return parseGeminiLine(line).actualModel; }
 
 function extractResponseText(raw) {
   let lastText = "";
   for (const line of raw.split("\n")) {
-    for (const t of extractTextsFromLine(line)) {
-      if (t.length > lastText.length) lastText = t;
-    }
+    for (const text of extractTextsFromLine(line)) if (text.length > lastText.length) lastText = text;
   }
   return cleanText(lastText);
 }
 
-const ACTUAL_MODEL_RE = /^(?:Gemini\s+)?\d+(?:\.\d+)?\s+(?:Flash|Pro)\b[- A-Za-z0-9.()]{0,40}$/i;
-
-function extractActualModelFromLine(line) {
-  if (!line.includes('"wrb.fr"')) return "";
-  try {
-    const inner = JSON.parse(JSON.parse(line)[0][2]);
-    const label = Array.isArray(inner) ? inner.find((v) => typeof v === "string" && ACTUAL_MODEL_RE.test(v)) : "";
-    return label || "";
-  } catch (_) {
-    return "";
-  }
-}
-
 function extractActualModel(raw) {
   let actualModel = "";
-  for (const line of raw.split("\n")) {
-    const found = extractActualModelFromLine(line);
-    if (found) actualModel = found;
-  }
+  for (const line of raw.split("\n")) actualModel = extractActualModelFromLine(line) || actualModel;
   return actualModel;
+}
+
+async function* readGeminiFrames(response, stats = { rawLength: 0, snippet: "" }, signal) {
+  if (!response.body) { signal?.throwIfAborted(); return; }
+  const reader = response.body.getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  const decoder = new TextDecoder();
+  let parts = [], lineLength = 0, totalBytes = 0;
+  try {
+    for (;;) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      totalBytes += value?.byteLength || 0;
+      if (totalBytes > MAX_GENERATION_BYTES) throw resourceLimit("upstream generation exceeds 32 MiB");
+      const chunk = done ? decoder.decode() : decoder.decode(value, { stream: true });
+      stats.rawLength += chunk.length;
+      if (stats.snippet.length < 200) stats.snippet += chunk.slice(0, 200 - stats.snippet.length);
+      let start = 0;
+      while (start < chunk.length) {
+        const newline = chunk.indexOf("\n", start);
+        const end = newline < 0 ? chunk.length : newline;
+        lineLength += end - start;
+        if (lineLength > MAX_FRAME_CHARS) throw resourceLimit("upstream frame exceeds 2 Mi characters");
+        const piece = chunk.slice(start, end);
+        if (newline < 0) { parts.push(piece); break; }
+        const line = parts.length ? parts.join("") + piece : piece;
+        parts = []; lineLength = 0;
+        const frame = parseGeminiLine(line);
+        if (frame.texts.length || frame.actualModel) yield frame;
+        start = newline + 1;
+      }
+      if (done) break;
+    }
+    if (parts.length) {
+      const frame = parseGeminiLine(parts.join(""));
+      if (frame.texts.length || frame.actualModel) yield frame;
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    try { await reader.cancel(); } catch (_) {}
+    reader.releaseLock();
+  }
 }
 
 function routeStatus(modelId, actualModel) {
@@ -2108,10 +2229,10 @@ function routeMetadata(modelId, actualModel) {
   return { upstream_model: actualModel || null, route_status: routeStatus(modelId, actualModel) };
 }
 
-async function buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra) {
+async function buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra, signal) {
   let body = buildPayload(prompt, modelId, thinkingLevel, fileRefs || null, extra);
   if (cfg.cookie) {
-    const at = cfg.xsrf_token || (await getPageTokens(cfg)).at;
+    const at = cfg.xsrf_token || (await getPageTokens(cfg, signal)).at;
     if (at) body += "&at=" + encodeURIComponent(at);
   }
   return body;
@@ -2126,6 +2247,7 @@ async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRe
     url = getUrl(cfg);
     headers = await buildHeaders(cfg, modelHeader);
   } catch (e) {
+    if (e.code === "resource_limit") throw e;
     if (cfg.cookie) {
       const reason = String((e && e.message) || e || "authenticated request setup failed");
       log(cfg, `authenticated request setup failed; falling back to guest: ${reason}`);
@@ -2143,11 +2265,15 @@ async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRe
         timeoutMs: cfg.request_timeout_sec * 1000,
         socket: cfg.upstream_socket,
       });
-      const raw = await resp.text();
-      const text = extractResponseText(raw);
-      const actualModel = extractActualModel(raw);
+      const stats = { rawLength: 0, snippet: "" };
+      let lastText = "", actualModel = "";
+      for await (const frame of readGeminiFrames(resp, stats)) {
+        if (frame.actualModel) actualModel = frame.actualModel;
+        for (const text of frame.texts) if (text.length > lastText.length) lastText = text;
+      }
+      const text = cleanText(lastText);
       if (!resp.ok || !text) {
-        log(cfg, `upstream status=${resp.status} rawLen=${raw.length} parsedLen=${text.length} snippet=${JSON.stringify(raw.slice(0, 200))}`);
+        log(cfg, `upstream status=${resp.status} rawLen=${stats.rawLength} parsedLen=${text.length} snippet=${JSON.stringify(stats.snippet)}`);
       }
       if (cfg.cookie && (!resp.ok || (!text && !actualModel))) {
         throw new Error(`authenticated upstream returned ${resp.status} without usable content`);
@@ -2157,9 +2283,10 @@ async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRe
         actualModel,
         status: resp.status,
         contentType: resp.headers.get("content-type"),
-        rawLength: raw.length,
+        rawLength: stats.rawLength,
       };
     } catch (e) {
+    if (e.code === "resource_limit") throw e;
       lastErr = e;
       if (attempt < cfg.retry_attempts - 1) {
         log(cfg, `Retry ${attempt + 1}/${cfg.retry_attempts}: ${e}`);
@@ -2183,18 +2310,22 @@ async function generate(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, mo
  * 流式生成。每步 yield 一段文本增量(本次新追加的后缀)。
  * 只在尚未 yield 过任何内容时才重试,以避免重复输出。
  */
-async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader) {
+async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal) {
+  signal?.throwIfAborted();
   let body, url, headers;
   try {
-    await refreshGeminiBl(cfg);
-    body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
+    await refreshGeminiBl(cfg, signal);
+    signal?.throwIfAborted();
+    body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra, signal);
+    signal?.throwIfAborted();
     url = getUrl(cfg);
     headers = await buildHeaders(cfg, modelHeader);
   } catch (e) {
+    if (signal?.aborted || e.code === "resource_limit") throw e;
     if (cfg.cookie) {
       const reason = String((e && e.message) || e || "authenticated stream setup failed");
       log(cfg, `authenticated stream setup failed; falling back to guest: ${reason}`);
-      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader);
+      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal);
       return;
     }
     throw e;
@@ -2210,71 +2341,31 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
         body,
         timeoutMs: cfg.request_timeout_sec * 1000,
         socket: cfg.upstream_socket,
+        signal,
       });
-      if (!resp.body) {
-        const raw = await resp.text();
-        const actualModel = extractActualModel(raw);
-        if (actualModel && onRoute) onRoute(routeMetadata(modelId, actualModel));
-        const text = extractResponseText(raw);
-        if (text) {
-          yielded = true;
-          yield text;
-        }
-        if (!yielded && cfg.cookie) throw new Error(`authenticated stream returned ${resp.status} without usable content`);
-        return;
-      }
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      let prev = "";
-      let started = false; // 是否已 yield 过非空内容(用于裁掉开头的空白)
-      let actualModel = "";
-      const consumeLine = function* (line) {
-        const found = extractActualModelFromLine(line);
-        if (found && found !== actualModel) {
-          actualModel = found;
+      let prevLength = 0, started = false, actualModel = "";
+      for await (const frame of readGeminiFrames(resp, undefined, signal)) {
+        if (frame.actualModel && frame.actualModel !== actualModel) {
+          actualModel = frame.actualModel;
           if (onRoute) onRoute(routeMetadata(modelId, actualModel));
         }
-        for (const t of extractTextsFromLine(line)) {
-          if (t.length > prev.length) {
-            // 每段增量:去掉残留标记,但流式过程中不裁剪内部空白,
-            // 以保留分块之间的空格(比如 "1, 2, 3" 而不是 "1, 2,3")。
-            // 在首个可见内容出现前,持续裁掉前导空白(避免开头空行)。
-            let delta = stripArtifacts(t.slice(prev.length));
-            prev = t;
-            if (!started) delta = delta.replace(/^\s+/, "");
-            if (delta) {
-              started = true;
-              yield delta;
-            }
-          }
-        }
-      };
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, idx);
-          buf = buf.slice(idx + 1);
-          for (const delta of consumeLine(line)) {
+        for (const text of frame.texts) {
+          if (text.length <= prevLength) continue;
+          let delta = stripArtifacts(text.slice(prevLength));
+          prevLength = text.length;
+          if (!started) delta = delta.replace(/^\s+/, "");
+          if (delta) {
+            started = true;
             yielded = true;
             yield delta;
           }
-        }
-      }
-      buf += decoder.decode();
-      if (buf) {
-        for (const delta of consumeLine(buf)) {
-          yielded = true;
-          yield delta;
         }
       }
       if (!yielded) log(cfg, `stream upstream produced no text (status=${resp.status})`);
       if (!yielded && cfg.cookie) throw new Error(`authenticated stream returned ${resp.status} without usable content`);
       return;
     } catch (e) {
+    if (signal?.aborted || e.code === "resource_limit") throw e;
       lastErr = e;
       if (!yielded && attempt < cfg.retry_attempts - 1) {
         log(cfg, `Stream retry ${attempt + 1}/${cfg.retry_attempts}: ${e}`);
@@ -2284,7 +2375,7 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
       if (!yielded && cfg.cookie) {
         const reason = String((e && e.message) || e || "authenticated stream failed");
         log(cfg, `authenticated stream failed; falling back to guest: ${reason}`);
-        yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader);
+        yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal);
         return;
       }
       throw e;
@@ -2294,7 +2385,7 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
     if (cfg.cookie) {
       const reason = String((lastErr && lastErr.message) || lastErr || "authenticated stream failed");
       log(cfg, `authenticated stream failed; falling back to guest: ${reason}`);
-      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader);
+      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal);
       return;
     }
     throw lastErr;
@@ -2914,23 +3005,26 @@ function adminAuthorized(request, cfg) {
 
 /**
  * 构造一个 SSE 响应,响应体由 `producer(write)` 生成。
- * `write(str)` 会入队一个 UTF-8 分块。producer 结束后流会自动关闭。
+ * `await write(str)` 等待客户端读取，避免缓冲区无限增长。
  */
 function sseResponse(producer) {
   const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    async start(controller) {
-      const write = (s) => controller.enqueue(encoder.encode(s));
-      try {
-        await producer(write);
-      } catch (_) {
-        /* 尽力而为:停止流式输出 */
-      } finally {
-        try { controller.close(); } catch (_) {}
-      }
-    },
-  });
-  return new Response(stream, {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const abort = new AbortController();
+  // Rejects as soon as the client cancels, including while awaiting upstream I/O.
+  void writer.closed.catch(reason => abort.abort(reason));
+  void (async () => {
+    try {
+      await producer(s => writer.write(encoder.encode(s)), abort.signal);
+    } catch (_) {
+      // API producers emit their own error events when the client is connected.
+    } finally {
+      try { await writer.close(); } catch (_) {}
+      writer.releaseLock();
+    }
+  })();
+  return new Response(readable, {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -2967,8 +3061,8 @@ async function handleChat(req, cfg) {
   const stream = req.stream || false;
   const cid = `chatcmpl-${randHex(12)}`;
 
-  if (stream && (!tools || toolChoice === "none")) {
-    return sseResponse(async (write) => {
+  if (stream && (!tools?.length || toolChoice === "none")) {
+    return sseResponse(async (write, signal) => {
       let got = false;
       let errMsg = "";
       let route = routeMetadata(rm.modeId, "");
@@ -2978,9 +3072,9 @@ async function handleChat(req, cfg) {
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; }, rm.header)) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; }, rm.header, signal)) {
           got = true;
-          chunk({ content: delta }, null);
+          await chunk({ content: delta }, null);
         }
       } catch (e) {
         errMsg = `⚠️ upstream error: ${e}`;
@@ -2988,13 +3082,13 @@ async function handleChat(req, cfg) {
         if (!got) {
           const note = errMsg || EMPTY_UPSTREAM_MSG;
           log(cfg, `chat stream produced no content -> ${note}`);
-          chunk({ content: note }, null);
+          await chunk({ content: note }, null);
         } else if (errMsg) {
           log(cfg, `chat stream truncated: ${errMsg}`);
-          chunk({ content: `\n\n${errMsg}` }, null);
+          await chunk({ content: `\n\n${errMsg}` }, null);
         }
-        chunk({}, "stop");
-        write("data: [DONE]\n\n");
+        await chunk({}, "stop");
+        await write("data: [DONE]\n\n");
       }
     });
   }
@@ -3023,16 +3117,16 @@ async function handleChat(req, cfg) {
   const finish = toolCalls ? "tool_calls" : "stop";
 
   if (stream) {
-    return sseResponse(async (write) => {
+    return sseResponse(async (write, signal) => {
       const delta = toolCalls
         ? { tool_calls: toOpenAIStreamToolCallDeltas(toolCalls) }
         : { role: "assistant", content: text || "" };
-      write(`data: ${JSON.stringify({
+      await write(`data: ${JSON.stringify({
         id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
         ...routeMetadata(rm.modeId, result.actualModel),
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
-      write("data: [DONE]\n\n");
+      await write("data: [DONE]\n\n");
     });
   }
 
@@ -3147,20 +3241,20 @@ async function handleResponses(req, cfg) {
   const usage = { input_tokens: tokenEst(prompt), output_tokens: tokenEst(text), total_tokens: tokenEst(prompt) + tokenEst(text) };
 
   if (req.stream) {
-    return sseResponse(async (write) => {
+    return sseResponse(async (write, signal) => {
       const route = routeMetadata(rm.modeId, result.actualModel);
-      write(`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: rid, object: "response", status: "in_progress", model: rm.name, ...route, output: [] } })}\n\n`);
+      await write(`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: rid, object: "response", status: "in_progress", model: rm.name, ...route, output: [] } })}\n\n`);
       for (const item of output) {
         if (item.type === "function_call") {
-          write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: "response.function_call_arguments.done", item_id: item.id, call_id: item.call_id, name: item.name, arguments: item.arguments })}\n\n`);
+          await write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: "response.function_call_arguments.done", item_id: item.id, call_id: item.call_id, name: item.name, arguments: item.arguments })}\n\n`);
         } else if (item.type === "message") {
-          item.content.forEach((cp, ci) => {
-            write(`event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: item.id, content_index: ci, text: cp.text })}\n\n`);
-          });
+          for (const [ci, cp] of item.content.entries()) {
+            await write(`event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: item.id, content_index: ci, text: cp.text })}\n\n`);
+          }
         }
       }
       const respObj = { id: rid, object: "response", status: "completed", model: rm.name, ...route, output, usage };
-      write(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: respObj })}\n\n`);
+      await write(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: respObj })}\n\n`);
     });
   }
 
@@ -3175,7 +3269,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
   if (rm.error) return jsonResponse({ error: { message: rm.error } }, 400);
 
   const fcMode = ((req.toolConfig || {}).functionCallingConfig || {}).mode || "AUTO";
-  const hasTools = !!req.tools && fcMode !== "NONE";
+  const hasTools = !!req.tools?.length && fcMode !== "NONE";
   const [prompt0, images] = googleContentsToPrompt(req);
   const { fileRefs, droppedNote } = await resolveImages(cfg, images);
   const prompt = prompt0 + droppedNote;
@@ -3184,19 +3278,19 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
   log(cfg, `Google API: model=${rm.name} stream=${stream} tools=${hasTools} prompt_len=${prompt.length}`);
 
   if (stream && !hasTools) {
-    return sseResponse(async (write) => {
-      let fullText = "";
+    return sseResponse(async (write, signal) => {
+      let fullTextLength = 0;
       let route = routeMetadata(rm.modeId, "");
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; }, rm.header)) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; }, rm.header, signal)) {
           if (!delta) continue;
-          fullText += delta;
-          write(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: delta }], role: "model" }, index: 0 }], modelVersion: rm.name, upstreamModel: route.upstream_model, routeStatus: route.route_status })}\n\n`);
+          fullTextLength += delta.length;
+          await write(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: delta }], role: "model" }, index: 0 }], modelVersion: rm.name, upstreamModel: route.upstream_model, routeStatus: route.route_status })}\n\n`);
         }
       } finally {
-        write(`data: ${JSON.stringify({
+        await write(`data: ${JSON.stringify({
           candidates: [{ finishReason: "STOP", index: 0 }],
-          usageMetadata: { promptTokenCount: tokenEst(prompt), candidatesTokenCount: tokenEst(fullText), totalTokenCount: tokenEst(prompt) + tokenEst(fullText) },
+          usageMetadata: { promptTokenCount: tokenEst(prompt), candidatesTokenCount: Math.floor(fullTextLength / 4), totalTokenCount: tokenEst(prompt) + Math.floor(fullTextLength / 4) },
           modelVersion: rm.name,
           upstreamModel: route.upstream_model,
           routeStatus: route.route_status,
@@ -3237,7 +3331,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
   };
 
   if (stream) {
-    return sseResponse(async (write) => { write(`data: ${JSON.stringify(responseObj)}\n\n`); });
+    return sseResponse(async (write, signal) => { await write(`data: ${JSON.stringify(responseObj)}\n\n`); });
   }
   return jsonResponse(responseObj);
 }
@@ -3389,7 +3483,7 @@ async function readRotationResponse(response, transport) {
     set_cookie_values: getSetCookieValues(response.headers),
     transport,
   };
-  try { await response.text(); } catch (_) {}
+  try { await response.body?.cancel(); } catch (_) {}
   return result;
 }
 
@@ -4802,14 +4896,6 @@ export default {
       return jsonResponse({ error: { message: "invalid api key" } }, 401);
     }
 
-    if (!adminPath && method === "POST" && cfg.cookie && ctx && typeof ctx.waitUntil === "function") {
-      ctx.waitUntil(
-        runScheduledActivity(cfg, env)
-          .then((result) => log(cfg, `request activity heartbeat: ${result.status}`))
-          .catch((e) => log(cfg, `request activity heartbeat failed: ${e}`)),
-      );
-    }
-
     try {
       if (adminPath) {
         if (path === "/admin/status" && method === "GET") return await handleAdminStatus(cfg, env, url);
@@ -4855,7 +4941,7 @@ export default {
           );
           if (wantsHtml) return dashboardResponse(cfg);
           const publicCfg = { ...cfg, cookie: "", sapisid: "", xsrf_token: "" };
-          await refreshGeminiBl(publicCfg);
+          if (_geminiBlMemory.origin === publicCfg.gemini_origin && _geminiBlMemory.value) publicCfg.gemini_bl = _geminiBlMemory.value;
           return jsonResponse({ status: "ok", version: VERSION, gemini_bl: publicCfg.gemini_bl, model_catalog: "dynamic" });
         }
         if (path === "/debug") {
@@ -4866,7 +4952,7 @@ export default {
       }
 
       if (method === "POST") {
-        const bodyText = await request.text();
+        const bodyText = await readLimitedText(request, MAX_REQUEST_BYTES, 413);
         const req = parseJson(bodyText);
 
         if (path === "/v1/chat/completions") {
@@ -4891,6 +4977,7 @@ export default {
       return jsonResponse({ error: "not found" }, 404);
     } catch (e) {
       log(cfg, `error: ${(e && e.stack) || e}`);
+      if (e.code === "resource_limit") return jsonResponse({ error: { code: e.code, message: e.message } }, e.status);
       return adminPath
         ? privateJsonResponse({ error: { message: String((e && e.message) || e) } }, 500)
         : jsonResponse({ error: { message: String((e && e.message) || e) } }, 500);
@@ -4927,5 +5014,6 @@ if (typeof process !== "undefined" && process.versions && process.versions.node)
     messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
     makeSapisidHash, parseImageUrl, extractGeminiBl, extractPageTokens, hasAuthenticatedPageMarkers, extractXsrfToken, getPageTokens, uploadImage, resolveImages,
     __setConnect, httpFetch, socketHttp, timingSafeEqual, MAX_IMAGE_BYTES,
+    readLimitedBytes, readLimitedText, readGeminiFrames, parseGeminiLine, MAX_REQUEST_BYTES, MAX_FRAME_CHARS, sseResponse,
   };
 }
