@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.10";
+const VERSION = "1.9.11";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -3009,19 +3009,29 @@ function adminAuthorized(request, cfg) {
  * 构造一个 SSE 响应,响应体由 `producer(write)` 生成。
  * `await write(str)` 等待客户端读取，避免缓冲区无限增长。
  */
-function sseResponse(producer) {
+function sseResponse(producer, requestSignal) {
   const encoder = new TextEncoder();
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const abort = new AbortController();
+  // Across a Durable Object boundary, a quiet response stream may not reject
+  // a write until the next upstream chunk. Observe disconnects independently.
+  const disconnect = () => {
+    abort.abort(requestSignal.reason);
+    void writer.abort(requestSignal.reason).catch(() => {});
+  };
+  requestSignal?.addEventListener("abort", disconnect, { once: true });
+  if (requestSignal?.aborted) disconnect();
   // Rejects as soon as the client cancels, including while awaiting upstream I/O.
   void writer.closed.catch(reason => abort.abort(reason));
   void (async () => {
     try {
+      abort.signal.throwIfAborted();
       await producer(s => writer.write(encoder.encode(s)), abort.signal);
     } catch (_) {
       // API producers emit their own error events when the client is connected.
     } finally {
+      requestSignal?.removeEventListener("abort", disconnect);
       try { await writer.close(); } catch (_) {}
       writer.releaseLock();
     }
@@ -3092,7 +3102,7 @@ async function handleChat(req, cfg) {
         await chunk({}, "stop");
         await write("data: [DONE]\n\n");
       }
-    });
+    }, cfg.request_signal);
   }
 
   let result;
@@ -3129,7 +3139,7 @@ async function handleChat(req, cfg) {
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
       await write("data: [DONE]\n\n");
-    });
+    }, cfg.request_signal);
   }
 
   return jsonResponse({
@@ -3257,7 +3267,7 @@ async function handleResponses(req, cfg) {
       }
       const respObj = { id: rid, object: "response", status: "completed", model: rm.name, ...route, output, usage };
       await write(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: respObj })}\n\n`);
-    });
+    }, cfg.request_signal);
   }
 
   return jsonResponse({ id: rid, object: "response", created_at: nowSec(), status: "completed", model: rm.name, ...routeMetadata(rm.modeId, result.actualModel), output, usage });
@@ -3298,7 +3308,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
           routeStatus: route.route_status,
         })}\n\n`);
       }
-    });
+    }, cfg.request_signal);
   }
 
   let result;
@@ -3333,7 +3343,7 @@ async function handleGoogleGenerate(req, cfg, path, stream) {
   };
 
   if (stream) {
-    return sseResponse(async (write, signal) => { await write(`data: ${JSON.stringify(responseObj)}\n\n`); });
+    return sseResponse(async (write, signal) => { await write(`data: ${JSON.stringify(responseObj)}\n\n`); }, cfg.request_signal);
   }
   return jsonResponse(responseObj);
 }
@@ -4847,9 +4857,28 @@ function dashboardResponse(cfg) {
   });
 }
 
+// Generation runs in a per-request SQLite Durable Object when provisioned.
+// Its CPU budget is separate from the Free plan's 10 ms ingress Worker budget.
+// No conversations or response bodies are persisted to Durable Object storage.
+function isGenerationRequest(method, path) {
+  return method === "POST" && (path === "/v1/chat/completions" || path === "/v1/responses"
+    || /^\/v1beta\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/.test(path));
+}
+
+export class GenerationRunner {
+  constructor(state, env) { this.state = state; this.env = env; }
+
+  async fetch(request) {
+    if (!isGenerationRequest(request.method, new URL(request.url).pathname)) {
+      return jsonResponse({ error: { message: "not found" } }, 404);
+    }
+    // The internal argument cannot be set by an HTTP header or request body.
+    return handleWorkerFetch(request, this.env, this.state, true);
+  }
+}
+
 // ─── 路由 ────────────────────────────────────────────────────────────────────
-export default {
-  async fetch(request, env, ctx) {
+async function handleWorkerFetch(request, env, ctx, inGenerationRunner = false) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -4857,8 +4886,31 @@ export default {
     const publicGet = method === "GET" && (path === "/" || path === "/health");
     let cfg;
 
+    if (!inGenerationRunner && env?.GENERATION_RUNNER && isGenerationRequest(method, path)) {
+      // Reject bad keys before allocating an object. Cookie-store access and
+      // full credential validation happen inside the runner, before body reads.
+      const edgeCfg = getConfig(env);
+      if (!authorized(request, url, edgeCfg)) {
+        return jsonResponse({ error: { message: "invalid api key" } }, 401);
+      }
+      try {
+        const namespace = env.GENERATION_RUNNER;
+        const stub = namespace.get(namespace.newUniqueId());
+        // Pass both streams through without JSON parsing, copying or pumping
+        // SSE in this invocation. Never retry a possibly-started generation.
+        return await stub.fetch(request, { signal: request.signal });
+      } catch (e) {
+        log(edgeCfg, `Generation runner unavailable: ${e}`);
+        return jsonResponse({ error: {
+          code: "generation_runner_unavailable",
+          message: "Generation runner unavailable; check Durable Object bindings and quotas.",
+        } }, 503);
+      }
+    }
+
     try {
       cfg = publicGet ? getConfig(env) : await getRequestConfig(env);
+      cfg.request_signal = request.signal;
     } catch (e) {
       const baseCfg = getConfig(env);
       log(baseCfg, `Cookie store unavailable; refusing fallback credentials: ${e}`);
@@ -4944,7 +4996,8 @@ export default {
           if (wantsHtml) return dashboardResponse(cfg);
           const publicCfg = { ...cfg, cookie: "", sapisid: "", xsrf_token: "" };
           if (_geminiBlMemory.origin === publicCfg.gemini_origin && _geminiBlMemory.value) publicCfg.gemini_bl = _geminiBlMemory.value;
-          return jsonResponse({ status: "ok", version: VERSION, gemini_bl: publicCfg.gemini_bl, model_catalog: "dynamic" });
+          return jsonResponse({ status: "ok", version: VERSION, gemini_bl: publicCfg.gemini_bl, model_catalog: "dynamic",
+            generation_runtime: env?.GENERATION_RUNNER ? "durable_object" : "worker" });
         }
         if (path === "/debug") {
           if (!cfg.enable_debug) return jsonResponse({ error: "debug endpoint disabled" }, 403);
@@ -4984,7 +5037,10 @@ export default {
         ? privateJsonResponse({ error: { message: String((e && e.message) || e) } }, 500)
         : jsonResponse({ error: { message: String((e && e.message) || e) } }, 500);
     }
-  },
+}
+
+export default {
+  fetch: handleWorkerFetch,
 
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil((async () => {

@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.10-62b6ff"></a>
+  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.11-62b6ff"></a>
   <a href="https://workers.cloudflare.com/"><img alt="Cloudflare Workers" src="https://img.shields.io/badge/Cloudflare-Workers-f6821f?logo=cloudflareworkers&logoColor=white"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f6b95c"></a>
   <a href="https://github.com/banana2556"><img alt="Author banana2556" src="https://img.shields.io/badge/GitHub-%40banana2556-8b949e?logo=github"></a>
@@ -81,10 +81,14 @@ cd gemini2api-cfworker
 npx wrangler deploy
 ```
 
-The checked-in `wrangler.toml` provisions the `COOKIE_STORE` Durable Object
-and the maintenance Cron Trigger. Pasting only `worker.js` into Cloudflare
-Quick Edit supports guest mode, but does not provision persistent Cookie
-storage or scheduled refresh.
+The checked-in `wrangler.toml` provisions the `COOKIE_STORE` and
+`GENERATION_RUNNER` SQLite Durable Objects and the maintenance Cron Trigger.
+The `v2` migration adds the generation runner and preserves existing Cookies.
+Deploy the configuration as well as the script to enable the CPU-limit fix.
+Pasting only `worker.js` into Cloudflare Quick Edit supports guest mode, but
+does not provision the generation runner, persistent Cookie storage or
+scheduled refresh; generation then remains subject to the ordinary Worker
+CPU limit.
 
 ### 2. Choose an access mode
 
@@ -252,15 +256,20 @@ verification or `/debug` to distinguish:
 ```mermaid
 flowchart LR
     client["OpenAI / Google AI client"] --> worker["Cloudflare Worker"]
-    worker --> gemini["Gemini Web"]
+    worker --> runner["GenerationRunner · one object per request"]
+    runner --> gemini["Gemini Web"]
+    runner --> store
     worker <--> store[("CookieStore Durable Object")]
     cron["Cron · every minute"] --> worker
 ```
 
-The Worker converts client messages and tools into Gemini Web payloads, streams
+The ingress Worker checks API keys and forwards generation request and response
+streams without parsing or buffering them. A per-request `GenerationRunner`
+converts client messages and tools into Gemini Web payloads, streams
 the upstream response back in the requested API format, and attaches truthful
 routing metadata. Images are uploaded through Google's Scotty upload flow
-before generation.
+before generation. The runner reads the existing Cookie store and validates
+credentials before processing input. It writes no conversations to storage.
 
 ## Configuration
 
@@ -390,13 +399,50 @@ encoding do. Each isolate has 128 MB of memory shared by its concurrent requests
 Increasing `REQUEST_TIMEOUT_SEC` does not raise either limit. See
 [Cloudflare's resource limits](https://developers.cloudflare.com/workers/platform/limits/).
 
+With the checked-in configuration, `/v1/chat/completions`, `/v1/responses` and
+the Google generation endpoints run inside `GenerationRunner`. SQLite Durable
+Objects are available on Workers Free and have a default **30-second CPU
+budget per request**, separate from the ingress Worker's 10 ms budget. This
+moves page discovery, JSON/payload conversion, image handling and upstream
+stream parsing out of the ingress invocation. Each request receives a new
+object ID; generation does not share the Cookie store's execution object.
+The runner cannot be selected or bypassed with a client-supplied header.
+See [Durable Object limits](https://developers.cloudflare.com/durable-objects/platform/limits/).
+
+This consumes Durable Object requests and active duration, including time
+waiting for Gemini while the object is active. Workers Free currently includes
+100,000 Durable Object requests and 13,000 GB-s of duration per day, shared
+with other objects such as `CookieStore`. Each active object is metered at
+128 MB regardless of actual memory usage. Exceeding a daily allowance causes
+failures until it resets; this is not unlimited free capacity. See
+[Durable Object pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/).
+If the runner is bound but unavailable, ingress returns
+`503 generation_runner_unavailable` without retrying generation locally.
+An error after SSE headers were sent instead terminates the stream.
+
+Deploy using `npx wrangler deploy`, confirm `GENERATION_RUNNER` is listed among
+the bindings, and check `/health` for version `1.9.11` and
+`generation_runtime: "durable_object"`. Replay the failing
+conversation and inspect both Worker and Durable Object invocation logs.
+Local tests do not enforce Cloudflare's deployed CPU limits. A logged
+`cpuTimeMs: 20` with `exceededCpu` does not establish a 20 ms configured limit:
+Cloudflare allows occasional overruns before terminating an invocation.
+Increasing `limits.cpu_ms` on a Free ingress Worker does not raise its budget;
+Workers Paid is another option if the application's traffic outgrows Free.
+
 The Worker consumes generation responses incrementally, parses each frame once,
 and applies backpressure to Socket and SSE streams. Non-streaming requests and
 tool calls keep the final text instead of the complete upstream wire history.
 Chat/Google requests with no tools (including an empty tools array) stream text
 as it arrives. Tool-call and Responses API SSE events still wait for the final
-result. Client cancellation of an active text stream cancels upstream reading,
-including page discovery. Cookie activity maintenance runs through the configured
+result. Stream cancellation and incoming request abort signals cancel active
+text-stream upstream reads, including page discovery. Wrangler enables incoming
+request signal forwarding and the TransformStream backpressure fix explicitly
+for the existing compatibility date. Immediate network-disconnect propagation
+still needs deployed validation: local Wrangler/Miniflare tests did not observe
+it within three seconds in either direct Worker or Durable Object mode, although
+explicit cancellation and abort-signal unit tests pass.
+Cookie activity maintenance runs through the configured
 Cron Trigger rather than being attached to each chat request.
 
 The following ceilings prevent unbounded buffering:
@@ -412,8 +458,8 @@ The following ceilings prevent unbounded buffering:
 Oversized request bodies or images return `413`. Upstream resource ceilings stop
 the request without retrying or switching to guest mode; non-streaming generation
 returns `502`, while an already-open chat stream reports an upstream error.
-These safeguards reduce resource use but do not guarantee every conversation
-fits the Free plan's CPU budget. If the platform still terminates a request,
+These safeguards reduce resource use but do not guarantee arbitrary workloads
+fit platform CPU, memory or daily usage limits. If the platform still terminates a request,
 check its invocation outcome for `exceededCpu` or `exceededMemory` and compare
 short text requests with the failing workload.
 
