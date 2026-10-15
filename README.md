@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.11-62b6ff"></a>
+  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.12-62b6ff"></a>
   <a href="https://workers.cloudflare.com/"><img alt="Cloudflare Workers" src="https://img.shields.io/badge/Cloudflare-Workers-f6821f?logo=cloudflareworkers&logoColor=white"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f6b95c"></a>
   <a href="https://github.com/banana2556"><img alt="Author banana2556" src="https://img.shields.io/badge/GitHub-%40banana2556-8b949e?logo=github"></a>
@@ -116,15 +116,31 @@ protect API requests and unlock the browser console.
 Visit the deployed Worker URL in a browser:
 
 1. Enter one of the configured API keys.
-2. Open **Import / 匯入面板** and paste a Cookie from a signed-in
-   `gemini.google.com` request.
-3. Refresh or verify the Cookie.
+2. In Firefox, sign in to `gemini.google.com`, then open **F12 → Storage →
+   Cookies** and select the relevant Gemini or Google domain.
+3. Open **Import / 匯入面板**. Copy the full **Value** of `__Secure-1PSID`
+   into the first field and `__Secure-1PSIDTS` into the second field. The first
+   field is required; leave the second empty if the account does not have it.
+   Paste only the values, then click **Import and verify / 匯入並驗證**.
 4. Confirm that the expected models appear in **Information / 資訊面板**.
 5. Send a test request from **Playground**.
 
-The imported Cookie must include `SAPISID` and a valid session Cookie such as
-`__Secure-1PSID`. Cookie values are stored only in the Durable Object and are
-never returned by status endpoints.
+The console builds the Cookie from those two fields. You do not need to paste
+Cookie names, a full Cookie header, JSON, or SAPISID. Copy complete values;
+truncated values cannot verify a login. Import checks the structure and
+refresh verifies the login with Gemini. Cookie values are stored only in the
+Durable Object and are never returned by status endpoints. This follows
+[Gemini-API's authentication approach](https://github.com/HanaokaYuzu/Gemini-API#authentication):
+its optional `browser-cookie3` integration reads the local browser store,
+including Firefox, and selects those two Cookies. A Cloudflare Worker cannot
+read a local browser store, so copy or export the values into the console.
+Firefox is recommended there because Chromium device-bound sessions can
+prevent renewal; the recommendation is unrelated to SAPISID being absent.
+
+When a mixed Cookie export returns a signed-out page or HTTP 401/403, manual
+refresh retries with only `__Secure-1PSID` and `__Secure-1PSIDTS`, without a
+`SAPISIDHASH` header. The reduced Cookie jar replaces the stored jar only after
+Gemini's session RPC accepts it; failed verification retains the existing jar.
 
 ### 4. Verify the deployment
 
@@ -212,8 +228,11 @@ frontend deployment.
 
 ## Models and routing
 
-With a configured Cookie, `GET /v1/models` builds six aliases from Gemini's
-current `GetUserStatus` response:
+With a configured Cookie, `GET /v1/models` exposes every model returned by
+the account's current `GetUserStatus` response, with a standard and Extended
+Thinking alias each. The catalog has no fixed model count or category allowlist;
+new names such as Argon appear when Google includes them for that account.
+Common aliases include:
 
 | Family | Standard | Extended Thinking |
 |---|---|---|
@@ -227,6 +246,10 @@ current `GetUserStatus` response:
 - The signed-in catalog is cached for ten minutes and invalidated when the
   stored Cookie changes.
 - `GET /v1/models?refresh=1` forces a fresh catalog lookup.
+- Models are selected using the ID and protocol number returned by Google.
+  Missing legacy `/app` route pairs do not hide a model; the model selection
+  header is used in that case. Multiple versions in a category remain listed,
+  while the newest Flash is preferred by default.
 
 Without a Cookie, the Worker exposes only `gemini-auto` and
 `gemini-auto-thinking`. Unknown client aliases remain usable in guest mode:
@@ -386,10 +409,15 @@ fresh Firefox session and closing that browser session after export.
 | Pro requests fall back | Inspect `upstream_model` and `route_status`; verify that the account has Pro access |
 | Cookie refresh reports `reauth_required` | Export a fresh Cookie from a signed-in Gemini browser session |
 
-`GEMINI_BL` is discovered from Gemini's app page and cached for one hour per
-origin during upstream operations. The configured value is the fallback.
-`/health` reports the in-memory build when available, otherwise that fallback;
-it does not fetch Gemini or verify upstream connectivity.
+`GEMINI_BL` is discovered from Gemini's app page during upstream operations.
+Its one-hour cache is scoped to the account session. Model catalog responses
+include the build from the same lookup, its source (`upstream`, `cache`,
+`stored`, or `configured`) and its check time. The console uses that account
+result and labels fallback values explicitly. Refreshing the information or
+model panel bypasses the ten-minute model cache and fetches the app build again.
+`/health` remains a lightweight check: it reports only the configured fallback,
+does not fetch Gemini, and does not verify upstream connectivity. A build date
+is the label returned by Google, not the current date.
 
 ### Worker CPU or memory limit errors
 

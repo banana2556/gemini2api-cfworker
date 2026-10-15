@@ -380,7 +380,7 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   assert.equal((await root.json()).status, "ok");
   const healthJson = await health.json();
   assert.equal(healthJson.status, "ok");
-  assert.equal(healthJson.version, "1.9.11");
+  assert.equal(healthJson.version, "1.9.12");
 });
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
@@ -555,6 +555,200 @@ test("Cookie import accepts the flat map formats used by the reference client", 
   assert.equal(flatResponse.status, 200);
   assert.equal(store.peek().cookie_jar.length, 2);
   assert.match(store.peek().cookie, /__Secure-1PSID=flat-session-2/);
+});
+
+test("Firefox session without SAPISID supports import, refresh, generation and scheduled rotation", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key", COOKIE_STORE: store,
+    UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false",
+  };
+  const headers = { Authorization: "Bearer api-test-key", "Content-Type": "application/json" };
+  const imported = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT", headers,
+    body: JSON.stringify({ auth: "__Secure-1PSID=firefox-session; __Secure-1PSIDTS=firefox-ts" }),
+  }), env);
+  assert.equal(imported.status, 200);
+  const importedData = await imported.json();
+  assert.equal(importedData.cookie.structurally_valid, true);
+  assert.equal(importedData.cookie.sapisid_present, false);
+  assert.equal(store.peek().sapisid, "");
+
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    let rotations = 0;
+    let generations = 0;
+    const authFetch = googleAuthFetch({
+      appBody: modelAppHtml,
+      rotateCookies: ["__Secure-1PSIDTS=firefox-rotated-ts; Path=/; Secure; HttpOnly"],
+    });
+    globalThis.fetch = (input, init = {}) => {
+      const url = String(typeof input === "string" ? input : input.url);
+      const upstreamHeaders = new Headers(init.headers);
+      assert.equal(upstreamHeaders.has("Authorization"), false);
+      assert.match(upstreamHeaders.get("Cookie") || "", /__Secure-1PSID=firefox-session/);
+      if (url.includes("/RotateCookies")) rotations += 1;
+      if (url.includes("/StreamGenerate")) {
+        generations += 1;
+        return Promise.resolve(new Response(generateRaw("Firefox authenticated answer with enough padding to pass parser")));
+      }
+      return authFetch(input, init);
+    };
+
+    const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST", headers,
+    }), env);
+    assert.equal(refreshed.status, 200);
+    const refreshedData = await refreshed.json();
+    assert.equal(refreshedData.status, "refreshed");
+    assert.equal(refreshedData.cookie.structurally_valid, true);
+    assert.equal(refreshedData.cookie.sapisid_present, false);
+    assert.equal(store.peek().xsrf_token, "guest-at");
+    assert.match(store.peek().cookie, /__Secure-1PSIDTS=firefox-rotated-ts/);
+
+    const generated = await worker.fetch(new Request("https://worker.example/v1/chat/completions", {
+      method: "POST", headers,
+      body: JSON.stringify({ model: "gemini-auto", messages: [{ role: "user", content: "hello" }] }),
+    }), env);
+    assert.equal(generated.status, 200);
+    assert.match((await generated.json()).choices[0].message.content, /Firefox authenticated answer/);
+    assert.equal(generations, 1);
+
+    store.peek().last_rotation_attempt_at = new Date(Date.now() - 120000).toISOString();
+    store.peek().next_rotation_at = new Date(Date.now() - 1000).toISOString();
+    const tasks = [];
+    await worker.scheduled({}, env, { waitUntil(task) { tasks.push(task); } });
+    await Promise.all(tasks);
+    assert.equal(rotations, 2);
+    assert.equal(store.peek().refresh_status, "verified");
+    assert.equal(store.peek().sapisid, "");
+
+    globalThis.fetch = async (input, init) => String(input).includes("rpcids=otAQ7b")
+      ? new Response(modelStatusRejectionRaw())
+      : authFetch(input, init);
+    const rejected = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+      method: "POST", headers,
+    }), env);
+    assert.equal((await rejected.json()).status, "reauth_required");
+    assert.equal(store.peek().refresh_error, "get_user_status_rejected");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+for (const initialStatus of [200, 401, 403]) {
+  test(`minimal browser Cookies recover a mixed export after HTTP ${initialStatus} without retaining SAPISID`, async () => {
+    const store = memoryCookieStore();
+    const env = {
+      API_KEYS: "api-test-key", COOKIE_STORE: store,
+      UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false",
+    };
+    const headers = { Authorization: "Bearer api-test-key", "Content-Type": "application/json" };
+    const minimal = "__Secure-1PSID=reference-session; __Secure-1PSIDTS=reference-ts";
+    await worker.fetch(new Request("https://worker.example/admin/cookie", {
+      method: "PUT", headers,
+      body: JSON.stringify({ auth: `${minimal}; SAPISID=stale-sapi; NID=stale-nid; __Secure-1PSIDCC=stale-cc; __Secure-3PSID=stale-session; __Secure-3PSIDTS=stale-ts` }),
+    }), env);
+
+    const originalFetch = globalThis.fetch;
+    internals.__setConnect(null);
+    try {
+      let mixedAttempts = 0;
+      let minimalAttempts = 0;
+      const authFetch = googleAuthFetch({ rotateStatus: 401, appBody: modelAppHtml });
+      globalThis.fetch = (input, init = {}) => {
+        const url = String(input);
+        if (url.includes("/RotateCookies")) return authFetch(input, init);
+        const upstreamHeaders = new Headers(init.headers);
+        if (url.includes("/app") && upstreamHeaders.get("Cookie") !== minimal) {
+          mixedAttempts += 1;
+          return Promise.resolve(new Response('<a aria-label="Sign in" href="https://accounts.google.com/ServiceLogin">Sign in</a>', { status: initialStatus }));
+        }
+        assert.equal(upstreamHeaders.get("Cookie"), minimal);
+        assert.equal(upstreamHeaders.has("Authorization"), false);
+        if (url.includes("/app")) minimalAttempts += 1;
+        return authFetch(input, init);
+      };
+      const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+        method: "POST", headers,
+      }), env);
+      const result = await refreshed.json();
+      assert.equal(refreshed.status, 200);
+      assert.equal(result.status, "no_rotation");
+      assert.equal(result.cookie.refresh_status, "verified");
+      assert.equal(result.cookie.sapisid_present, false);
+      assert.equal(store.peek().sapisid, "");
+      assert.equal(store.peek().cookie, minimal);
+      assert.equal(store.peek().rotated_at, null);
+      assert.equal(mixedAttempts, 1);
+      assert.equal(minimalAttempts, 1);
+
+      const models = await worker.fetch(new Request("https://worker.example/v1/models?refresh=1", { headers }), env);
+      assert.equal(models.status, 200);
+      assert.equal((await models.json()).data.length, 6);
+      assert.equal(mixedAttempts, 1);
+      assert.equal(minimalAttempts, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
+for (const rpcResult of ["rejected", "inconclusive"]) {
+  test(`minimal browser Cookie candidate keeps the original jar when RPC verification is ${rpcResult}`, async () => {
+    const store = memoryCookieStore();
+    const env = {
+      API_KEYS: "api-test-key", COOKIE_STORE: store,
+      UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false",
+    };
+    const headers = { Authorization: "Bearer api-test-key", "Content-Type": "application/json" };
+    await worker.fetch(new Request("https://worker.example/admin/cookie", {
+      method: "PUT", headers,
+      body: JSON.stringify({ auth: "__Secure-1PSID=unverified-session; __Secure-1PSIDTS=unverified-ts; SAPISID=original-sapi; NID=original-nid" }),
+    }), env);
+    const originalRecord = structuredClone(store.peek());
+    const originalFetch = globalThis.fetch;
+    internals.__setConnect(null);
+    try {
+      const authFetch = googleAuthFetch({ rotateStatus: 401, appBody: modelAppHtml });
+      globalThis.fetch = (input, init = {}) => {
+        const url = String(input);
+        if (url.includes("/app") && new Headers(init.headers).get("Cookie")?.includes("SAPISID=")) {
+          return Promise.resolve(new Response('<a aria-label="Sign in" href="https://accounts.google.com/ServiceLogin">Sign in</a>'));
+        }
+        if (url.includes("rpcids=otAQ7b")) {
+          assert.equal(new Headers(init.headers).has("Authorization"), false);
+          assert.doesNotMatch(new Headers(init.headers).get("Cookie"), /SAPISID|NID/);
+          return Promise.resolve(new Response(rpcResult === "rejected" ? modelStatusRejectionRaw() : "[]"));
+        }
+        return authFetch(input, init);
+      };
+      const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", {
+        method: "POST", headers,
+      }), env);
+      assert.equal((await refreshed.json()).status, rpcResult === "rejected" ? "reauth_required" : "retrying");
+      assert.equal(store.peek().cookie, originalRecord.cookie);
+      assert.deepEqual(store.peek().cookie_jar, originalRecord.cookie_jar);
+      assert.equal(store.peek().sapisid, originalRecord.sapisid);
+      assert.equal(store.peek().updated_at, originalRecord.updated_at);
+      assert.equal(store.peek().refreshed_at, null);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
+test("Cookie import rejects timestamp and check Cookies without a login session", async () => {
+  const store = memoryCookieStore();
+  const response = await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT",
+    headers: { Authorization: "Bearer api-test-key", "Content-Type": "application/json" },
+    body: JSON.stringify({ auth: "__Secure-3PAPISID=example; __Secure-1PSIDTS=example; __Secure-3PSIDTS=example; __Secure-1PSIDCC=example; __Secure-3PSIDCC=example; SIDCC=example" }),
+  }), { API_KEYS: "api-test-key", COOKIE_STORE: store });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error.message, /缺少登入工作階段 Cookie/);
+  assert.equal(store.peek(), null);
 });
 
 test("authenticated Cookie refresh persists rotations without exposing values and rejects expired login", async () => {
@@ -1345,6 +1539,206 @@ test("API key authentication accepts common header variants", async () => {
     headers: { "api-key": "wrong" },
   }), env);
   assert.equal(denied.status, 401);
+});
+
+test("model responses include newly discovered models and the upstream build across cache hits", async () => {
+  const store = memoryCookieStore();
+  const env = {
+    API_KEYS: "api-test-key", COOKIE_STORE: store,
+    GEMINI_BL: "boq_assistant-bard-web-server_20260804.05_p0",
+    GEMINI_ORIGIN: "https://build-discovery.example",
+    UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false",
+  };
+  const headers = { Authorization: "Bearer api-test-key", "Content-Type": "application/json" };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT", headers, body: JSON.stringify({ auth: "__Secure-1PSID=build-discovery-session" }),
+  }), env);
+  const originalFetch = globalThis.fetch;
+  internals.__setConnect(null);
+  try {
+    let appCalls = 0;
+    let rpcCalls = 0;
+    let build = "boq_assistant-bard-web-server_20261015.01_p0";
+    const payload = JSON.parse(JSON.parse(modelStatusRaw())[0][2]);
+    payload[14] = 1000;
+    payload[15].push(statusRow("aaaaaaaaaaaaaaaa", "Argon", 9, "bbbbbbbbbbbbbbbb"));
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("/app")) {
+        appCalls += 1;
+        return new Response(modelAppHtml.replace("boq_assistant-bard-web-server_test", build));
+      }
+      if (url.includes("rpcids=otAQ7b")) {
+        rpcCalls += 1;
+        assert.equal(new URL(url).searchParams.get("bl"), build);
+        return new Response(JSON.stringify([["wrb.fr", "otAQ7b", JSON.stringify(payload)]]));
+      }
+      throw new Error("Unexpected model discovery request");
+    };
+    const requestModels = (force = false) => worker.fetch(new Request("https://worker.example/v1/models" + (force ? "?refresh=1" : ""), { headers }), env);
+    const fresh = await (await requestModels(true)).json();
+    assert.equal(fresh.data.length, 8);
+    assert.ok(fresh.data.some((model) => model.id === "gemini-argon"));
+    assert.equal(fresh.gemini_bl, build);
+    assert.equal(fresh.gemini_bl_source, "upstream");
+    assert.ok(fresh.gemini_bl_checked_at);
+    const cached = await (await requestModels()).json();
+    assert.equal(cached.data.length, 8);
+    assert.equal(cached.gemini_bl, build);
+    assert.equal(cached.gemini_bl_source, "cache");
+    assert.equal(cached.gemini_bl_checked_at, fresh.gemini_bl_checked_at);
+    assert.equal(appCalls, 1);
+    assert.equal(rpcCalls, 1);
+    build = "boq_assistant-bard-web-server_20261016.01_p0";
+    const forced = await (await requestModels(true)).json();
+    assert.equal(forced.gemini_bl, build);
+    assert.equal(forced.gemini_bl_source, "upstream");
+    assert.equal(appCalls, 2);
+    assert.equal(rpcCalls, 2);
+    const health = await (await worker.fetch(new Request("https://worker.example/health"), env)).json();
+    assert.equal(health.gemini_bl_source, "configured");
+    assert.equal(health.gemini_bl_checked_at, null);
+    assert.equal(appCalls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a newly discovered model generates using its returned ID and protocol number", async () => {
+  const store = memoryCookieStore();
+  const env = { API_KEYS: "api-test-key", COOKIE_STORE: store, UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false", RETRY_ATTEMPTS: "1" };
+  const headers = { Authorization: "Bearer api-test-key", "Content-Type": "application/json" };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT", headers, body: JSON.stringify({ auth: "__Secure-1PSID=argon-generation-session" }),
+  }), env);
+  const originalFetch = globalThis.fetch;
+  const authFetch = googleAuthFetch({ appBody: modelAppHtml });
+  let generations = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    assert.match(new Headers(init.headers).get("Cookie") || "", /__Secure-1PSID=argon-generation-session/);
+    if (url.includes("rpcids=otAQ7b")) {
+      const payload = new Array(16).fill(null);
+      payload[14] = 1000;
+      payload[15] = [statusRow("aaaaaaaaaaaaaaaa", "Argon", 9, "bbbbbbbbbbbbbbbb")];
+      return new Response(JSON.stringify([["wrb.fr", "otAQ7b", JSON.stringify(payload)]]));
+    }
+    if (url.includes("StreamGenerate")) {
+      generations += 1;
+      const selected = JSON.parse(new Headers(init.headers).get("x-goog-ext-525001261-jspb"));
+      assert.equal(selected[4], "aaaaaaaaaaaaaaaa");
+      assert.equal(selected.at(-1), 9);
+      const inner = JSON.parse(JSON.parse(new URLSearchParams(init.body).get("f.req"))[1]);
+      assert.equal(inner[79], 9);
+      assert.equal(inner[80], 1);
+      assert.equal(inner[64], null);
+      return new Response(generateRaw("Argon response with enough padding to pass parser"));
+    }
+    return authFetch(input, init);
+  };
+  try {
+    const response = await worker.fetch(new Request("https://worker.example/v1/chat/completions", {
+      method: "POST", headers, body: JSON.stringify({ model: "gemini-argon", messages: [{ role: "user", content: "hello" }] }),
+    }), env);
+    const data = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(data.model, "gemini-argon");
+    assert.match(data.choices[0].message.content, /Argon response/);
+    assert.equal(data.route_status, "unknown");
+    assert.equal(generations, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("shared model cache accepts variable model counts and restores build metadata", async () => {
+  const originalCaches = globalThis.caches;
+  const originalFetch = globalThis.fetch;
+  const build = "boq_assistant-bard-web-server_shared-cache";
+  const models = internals.buildModelCatalog({ 15: [statusRow("aaaaaaaaaaaaaaaa", "Argon", 9, "bbbbbbbbbbbbbbbb")] }, "");
+  const checkedAt = new Date().toISOString();
+  const cfg = internals.applyStoredAuth(internals.getConfig({}), { cookie: "__Secure-1PSID=shared-cache-session" });
+  let cacheCalls = 0;
+  globalThis.caches = { default: {
+    async match(request) {
+      cacheCalls += 1;
+      assert.equal(new URL(request.url).searchParams.get("v"), "3");
+      return Response.json({ models, expiresAt: Date.now() + 60000, build: {
+        gemini_bl: build, gemini_bl_source: "upstream", gemini_bl_checked_at: checkedAt,
+      } });
+    },
+  } };
+  globalThis.fetch = async () => { throw new Error("Cached catalog must not fetch upstream"); };
+  try {
+    assert.deepEqual(await internals.getModelCatalog(cfg), models);
+    assert.equal(cacheCalls, 1);
+    assert.equal(cfg.gemini_bl, build);
+    assert.equal(cfg.gemini_bl_source, "cache");
+    assert.equal(cfg.gemini_bl_checked_at, checkedAt);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalCaches === undefined) delete globalThis.caches;
+    else globalThis.caches = originalCaches;
+  }
+});
+
+test("build discovery isolates different accounts and labels a failed lookup as a fallback", async () => {
+  const originalFetch = globalThis.fetch;
+  const config = () => internals.getConfig({ GEMINI_ORIGIN: "https://account-builds.example", UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false" });
+  const account = (name) => internals.applyStoredAuth(config(), { cookie: `__Secure-1PSID=${name}` });
+  let calls = 0;
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    const cookie = new Headers(init.headers).get("Cookie");
+    if (cookie.includes("broken-account")) throw new Error("Unavailable");
+    return new Response(JSON.stringify({ cfb2h: cookie.includes("account-a") ? "boq_assistant-bard-web-server_build-a" : "boq_assistant-bard-web-server_build-b" }));
+  };
+  try {
+    const a = account("account-a");
+    const b = account("account-b");
+    assert.equal(await internals.refreshGeminiBl(a), "boq_assistant-bard-web-server_build-a");
+    assert.equal(await internals.refreshGeminiBl(b), "boq_assistant-bard-web-server_build-b");
+    assert.equal(calls, 2);
+    assert.equal(b.gemini_bl_source, "upstream");
+    assert.ok(b.gemini_bl_checked_at);
+    const again = account("account-b");
+    assert.equal(await internals.refreshGeminiBl(again), "boq_assistant-bard-web-server_build-b");
+    assert.equal(again.gemini_bl_source, "cache");
+    assert.equal(calls, 2);
+    const broken = account("broken-account");
+    await internals.refreshGeminiBl(broken);
+    assert.equal(broken.gemini_bl_source, "configured");
+    assert.equal(broken.gemini_bl_checked_at, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("session verification accepts a catalog containing only a new model category", async () => {
+  const store = memoryCookieStore();
+  const env = { API_KEYS: "api-test-key", COOKIE_STORE: store, UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false" };
+  const headers = { Authorization: "Bearer api-test-key", "Content-Type": "application/json" };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT", headers, body: JSON.stringify({ auth: "__Secure-1PSID=new-category-session" }),
+  }), env);
+  const originalFetch = globalThis.fetch;
+  const authFetch = googleAuthFetch();
+  globalThis.fetch = (input, init) => {
+    if (String(input).includes("rpcids=otAQ7b")) {
+      const payload = new Array(16).fill(null);
+      payload[14] = 1000;
+      payload[15] = [statusRow("aaaaaaaaaaaaaaaa", "Argon", 9, "bbbbbbbbbbbbbbbb")];
+      return Promise.resolve(new Response(JSON.stringify([["wrb.fr", "otAQ7b", JSON.stringify(payload)]])));
+    }
+    return authFetch(input, init);
+  };
+  try {
+    const refreshed = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", { method: "POST", headers }), env);
+    assert.equal((await refreshed.json()).cookie.refresh_status, "verified");
+    assert.ok(store.peek().gemini_bl_checked_at);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("anonymous catalog is guest auto routing and does not fetch Gemini", async () => {

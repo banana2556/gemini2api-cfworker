@@ -8,6 +8,7 @@ const {
   authCacheKey,
   buildModelCatalog,
   buildHeaders,
+  cookieSummary,
   buildPayload,
   extractActualModel,
   extractGeminiBl,
@@ -63,7 +64,7 @@ test("unknown client aliases keep the thinking suffix on guest auto routing", ()
   assert.equal(resolveModel("gemini-auto-thinking", "", guest).extra, null);
 });
 
-test("GetUserStatus builds exactly three current models with a thinking variant each", () => {
+test("GetUserStatus exposes the returned models with a thinking variant each", () => {
   assert.deepEqual(Object.keys(models), [
     "gemini-3.5-flash-lite",
     "gemini-3.5-flash-lite-thinking",
@@ -75,7 +76,7 @@ test("GetUserStatus builds exactly three current models with a thinking variant 
   assert.equal(resolveModel("missing-client-alias", "", models).name, "gemini-3.7-flash");
 });
 
-test("GetUserStatus prefers the newest routable rollout in a model category", () => {
+test("GetUserStatus preserves every rollout and prefers the newest default in a model category", () => {
   const older = statusRow("1111111111111111", "3.6 Flash", 1, "2222222222222222");
   const newer = statusRow("3333333333333333", "3.8 Flash", 1, "4444444444444444");
   const html = [
@@ -87,7 +88,48 @@ test("GetUserStatus prefers the newest routable rollout in a model category", ()
 
   assert.equal(catalog["gemini-3.8-flash"].model, "3333333333333333");
   assert.equal(catalog["gemini-3.8-flash"].submodel, "4444444444444444");
-  assert.equal(catalog["gemini-3.6-flash"], undefined);
+  assert.equal(catalog["gemini-3.6-flash"].model, "1111111111111111");
+  assert.equal(defaultModelName(catalog), "gemini-3.8-flash");
+});
+
+test("Argon and new protocol numbers are discovered without a fixed category or /app route pair", () => {
+  const argon = statusRow("aaaaaaaaaaaaaaaa", "Argon", 9, "bbbbbbbbbbbbbbbb");
+  const catalog = buildModelCatalog({ 15: [...statusPayload[15], argon] }, appHtml);
+  assert.equal(Object.keys(catalog).length, 8);
+  assert.equal(catalog["gemini-argon"].mode, 9);
+  assert.equal(catalog["gemini-argon"].submodel, "");
+  const selected = resolveModel("gemini-argon", "", catalog);
+  assert.equal(selected.extra, null);
+  assert.equal(JSON.parse(selected.header)[4], "aaaaaaaaaaaaaaaa");
+  assert.equal(JSON.parse(selected.header).at(-1), 9);
+  const inner = JSON.parse(JSON.parse(new URLSearchParams(buildPayload("PING", selected.modeId, selected.thinkingLevel, null, selected.extra)).get("f.req"))[1]);
+  assert.equal(inner[79], 9);
+  assert.equal(inner[64], null);
+  assert.equal(catalog["gemini-argon-thinking"].thinking_level, 2);
+  assert.equal(routeStatus(9, "3.8 Flash"), "unknown");
+});
+
+test("model discovery keeps multiple names in one category and tolerates a smaller catalog", () => {
+  const argon = statusRow("aaaaaaaaaaaaaaaa", "Argon", 3, "bbbbbbbbbbbbbbbb");
+  argon[17] = null;
+  argon[9] = 7;
+  const onlyArgon = buildModelCatalog({ 15: [null, [], argon] }, "");
+  assert.equal(Object.keys(onlyArgon).length, 2);
+  assert.equal(onlyArgon["gemini-argon"].mode, 7);
+  argon[17] = 3;
+  const together = buildModelCatalog({ 15: [...statusPayload[15], argon] }, appHtml);
+  assert.ok(together["gemini-argon"]);
+  assert.ok(together["gemini-3.1-pro"]);
+  assert.throws(() => buildModelCatalog({ 15: [null, []] }, ""), /no models/);
+});
+
+test("model discovery deduplicates primary IDs without losing same-name models", () => {
+  const a = statusRow("aaaaaaaaaaaaaaaa", "Argon", 7, "bbbbbbbbbbbbbbbb");
+  const b = statusRow("cccccccccccccccc", "Argon", 7, "dddddddddddddddd");
+  const catalog = buildModelCatalog({ 15: [a, a, b] }, "");
+  assert.equal(Object.keys(catalog).length, 4);
+  assert.equal(catalog["gemini-argon"].model, a[0]);
+  assert.equal(catalog["gemini-argon-cccccccccccccccc"].model, b[0]);
 });
 
 test("standard and extended payloads use current route IDs and independent thinking levels", () => {
@@ -182,6 +224,34 @@ test("Cookie import normalizes markdown-escaped browser paste", () => {
 
 test("Cookie validation rejects an incomplete login session", () => {
   assert.throws(() => parseAuthPayload("SAPISID=value", true), /工作階段 Cookie/);
+  assert.throws(() => parseAuthPayload(
+    "AEC=example; NID=example; __Secure-3PAPISID=example; SIDCC=example; __Secure-1PSIDCC=example; __Secure-3PSIDCC=example; __Secure-1PSIDTS=example; __Secure-3PSIDTS=example",
+    true,
+  ), /缺少登入工作階段 Cookie.*PSIDTS、PSIDCC 與 APISID 無法取代/);
+  assert.throws(() => parseAuthPayload({
+    cookie: "SAPISID=embedded; SID=session", sapisid: "different",
+  }, true), /不一致/);
+});
+
+test("session Cookies without SAPISID import and authenticate without a hash header", async () => {
+  for (const name of ["__Secure-1PSID", "__Secure-3PSID", "SID"]) {
+    const parsed = parseAuthPayload(`${name}=firefox-session; __Secure-3PAPISID=optional-api`, true);
+    assert.equal(parsed.sapisid, "");
+    const cfg = applyStoredAuth(getConfig({}), parsed);
+    const summary = cookieSummary(cfg);
+    assert.equal(summary.structurally_valid, true);
+    assert.equal(summary.sapisid_present, false);
+    assert.equal(summary.session_cookie, name);
+    assert.deepEqual(summary.issues, []);
+    const headers = await buildHeaders(cfg);
+    assert.match(headers.Cookie, new RegExp(`${name}=firefox-session`));
+    assert.equal(headers.Authorization, undefined);
+  }
+  const json = parseAuthPayload({ cookies: [
+    { name: "__Secure-1PSID", value: "firefox-json-session", domain: ".google.com", path: "/", secure: true },
+  ] }, true);
+  assert.equal(json.sapisid, "");
+  assert.equal(json.cookie, "__Secure-1PSID=firefox-json-session");
 });
 
 test("page-token cache identity changes with the Cookie", async () => {
