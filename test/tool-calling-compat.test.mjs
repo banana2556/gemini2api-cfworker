@@ -267,6 +267,22 @@ test("Gemini build is extracted from the app page", () => {
   );
 });
 
+test("cfb2h accepts the current Gemini UI build and takes priority over legacy bundle labels", () => {
+  const build = "boq_gemini-web-uiserver_20261013.29_p0";
+  const html = `<script>const legacy = "boq_assistant-bard-web-server_20260804.05_p0";</script><script>{"cfb2h": "${build}"}</script>`;
+  assert.equal(extractGeminiBl(html), build);
+  assert.equal(globalThis.__GEMINI_WORKER_TEST__.extractPageTokens(html).bl, build);
+  assert.equal(extractGeminiBl('{"cfb2h":"future_gemini-server_20261016.01_p0"}'), "future_gemini-server_20261016.01_p0");
+  assert.equal(extractGeminiBl('{"cfb2h":"boq_gemini-web-uiserver_20261013\\u002e29_p0"}'), build);
+});
+
+test("build fallback recognizes the new prefix without cfb2h and rejects empty or unsafe labels", () => {
+  assert.equal(extractGeminiBl('"boq_gemini-web-uiserver_20261013.29_p0" "boq_assistant-bard-web-server_20260804.05_p0"'), "boq_gemini-web-uiserver_20261013.29_p0");
+  assert.equal(extractGeminiBl('{"cfb2h":""}'), "");
+  assert.equal(extractGeminiBl('{"cfb2h":"unexpected value with spaces"}'), "");
+  assert.equal(extractGeminiBl("no build here"), "");
+});
+
 test("actual upstream model and fallback routing are extracted from StreamGenerate", () => {
   const inner = new Array(43).fill(null);
   inner[42] = "3.5 Flash-Lite";

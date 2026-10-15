@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.12";
+const VERSION = "1.9.14";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -46,7 +46,7 @@ const CONFIG = {
   API_KEYS: [],
 
   // Gemini 网页版构建号。如果返回开始变空,去 gemini.google.com 页面源码里
-  // 找一个新的值("boq_assistant-bard-web-server_...")。
+  // 找 cfb2h 的值(例如 "boq_gemini-web-uiserver_...")。
   GEMINI_BL: "boq_assistant-bard-web-server_20260811.23_p0",
 
   // 上游源站。默认直连 gemini.google.com。若部署在 Cloudflare/无服务器平台
@@ -78,7 +78,7 @@ const MODEL_STATUS_RPC = "otAQ7b";
 const ACTIVITY_RPC = "ESY5D";
 const ACTIVITY_PAYLOAD = '[[["bard_activity_enabled"]]]';
 const MODEL_CATALOG_TTL_SEC = 10 * 60;
-const MODEL_CATALOG_CACHE_VERSION = "3";
+const MODEL_CATALOG_CACHE_VERSION = "4";
 const UNAUTHENTICATED_STATUS = 1016;
 let _modelCatalogMemory = { key: "", models: null, expiresAt: 0, build: null };
 
@@ -349,6 +349,7 @@ const DEFAULT_COOKIE_PATH = "/";
 const ROTATION_COOLDOWN_MS = 60 * 1000;
 const ROTATION_INTERVAL_MS = 10 * 60 * 1000;
 const ROTATION_JITTER_MS = 15 * 1000;
+const ROTATION_LIFETIME_FRACTION = 0.95;
 const ACTIVITY_MIN_INTERVAL_MS = 60 * 1000;
 const ACTIVITY_MAX_INTERVAL_MS = 120 * 1000;
 const MAINTENANCE_LOCK_MS = 5 * 60 * 1000;
@@ -786,9 +787,8 @@ function cookieSummary(cfg) {
   const sessionCookie = SESSION_COOKIE_NAMES.find((name) => pairs.has(name)) || null;
   const psidtsNames = ["__Secure-1PSIDTS", "__Secure-3PSIDTS"]
     .filter((name) => pairs.has(name));
-  const lifetimeCookie = ["__Secure-1PSIDTS", "__Secure-3PSIDTS", "__Secure-1PSID", "__Secure-3PSID"]
-    .map((name) => jar.find((cookie) => cookie.name === name && cookie.expires !== null))
-    .find(Boolean) || null;
+  const lifetimeCookie = rotationLifetimeCookie(cfg);
+  const rotationPlan = cookieRotationPlan(cfg);
   const sessionExpiresAt = lifetimeCookie ? new Date(lifetimeCookie.expires * 1000).toISOString() : null;
   const remainingSeconds = lifetimeCookie ? Math.max(0, lifetimeCookie.expires - Math.floor(Date.now() / 1000)) : null;
   const issues = [];
@@ -808,7 +808,9 @@ function cookieSummary(cfg) {
     expiry_known: !!sessionExpiresAt,
     jar_version: cfg.cookie_jar_version || COOKIE_JAR_VERSION,
     last_rotation_attempt_at: cfg.last_rotation_attempt_at || null,
-    next_rotation_at: cfg.next_rotation_at || null,
+    next_rotation_at: rotationPlan.next_rotation_at,
+    rotation_policy: rotationPlan.policy,
+    rotation_expiry_cookie: lifetimeCookie?.name || null,
     rotation_status: cfg.rotation_status || null,
     rotation_http_status: cfg.rotation_http_status ?? null,
     rotation_transport: cfg.rotation_transport || null,
@@ -915,7 +917,7 @@ function applyStoredAuth(cfg, record) {
     cookie_refresh_status: record.refresh_status || null,
     cookie_refresh_error: record.refresh_error || null,
     last_rotation_attempt_at: record.last_rotation_attempt_at || null,
-    next_rotation_at: record.next_rotation_at || null,
+    next_rotation_at: cookieRotationPlan(record).next_rotation_at,
     rotation_status: record.rotation_status || null,
     rotation_http_status: record.rotation_http_status ?? null,
     rotation_transport: record.rotation_transport || null,
@@ -970,6 +972,7 @@ function storedAuthRecord(cfg, overrides = {}) {
   record.cookie = cookie;
   record.cookie_jar = cookieJar;
   record.cookie_jar_version = COOKIE_JAR_VERSION;
+  record.next_rotation_at = cookieRotationPlan(record).next_rotation_at;
   return record;
 }
 
@@ -1018,6 +1021,51 @@ function randomizedNextAt(nowMs, minimumMs, maximumMs = minimumMs) {
   return new Date(nowMs + minimumMs + Math.floor(Math.random() * (span + 1))).toISOString();
 }
 
+function rotationLifetimeCookie(auth) {
+  // Include expired entries when calculating a due date so an overdue PSIDTS
+  // cannot silently disappear and defer rotation to a longer-lived SID.
+  const jar = normalizeCookieJar(auth.cookie_jar, auth.cookie, 0)
+    .filter((cookie) => cookie.expires !== null
+      && (cookieDomainMatches("accounts.google.com", cookie) || cookieDomainMatches("gemini.google.com", cookie))
+      && cookiePathMatches("/RotateCookies", cookie.path));
+  const psidts = jar.filter((cookie) => ["__Secure-1PSIDTS", "__Secure-3PSIDTS"].includes(cookie.name));
+  const candidates = psidts.length ? psidts : jar.filter((cookie) => SESSION_COOKIE_NAMES.includes(cookie.name));
+  return candidates.sort((a, b) => a.expires - b.expires)[0] || null;
+}
+
+function cookieRotationPlan(auth, nowMs = Date.now()) {
+  const lifetimeCookie = rotationLifetimeCookie(auth);
+  const lastAttempt = Date.parse(auth.last_rotation_attempt_at || "");
+  if (!lifetimeCookie) {
+    let nextAt = auth.next_rotation_at || null;
+    if (Number.isFinite(lastAttempt)) {
+      const recordedAt = Date.parse(nextAt || "");
+      const fallbackAt = lastAttempt + ROTATION_INTERVAL_MS;
+      nextAt = new Date(Number.isFinite(recordedAt)
+        ? Math.min(recordedAt, fallbackAt + ROTATION_JITTER_MS) : fallbackAt).toISOString();
+    }
+    return { policy: "unknown_expiry", next_rotation_at: nextAt };
+  }
+  const expiresMs = lifetimeCookie.expires * 1000;
+  const importedAt = Date.parse(auth.updated_at || auth.cookie_updated_at || "");
+  const issuedAt = lifetimeCookie.updated_at > 0 ? lifetimeCookie.updated_at : importedAt;
+  // Imported exports do not contain the original creation time. The import
+  // time is the fixed start of the remaining known lifetime in that case.
+  const startMs = Number.isFinite(issuedAt) && issuedAt <= nowMs ? issuedAt : nowMs;
+  let dueMs = Math.floor(startMs + Math.max(0, expiresMs - startMs) * ROTATION_LIFETIME_FRACTION);
+  let policy = "expiry_95_percent";
+  if (Number.isFinite(lastAttempt)) {
+    // Retry a failed/unchanged overdue rotation in ten minutes rather than
+    // waiting out another full lifetime or hitting Google on every Cron tick.
+    if (auth.rotation_error || dueMs <= lastAttempt) {
+      dueMs = lastAttempt + ROTATION_INTERVAL_MS;
+      policy = "retry";
+    }
+    dueMs = Math.max(dueMs, lastAttempt + ROTATION_COOLDOWN_MS);
+  }
+  return { policy, next_rotation_at: new Date(dueMs).toISOString() };
+}
+
 async function cookieSessionKey(cfg) {
   if (cfg.session_key) return cfg.session_key;
   const jar = normalizeCookieJar(cfg.cookie_jar, cfg.cookie);
@@ -1056,7 +1104,7 @@ async function claimStoredMaintenance(env, cfg, kind, scheduled = false) {
   const attemptField = kind === "rotation" ? "last_rotation_attempt_at" : "last_activity_attempt_at";
   const nextField = kind === "rotation" ? "next_rotation_at" : "next_activity_at";
   const lastAttempt = Date.parse(cfg[attemptField] || "");
-  const nextAttempt = Date.parse(cfg[nextField] || "");
+  const nextAttempt = Date.parse(kind === "rotation" ? cookieRotationPlan(cfg, nowMs).next_rotation_at || "" : cfg[nextField] || "");
   const minimum = kind === "rotation" ? ROTATION_COOLDOWN_MS : ACTIVITY_MIN_INTERVAL_MS;
   if (Number.isFinite(lastAttempt) && nowMs - lastAttempt < minimum) {
     return { claimed: false, reason: "cooldown", cfg, session_key: sessionKey };
@@ -1133,6 +1181,13 @@ export class CookieStore {
         const nextField = kind === "rotation" ? "next_rotation_at" : "next_activity_at";
         const minimum = kind === "rotation" ? ROTATION_COOLDOWN_MS : ACTIVITY_MIN_INTERVAL_MS;
         const lastAttempt = Date.parse(auth[attemptField] || "");
+        if (kind === "rotation") {
+          const plannedAt = cookieRotationPlan(auth, nowMs).next_rotation_at;
+          if (auth.next_rotation_at !== plannedAt) {
+            auth.next_rotation_at = plannedAt;
+            await txn.put("auth", auth);
+          }
+        }
         const nextAttempt = Date.parse(auth[nextField] || "");
         if (Number.isFinite(lastAttempt) && nowMs - lastAttempt < minimum) {
           return { status: 200, body: { claimed: false, reason: "cooldown", record: auth } };
@@ -1657,6 +1712,7 @@ const ROTATE_COOKIES_URL = "https://accounts.google.com/RotateCookies";
 const ROTATE_COOKIES_BODY = '[000,"-0000000000000000000"]';
 let _pageTokens = { key: "", tokens: null, ts: 0 };
 const GEMINI_BL_CACHE_TTL_SEC = 3600;
+const GEMINI_BL_CACHE_VERSION = "3";
 let _geminiBlMemory = { key: "", value: "", expiresAt: 0, checkedAt: null };
 
 async function authCacheKey(cfg) {
@@ -1666,10 +1722,20 @@ async function authCacheKey(cfg) {
 }
 
 function extractGeminiBl(html) {
-  const cfb2h = /"cfb2h"\s*:\s*"([^"]+)"/.exec(html || "");
-  if (cfb2h && /^boq_assistant-bard-web-server_/.test(cfb2h[1])) return cfb2h[1];
-  const build = /(boq_assistant-bard-web-server_[A-Za-z0-9._-]+)/.exec(html || "");
-  return build ? build[1] : "";
+  // cfb2h is the authoritative build label, independent of Google's server
+  // prefix. A page can still mention legacy builds elsewhere in its bundles.
+  const cfb2h = /"cfb2h"\s*:\s*("(?:\\.|[^"\\])*")/.exec(html || "");
+  if (cfb2h) {
+    try {
+      const build = JSON.parse(cfb2h[1]);
+      if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(build)) return build;
+    } catch (_) {}
+  }
+  for (const prefix of ["boq_gemini-web-uiserver_", "boq_assistant-bard-web-server_"]) {
+    const build = new RegExp(`(${prefix}[A-Za-z0-9._-]+)`).exec(html || "");
+    if (build) return build[1];
+  }
+  return "";
 }
 
 function extractPageTokens(html) {
@@ -1768,7 +1834,7 @@ async function refreshGeminiBl(cfg, signal) {
   }
 
   const cache = globalThis.caches && globalThis.caches.default;
-  const cacheKey = new Request("https://gemini2api-cache.invalid/gemini-bl?v=2&account=" + key);
+  const cacheKey = new Request(`https://gemini2api-cache.invalid/gemini-bl?v=${GEMINI_BL_CACHE_VERSION}&account=${key}`);
   if (cache) {
     try {
       const cached = await cache.match(cacheKey);
@@ -3870,6 +3936,11 @@ async function handleCookieRefresh(cfg, env, verifyPage = true) {
   }
   const now = new Date(Date.now()).toISOString();
 
+  // Verification must use the build from this page, not the build stored
+  // before navigation. Otherwise a newly discovered build is never saved
+  // when Google rejects verification requests carrying the older label.
+  if (tokens.bl) applyGeminiBuild(pageCfg, { gemini_bl: tokens.bl, gemini_bl_checked_at: now }, "upstream");
+
   if (response.ok && !tokens.at && hasAuthenticatedPageMarkers(tokens, page.html)) {
     try {
       const at = await probeXsrfToken(pageCfg, tokens.bl || pageCfg.gemini_bl);
@@ -4392,6 +4463,7 @@ function dashboardResponse(cfg) {
             <button class="btn sm" id="reload-cookie">重新讀取</button>
           </div>
           <dl class="kv" id="cookie-kv"><dt>狀態</dt><dd>尚未載入（需要 API Key）</dd></dl>
+          <p class="hint">保存期限是瀏覽器可保留 Cookie 的時間；Google 仍可能提前讓登入失效。</p>
           <div class="issues" id="cookie-issues" hidden></div>
         </div>
       </div>
@@ -4576,7 +4648,8 @@ function dashboardResponse(cfg) {
         ["最後檢查", fmtTime(cookie.refresh_checked_at)],
         ["最近驗證成功", fmtTime(cookie.refreshed_at)],
         ["最近延長 Session", fmtTime(cookie.rotated_at)],
-        ["Cookie 到期", cookie.expiry_known ? fmtTime(cookie.session_expires_at) : "瀏覽器匯出未含到期資訊"],
+        ["Cookie 保存期限", cookie.expiry_known ? fmtTime(cookie.session_expires_at) : "尚無到期資訊"],
+        ["輪替依據", cookie.rotation_policy === "expiry_95_percent" ? "已知有效期間的 95%（" + cookie.rotation_expiry_cookie + "）" : cookie.rotation_policy === "retry" ? "輪替重試，每 10 分鐘" : "期限未知，每 10 分鐘"],
         ["下次輪替", fmtTime(cookie.next_rotation_at)],
         ["輪替傳輸", cookie.rotation_transport || "—"],
         ["上次刷新結果", cookie.refresh_status === "rotation_ok" ? "輪替成功，等待頁面驗證" : cookie.refresh_status === "retrying" ? "暫時失敗，將重試" : cookie.refresh_status === "verified" ? "登入有效" : cookie.refresh_status || "—", cookie.refresh_status === "reauth_required" ? "bad" : ""],
@@ -4630,7 +4703,7 @@ function dashboardResponse(cfg) {
           ((cookie.issues || []).length ? " · " + cookie.issues.length + " 項問題" : "") + " · 即時登入狀態請手動刷新");
         var checkedAgo = fmtAgo(cookie.refresh_checked_at);
         if (!cookie.refresh_checked_at) {
-          setStat("stat-cron", "warn", "尚未檢查", "每分鐘檢查、約每 10 分鐘輪替 · 還沒有檢查紀錄");
+          setStat("stat-cron", "warn", "尚未檢查", "每分鐘檢查排程 · 已知期限在 95% 時輪替，期限未知時每 10 分鐘輪替");
         } else if (cookie.refresh_status === "reauth_required") {
           setStat("stat-cron", "err", "需要重匯入",
             "排程最後檢查：" + checkedAgo + " · Google 已明確拒絕這份 Cookie");
@@ -4638,10 +4711,11 @@ function dashboardResponse(cfg) {
           setStat("stat-cron", "warn", "等待重試",
             "最後檢查：" + checkedAgo + " · 現有 Cookie 已保留");
         } else {
-          var overdue = Date.now() - new Date(cookie.refresh_checked_at).getTime() > 30 * 60000;
+          var dueAt = Date.parse(cookie.next_rotation_at || "");
+          var overdue = Number.isFinite(dueAt) && Date.now() - dueAt > 30 * 60000;
           setStat("stat-cron", overdue ? "warn" : "ok", overdue ? "已逾期" : "正常",
-            "排程最後檢查：" + checkedAgo +
-            (overdue ? "；請按「手動重新整理」或檢查 Cookie 是否失效" : ""));
+            overdue ? "輪替時間已過；請按「手動重新整理」檢查登入狀態"
+              : "下次輪替：" + fmtTime(cookie.next_rotation_at) + " · 每分鐘檢查排程");
         }
       }
       renderCookieKv(data.cookie || null);
@@ -5178,7 +5252,7 @@ if (typeof process !== "undefined" && process.versions && process.versions.node)
     computeAccountCapacity, buildModelSelectHeader,
     guestModelCatalog, defaultModelName, modelNameForCategory, resolveModel, getConfig, getRequestConfig, getModelCatalog, applyStoredAuth,
     parseAuthPayload, cookieSummary, authCacheKey,
-    getSetCookieValues, importedCookieJar, normalizeCookieJar, cookieHeaderForUrl, serializeCookieJar,
+    getSetCookieValues, importedCookieJar, normalizeCookieJar, cookieHeaderForUrl, serializeCookieJar, cookieRotationPlan,
     parseSetCookie, mergeCookieJar, mergeRotatedCookies, cookieSessionKey,
     buildPayload, getUrl, buildHeaders, cleanText,
     extractTextsFromLine, extractResponseText, extractActualModel, routeStatus, generate, generateResult, generateStream,

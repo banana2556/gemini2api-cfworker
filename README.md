@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.12-62b6ff"></a>
+  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.14-62b6ff"></a>
   <a href="https://workers.cloudflare.com/"><img alt="Cloudflare Workers" src="https://img.shields.io/badge/Cloudflare-Workers-f6821f?logo=cloudflareworkers&logoColor=white"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f6b95c"></a>
   <a href="https://github.com/banana2556"><img alt="Author banana2556" src="https://img.shields.io/badge/GitHub-%40banana2556-8b949e?logo=github"></a>
@@ -62,7 +62,7 @@ requests work without configuration through Gemini's guest auto-routing mode.
 - **Transparent routing metadata** through `upstream_model` / `upstreamModel`
   and `route_status` / `routeStatus`.
 - **Persistent Cookie storage** in a SQLite Durable Object, with an automatic
-  one-minute maintenance Cron Trigger with an internal ten-minute rotation schedule.
+  one-minute maintenance Cron Trigger with rotation at 95% of the known Cookie lifetime.
 - **Cloudflare egress fallback** using raw TCP sockets when normal `fetch`
   traffic is rate-limited.
 - **Single-file runtime** with no application dependencies.
@@ -371,14 +371,26 @@ key is configured.
 <details>
 <summary><strong>Automatic refresh behavior</strong></summary>
 
-The Cron Trigger wakes every minute. Its persisted due time calls Google's
-`RotateCookies` endpoint about every ten minutes with ±15-second jitter,
-merges approved `Set-Cookie` values into a persistent domain/path/expiry aware
-Cookie jar, and sends the same lightweight activity RPC used by the reference
-client. A 60-second atomic cooldown prevents overlapping manual and scheduled
-rotation calls. Temporary rotation, network, or page-token failures keep the
-last verified Cookie and are retried; `reauth_required` is recorded only when
-Gemini provides an explicit signed-out signal.
+The Cron Trigger wakes every minute but calls `RotateCookies` only when due.
+For a known expiry, rotation is due at 95% of the period from Google's Cookie
+issuance to its expiry. Imported exports without an issuance timestamp use the
+import time as the start of the remaining known period. The earliest known
+`__Secure-1PSIDTS`/`__Secure-3PSIDTS` expiry is used; if neither has expiry
+metadata, the login session Cookie expiry is used. Legacy ten-minute due times
+are recalculated automatically, without extending the deadline on each check.
+
+Unknown expiry retains the ten-minute schedule with ±15-second jitter. Failed
+rotations and overdue attempts that did not renew the Cookie retry in ten
+minutes. Manual refresh can still run before the due time; a 60-second atomic
+cooldown prevents overlapping calls. Approved `Set-Cookie` values are merged
+into the persistent domain/path/expiry aware jar, and the lightweight activity
+RPC continues on its own schedule. Failures retain the existing Cookie;
+`reauth_required` is recorded only for explicit signed-out signals.
+
+The displayed expiry is a browser storage deadline, not a guarantee that Google
+will accept the session until that date. A two-year Cookie lifetime therefore
+produces a rotation date nearly two years away under this policy; earlier
+server-side invalidation still requires reauthentication.
 
 Manual refresh returns `refreshed`, `no_rotation`, or
 `reauth_required`. The Cookie details report `refresh_status: verified` when
@@ -410,6 +422,9 @@ fresh Firefox session and closing that browser session after export.
 | Cookie refresh reports `reauth_required` | Export a fresh Cookie from a signed-in Gemini browser session |
 
 `GEMINI_BL` is discovered from Gemini's app page during upstream operations.
+The page's `cfb2h` value is authoritative regardless of its server prefix,
+including `boq_gemini-web-uiserver_`; legacy build strings elsewhere in the
+page do not override it.
 Its one-hour cache is scoped to the account session. Model catalog responses
 include the build from the same lookup, its source (`upstream`, `cache`,
 `stored`, or `configured`) and its check time. The console uses that account

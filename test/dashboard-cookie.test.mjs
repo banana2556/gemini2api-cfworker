@@ -380,7 +380,7 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   assert.equal((await root.json()).status, "ok");
   const healthJson = await health.json();
   assert.equal(healthJson.status, "ok");
-  assert.equal(healthJson.version, "1.9.12");
+  assert.equal(healthJson.version, "1.9.14");
 });
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
@@ -1558,7 +1558,7 @@ test("model responses include newly discovered models and the upstream build acr
   try {
     let appCalls = 0;
     let rpcCalls = 0;
-    let build = "boq_assistant-bard-web-server_20261015.01_p0";
+    let build = "boq_gemini-web-uiserver_20261013.29_p0";
     const payload = JSON.parse(JSON.parse(modelStatusRaw())[0][2]);
     payload[14] = 1000;
     payload[15].push(statusRow("aaaaaaaaaaaaaaaa", "Argon", 9, "bbbbbbbbbbbbbbbb"));
@@ -1566,7 +1566,7 @@ test("model responses include newly discovered models and the upstream build acr
       const url = String(input);
       if (url.includes("/app")) {
         appCalls += 1;
-        return new Response(modelAppHtml.replace("boq_assistant-bard-web-server_test", build));
+        return new Response('"boq_assistant-bard-web-server_20260804.05_p0"' + modelAppHtml.replace("boq_assistant-bard-web-server_test", build));
       }
       if (url.includes("rpcids=otAQ7b")) {
         rpcCalls += 1;
@@ -1589,7 +1589,7 @@ test("model responses include newly discovered models and the upstream build acr
     assert.equal(cached.gemini_bl_checked_at, fresh.gemini_bl_checked_at);
     assert.equal(appCalls, 1);
     assert.equal(rpcCalls, 1);
-    build = "boq_assistant-bard-web-server_20261016.01_p0";
+    build = "boq_gemini-web-uiserver_20261016.01_p0";
     const forced = await (await requestModels(true)).json();
     assert.equal(forced.gemini_bl, build);
     assert.equal(forced.gemini_bl_source, "upstream");
@@ -1662,7 +1662,7 @@ test("shared model cache accepts variable model counts and restores build metada
   globalThis.caches = { default: {
     async match(request) {
       cacheCalls += 1;
-      assert.equal(new URL(request.url).searchParams.get("v"), "3");
+      assert.equal(new URL(request.url).searchParams.get("v"), "4");
       return Response.json({ models, expiresAt: Date.now() + 60000, build: {
         gemini_bl: build, gemini_bl_source: "upstream", gemini_bl_checked_at: checkedAt,
       } });
@@ -1709,6 +1709,44 @@ test("build discovery isolates different accounts and labels a failed lookup as 
     await internals.refreshGeminiBl(broken);
     assert.equal(broken.gemini_bl_source, "configured");
     assert.equal(broken.gemini_bl_checked_at, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Cookie verification uses and persists the new UI build before calling session RPCs", async () => {
+  const store = memoryCookieStore();
+  const build = "boq_gemini-web-uiserver_20261013.29_p0";
+  const env = {
+    API_KEYS: "api-test-key", COOKIE_STORE: store,
+    GEMINI_BL: "boq_assistant-bard-web-server_20260804.05_p0",
+    UPSTREAM_SOCKET: "false", LOG_REQUESTS: "false",
+  };
+  const headers = { Authorization: "Bearer api-test-key", "Content-Type": "application/json" };
+  await worker.fetch(new Request("https://worker.example/admin/cookie", {
+    method: "PUT", headers, body: JSON.stringify({ auth: "__Secure-1PSID=new-ui-build-session" }),
+  }), env);
+  const originalFetch = globalThis.fetch;
+  const authFetch = googleAuthFetch({ appBody: JSON.stringify({ SNlM0e: "new-ui-at", cfb2h: build }) });
+  let rpcs = 0;
+  globalThis.fetch = (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname.includes("batchexecute")) {
+      rpcs += 1;
+      assert.equal(url.searchParams.get("bl"), build);
+    }
+    return authFetch(input, init);
+  };
+  try {
+    const response = await worker.fetch(new Request("https://worker.example/admin/cookie/refresh", { method: "POST", headers }), env);
+    const result = await response.json();
+    assert.equal(result.cookie.refresh_status, "verified");
+    assert.equal(store.peek().gemini_bl, build);
+    assert.equal(rpcs, 2);
+    const status = await (await worker.fetch(new Request("https://worker.example/admin/status", { headers }), env)).json();
+    assert.equal(status.gemini_bl, build);
+    assert.equal(status.gemini_bl_source, "stored");
+    assert.ok(status.gemini_bl_checked_at);
   } finally {
     globalThis.fetch = originalFetch;
   }
