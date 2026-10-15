@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.11.1";
+const VERSION = "1.12.0";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -81,6 +81,9 @@ const MODEL_CATALOG_TTL_SEC = 10 * 60;
 const MODEL_CATALOG_CACHE_VERSION = "4";
 const IMAGE_API_MODEL = "gemini-nano-banana-pro";
 const IMAGE_TOOL_MODE = 14;
+// Gemini Web LQaXg module, observed 2026-10-15: gvd maps companion option
+// IDs to the image tool's f0c.aspect_ratio string (not the video enum).
+const IMAGE_ASPECT_RATIOS = Object.freeze({ "1:1": 61, "9:16": 59, "3:4": 60, "4:3": 62, "16:9": 63 });
 const MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_IMAGE_API_BYTES = 20 * 1024 * 1024;
 const UNAUTHENTICATED_STATUS = 1016;
@@ -1355,7 +1358,7 @@ const SLOT = {
   VARIANT_MODE: 75, MODE: 79, THINK_LEVEL: 80,
 };
 
-function buildPayload(prompt, modelId, thinkingLevel, fileRefs, extra) {
+function buildPayload(prompt, modelId, thinkingLevel, fileRefs, extra, imageAspectRatio = "auto") {
   const inner = new Array(102).fill(null);
   if (fileRefs && fileRefs.length) {
     // 每个上传文件表示为 [[fileRef, 1], filename](格式来自 gemini_webapi,
@@ -1385,6 +1388,14 @@ function buildPayload(prompt, modelId, thinkingLevel, fileRefs, extra) {
   if (thinkingLevel >= 1 && thinkingLevel <= 3) inner[SLOT.THINK_LEVEL] = thinkingLevel;
   if (extra) {
     for (const k of Object.keys(extra)) inner[Number(k)] = extra[k];
+  }
+  if (Object.hasOwn(IMAGE_ASPECT_RATIOS, imageAspectRatio)) {
+    // Native Web image settings: prompt.uL[9].rL[6].xI[1].f0c[1].
+    // Preserve prompt text, file attachments and all unrelated model fields.
+    const settings = new Array(7).fill(null);
+    settings[6] = [null, [null, imageAspectRatio]];
+    inner[SLOT.PROMPT][9] = settings;
+    inner[55] = [[IMAGE_ASPECT_RATIOS[imageAspectRatio]]];
   }
   const outer = [null, JSON.stringify(inner)];
   return new URLSearchParams({ "f.req": JSON.stringify(outer) }).toString();
@@ -2426,7 +2437,7 @@ function routeMetadata(modelId, actualModel) {
 }
 
 async function buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra, signal) {
-  let body = buildPayload(prompt, modelId, thinkingLevel, fileRefs || null, extra);
+  let body = buildPayload(prompt, modelId, thinkingLevel, fileRefs || null, extra, cfg.image_aspect_ratio);
   if (cfg.cookie) {
     const at = cfg.xsrf_token || (await getPageTokens(cfg, signal)).at;
     if (at) body += "&at=" + encodeURIComponent(at);
@@ -3314,6 +3325,7 @@ function imageApiModel(models) {
     display_name: "Nano Banana Pro",
     description: "Nano Banana Pro · Gemini Web image-only API · uses the account's Pro route",
     supported_endpoints: ["/v1/images/generations"],
+    supported_aspect_ratios: ["auto", ...Object.keys(IMAGE_ASPECT_RATIOS)],
     upstream_model: upstream,
   };
 }
@@ -3336,6 +3348,10 @@ async function handleImageGeneration(req, cfg) {
   const format = req.response_format ?? "url";
   if (!["url", "b64_json"].includes(format)) return invalid("response_format must be url or b64_json.");
   if (req.stream) return invalid("The image API returns a single image response; stream is not supported.");
+  const aspectRatio = req.aspect_ratio ?? "auto";
+  if (typeof aspectRatio !== "string" || (aspectRatio !== "auto" && !Object.hasOwn(IMAGE_ASPECT_RATIOS, aspectRatio))) {
+    return invalid("aspect_ratio must be auto, 1:1, 9:16, 3:4, 4:3 or 16:9.");
+  }
   for (const name of ["size", "quality", "background", "output_format"]) {
     if (req[name] !== undefined && req[name] !== "auto") return invalid(`${name} currently supports only auto; Gemini controls the actual image dimensions and format.`);
   }
@@ -3344,7 +3360,7 @@ async function handleImageGeneration(req, cfg) {
   const adapter = imageApiModel(models);
   if (!adapter) return jsonResponse({ error: { code: "image_model_unavailable", message: "The current session did not expose a Pro route for the image tool; verify the Cookie and account permissions." } }, 503);
   const model = resolveModel(adapter.upstream_model, cfg.default_model, models);
-  const imageCfg = { ...cfg, image_generation_only: true, retry_attempts: 1 };
+  const imageCfg = { ...cfg, image_generation_only: true, image_aspect_ratio: aspectRatio, retry_attempts: 1 };
   // Historical native image-tool routing documented in Gemini-API PR #209.
   // Use account-discovered IDs, never the PR's old hard-coded model signature.
   const extra = { ...model.extra, 17: [[1]], 49: IMAGE_TOOL_MODE };
@@ -3371,7 +3387,7 @@ async function handleImageGeneration(req, cfg) {
       }
     }
     return jsonResponse({ created: nowSec(), model: IMAGE_API_MODEL, upstream_model: adapter.upstream_model,
-      image_mode: "tool_14", data });
+      image_mode: "tool_14", aspect_ratio: aspectRatio, data });
   } catch (error) {
     if (cfg.request_signal?.aborted) throw error;
     return jsonResponse({ error: { code: error.code || "image_generation_failed",
@@ -4650,6 +4666,7 @@ function dashboardResponse(cfg) {
 
     .play-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 13px; }
     .play-bar label { color: var(--muted); font-size: .85rem; display: inline-flex; align-items: center; gap: 7px; }
+    .play-bar [hidden] { display: none; }
     select {
       min-height: 36px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px;
       background: var(--panel-2); font-family: var(--mono); font-size: .9rem; max-width: 300px;
@@ -4827,6 +4844,16 @@ function dashboardResponse(cfg) {
         <div class="play-bar">
           <label>模型
             <select id="play-model"><option value="">（尚未載入）</option></select>
+          </label>
+          <label id="play-aspect-control" hidden>圖片比例
+            <select id="play-aspect-ratio">
+              <option value="auto">自動</option>
+              <option value="1:1">1:1 · 正方形</option>
+              <option value="9:16">9:16 · 直式</option>
+              <option value="3:4">3:4 · 直式</option>
+              <option value="4:3">4:3 · 橫式</option>
+              <option value="16:9">16:9 · 橫式</option>
+            </select>
           </label>
           <label><input type="checkbox" class="switch" id="play-stream" checked><span id="play-stream-label">串流輸出</span></label>
           <button class="btn primary push-right" id="play-send">送出（Ctrl+Enter）</button>
@@ -5248,10 +5275,12 @@ function dashboardResponse(cfg) {
       } else if (!imageMode && streamToggle.disabled) streamToggle.checked = state.chatStream !== false;
       streamToggle.disabled = imageMode;
       $("play-system").disabled = imageMode;
+      $("play-aspect-control").hidden = !imageMode;
+      $("play-aspect-ratio").disabled = !imageMode;
       $("play-input").placeholder = imageMode ? "描述你想要的圖片，例如：窗邊橘貓，水彩插畫" : "輸入訊息，或明確要求「生成一張圖片」…";
       $("play-stream-label").textContent = imageMode ? "圖片 API 不使用串流" : "串流輸出";
       $("play-mode-hint").textContent = imageMode
-        ? "專用圖片 API：直接輸入畫面描述，只回傳圖片。連結有效一小時。"
+        ? "專用圖片 API：可選擇網頁原生圖片比例，直接輸入畫面描述。連結有效一小時。"
         : "生成圖片需登入帳號有相應權限；圖片連結有效一小時，請及時下載保存。";
     }
     $("play-model").addEventListener("change", syncPlayMode);
@@ -5318,7 +5347,7 @@ function dashboardResponse(cfg) {
         var res = await fetch(imageMode ? "/v1/images/generations" : "/v1/chat/completions", {
           method: "POST",
           headers: headersFor(true),
-          body: JSON.stringify(imageMode ? { model: model, prompt: text, n: 1, response_format: "url" }
+          body: JSON.stringify(imageMode ? { model: model, prompt: text, n: 1, response_format: "url", aspect_ratio: $("play-aspect-ratio").value }
             : { model: model, messages: messages, stream: wantStream }),
           signal: playAbort.signal,
         });
@@ -5366,7 +5395,7 @@ function dashboardResponse(cfg) {
             renderPlayImages((data.data || []).map(function (image) {
               return { image_url: { url: image.url }, alt: "Gemini 生成的圖片" };
             }));
-            meta.textContent = elapsed + "s · 圖片 API · " + (data.data || []).length + " 張圖片";
+            meta.textContent = elapsed + "s · 圖片 API · " + (data.data || []).length + " 張圖片 · 比例 " + (data.aspect_ratio === "auto" ? "自動" : data.aspect_ratio || "自動");
           } else {
           var choice = data.choices && data.choices[0];
           rawOutput = (choice && choice.message && choice.message.content) || "";

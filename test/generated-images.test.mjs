@@ -336,6 +336,7 @@ test("the image API uses native tool routing and an account-discovered Pro ID wi
   assert.equal(response.status, 200);
   assert.equal(data.model, "gemini-nano-banana-pro");
   assert.equal(data.image_mode, "tool_14");
+  assert.equal(data.aspect_ratio, "auto");
   assert.equal(data.upstream_model, "gemini-3.1-pro");
   assert.equal(data.data.length, 1);
   assert.match(data.data[0].url, /^https:\/\/worker\.test\/v1\/images\//);
@@ -371,6 +372,7 @@ test("image model discovery advertises only the images endpoint and completion r
   const models = await worker.fetch(new Request(origin + "/v1/models", { headers: { Authorization: "Bearer image-api-key" } }), env);
   const image = (await models.json()).data.find(model => model.id === "gemini-nano-banana-pro");
   assert.equal(image.display_name, "Nano Banana Pro");
+  assert.deepEqual(image.supported_aspect_ratios, ["auto", "1:1", "9:16", "3:4", "4:3", "16:9"]);
   assert.deepEqual(image.supported_endpoints, ["/v1/images/generations"]);
   assert.equal(image.owned_by, "gemini-web-adapter");
   const response = await worker.fetch(new Request(origin + "/v1/chat/completions", {
@@ -392,6 +394,61 @@ test("invalid image requests fail before model discovery or upstream generation"
     assert.equal((await worker.fetch(imageRequest(body), env)).status, 400);
   }
   assert.equal(fetches, 0);
+});
+
+for (const [ratio, option] of [["1:1", 61], ["9:16", 59], ["3:4", 60], ["4:3", 62], ["16:9", 63]]) {
+  test(`image API sends the Web image settings for ${ratio} without adding prompt instructions`, async t => {
+    const tag = `ratio-${option}`;
+    const { env } = setup(tag);
+    const prompt = "A ceramic teapot on a wooden table";
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", upstream(tag, imageFrame(), init => {
+      calls += 1;
+      const inner = JSON.parse(JSON.parse(new URLSearchParams(init.body).get("f.req"))[1]);
+      assert.equal(inner[0][0], prompt);
+      assert.deepEqual(inner[0][9], [null, null, null, null, null, null, [null, [null, ratio]]]);
+      assert.deepEqual(inner[55], [[option]]);
+      assert.deepEqual(inner[17], [[1]]);
+      assert.equal(inner[49], 14);
+      assert.equal(inner[79], 3);
+      assert.equal(inner[0][3], null);
+    }, 3));
+    const response = await worker.fetch(imageRequest({ model: "gemini-nano-banana-pro", prompt, aspect_ratio: ratio }), env);
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.aspect_ratio, ratio);
+    assert.equal(result.data.length, 1);
+    assert.equal(calls, 1);
+  });
+}
+
+test("auto ratio leaves upstream defaults intact and explicit ratio keeps attached files and route IDs", async t => {
+  const { env } = setup("auto-image-ratio");
+  t.mock.method(globalThis, "fetch", upstream("auto-image-ratio", imageFrame(), init => {
+    const inner = JSON.parse(JSON.parse(new URLSearchParams(init.body).get("f.req"))[1]);
+    assert.equal(inner[55], null);
+    assert.equal(inner[0].length, 7);
+  }, 3));
+  assert.equal((await worker.fetch(imageRequest({ prompt: "A cat", aspect_ratio: "auto" }), env)).status, 200);
+  const raw = api.buildPayload("Describe this", 3, 2, ["/uploaded-file"], { 64: "route", 75: 3 }, "4:3");
+  const inner = JSON.parse(JSON.parse(new URLSearchParams(raw).get("f.req"))[1]);
+  assert.deepEqual(inner[0][3], [[["/uploaded-file", 1], "image.png"]]);
+  assert.equal(inner[0][9][6][1][1], "4:3");
+  assert.equal(inner[64], "route");
+  assert.equal(inner[75], 3);
+  assert.equal(inner[80], 2);
+});
+
+test("unsupported or malformed ratios are rejected before upstream requests", async t => {
+  const { env } = setup("invalid-aspect");
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => { calls += 1; throw new Error("Must not fetch upstream"); });
+  for (const ratio of ["21:9", "2:3", "16/9", " 16:9 ", "", 1, { value: "16:9" }, ["16:9"], "constructor", "__proto__"]) {
+    const response = await worker.fetch(imageRequest({ prompt: "A cat", aspect_ratio: ratio }), env);
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error.message, /aspect_ratio/);
+  }
+  assert.equal(calls, 0);
 });
 
 test("image API requires a login and an available Pro route", async t => {

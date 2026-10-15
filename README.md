@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.11.1-62b6ff"></a>
+  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.12.0-62b6ff"></a>
   <a href="https://workers.cloudflare.com/"><img alt="Cloudflare Workers" src="https://img.shields.io/badge/Cloudflare-Workers-f6821f?logo=cloudflareworkers&logoColor=white"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f6b95c"></a>
   <a href="https://github.com/banana2556"><img alt="Author banana2556" src="https://img.shields.io/badge/GitHub-%40banana2556-8b949e?logo=github"></a>
@@ -239,6 +239,7 @@ or "generate an image" instruction is required.
 {
   "model": "gemini-nano-banana-pro",
   "prompt": "An orange cat beside a sunny window, watercolor illustration",
+  "aspect_ratio": "16:9",
   "n": 1,
   "response_format": "url"
 }
@@ -250,6 +251,11 @@ The response has the OpenAI Images envelope: `created` and `data`, with
 Markdown. `n` accepts 1–4; requests for multiple images can require multiple
 upstream generations. URL downloads allow 20 MiB per image. Base64 output is
 limited to 10 MiB per image and 20 MiB of image bytes across one response.
+`aspect_ratio` accepts `auto` (default), `1:1`, `9:16`, `3:4`, `4:3` and `16:9`,
+matching Gemini Web's image ratio menu. The Worker sends the native image-tool
+settings and companion option ID; it preserves your prompt and does not crop
+or resize the result. Playground exposes the same choices when you select
+Nano Banana Pro. The image entry in `/v1/models` lists `supported_aspect_ratios`.
 `size`, `quality`, `background` and `output_format` currently accept only `auto`;
 the service determines actual dimensions, quality and encoding. Image requests
 do not support streaming.

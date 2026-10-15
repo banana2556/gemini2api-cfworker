@@ -380,7 +380,7 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   assert.equal((await root.json()).status, "ok");
   const healthJson = await health.json();
   assert.equal(healthJson.status, "ok");
-  assert.equal(healthJson.version, "1.11.1");
+  assert.equal(healthJson.version, "1.12.0");
 });
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
