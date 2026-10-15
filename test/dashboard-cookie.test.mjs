@@ -380,7 +380,7 @@ test("root keeps health JSON compatibility for non-browser clients", async () =>
   assert.equal((await root.json()).status, "ok");
   const healthJson = await health.json();
   assert.equal(healthJson.status, "ok");
-  assert.equal(healthJson.version, "1.9.14");
+  assert.equal(healthJson.version, "1.11.1");
 });
 
 test("Cookie import persists only in Durable Object and never falls back to a legacy secret", async () => {
@@ -686,7 +686,7 @@ for (const initialStatus of [200, 401, 403]) {
 
       const models = await worker.fetch(new Request("https://worker.example/v1/models?refresh=1", { headers }), env);
       assert.equal(models.status, 200);
-      assert.equal((await models.json()).data.length, 6);
+      assert.equal((await models.json()).data.length, 7);
       assert.equal(mixedAttempts, 1);
       assert.equal(minimalAttempts, 2);
     } finally {
@@ -1577,13 +1577,13 @@ test("model responses include newly discovered models and the upstream build acr
     };
     const requestModels = (force = false) => worker.fetch(new Request("https://worker.example/v1/models" + (force ? "?refresh=1" : ""), { headers }), env);
     const fresh = await (await requestModels(true)).json();
-    assert.equal(fresh.data.length, 8);
+    assert.equal(fresh.data.length, 9);
     assert.ok(fresh.data.some((model) => model.id === "gemini-argon"));
     assert.equal(fresh.gemini_bl, build);
     assert.equal(fresh.gemini_bl_source, "upstream");
     assert.ok(fresh.gemini_bl_checked_at);
     const cached = await (await requestModels()).json();
-    assert.equal(cached.data.length, 8);
+    assert.equal(cached.data.length, 9);
     assert.equal(cached.gemini_bl, build);
     assert.equal(cached.gemini_bl_source, "cache");
     assert.equal(cached.gemini_bl_checked_at, fresh.gemini_bl_checked_at);

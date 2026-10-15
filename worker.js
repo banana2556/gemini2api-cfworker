@@ -33,7 +33,7 @@
  * 否则上游会回退到其他模型。
  */
 
-const VERSION = "1.9.14";
+const VERSION = "1.11.1";
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG —— 改这些值,然后直接部署本文件。
@@ -79,6 +79,10 @@ const ACTIVITY_RPC = "ESY5D";
 const ACTIVITY_PAYLOAD = '[[["bard_activity_enabled"]]]';
 const MODEL_CATALOG_TTL_SEC = 10 * 60;
 const MODEL_CATALOG_CACHE_VERSION = "4";
+const IMAGE_API_MODEL = "gemini-nano-banana-pro";
+const IMAGE_TOOL_MODE = 14;
+const MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_API_BYTES = 20 * 1024 * 1024;
 const UNAUTHENTICATED_STATUS = 1016;
 let _modelCatalogMemory = { key: "", models: null, expiresAt: 0, build: null };
 
@@ -294,6 +298,7 @@ function modelNameForCategory(models, category, thinkingLevel = 1) {
  * 返回 { name, modeId, thinkingLevel, extra },或 { error }。
  */
 function resolveModel(modelName, def, models) {
+  if (modelName === IMAGE_API_MODEL) return { error: "gemini-nano-banana-pro is an image-only model; use POST /v1/images/generations" };
   let cfg = models[modelName];
   if (!cfg) {
     const level = /thinking|deep.?think/i.test(String(modelName || "")) ? 2 : 1;
@@ -1910,8 +1915,9 @@ async function executeBatchRpc(cfg, rpcId, payload, accessToken = cfg.xsrf_token
     body: body.toString(),
     timeoutMs: 30000,
     socket: cfg.upstream_socket,
+    signal: cfg.request_signal,
   });
-  return { response, raw: await readLimitedText(response) };
+  return { response, raw: await readLimitedText(response, MAX_BUFFERED_BYTES, 502, cfg.request_signal) };
 }
 
 async function verifySessionWithRpc(cfg, accessToken) {
@@ -2236,7 +2242,7 @@ function stripArtifacts(text) {
     /```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n[\s\S]*?```\n?/g,
     ""
   );
-  text = text.replace(/http:\/\/googleusercontent\.com\/card_content\/\d+\n?/g, "");
+  text = text.replace(/https?:\/\/googleusercontent\.com\/(?:[A-Za-z0-9_]+\/)+\d+\n*/g, "");
   return text;
 }
 
@@ -2246,31 +2252,97 @@ function cleanText(text) {
 }
 
 const ACTUAL_MODEL_RE = /^(?:Gemini\s+)?\d+(?:\.\d+)?\s+(?:Flash|Pro)\b[- A-Za-z0-9.()]{0,40}$/i;
+const MAX_GENERATED_IMAGES = 16;
+const IMAGE_LINK_TTL_MS = 60 * 60 * 1000;
+const GENERATED_IMAGE_RPC = "c8o8Fe";
+
+function nestedValue(value, path) {
+  for (const key of path) value = value?.[key];
+  return value;
+}
+
+function richContentField(candidate, index) {
+  const rich = candidate?.[12];
+  if (!Array.isArray(rich)) return null;
+  const positional = rich[index];
+  if (Array.isArray(positional) && positional.length) return positional;
+  const sparse = rich[rich.length - 1];
+  return sparse && !Array.isArray(sparse) && typeof sparse === "object" ? sparse[String(index + 1)] : null;
+}
+
+function isGeneratedImageUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password && (!url.port || url.port === "443")
+      && (url.hostname === "googleusercontent.com" || url.hostname.endsWith(".googleusercontent.com")
+        || url.hostname.endsWith(".ggpht.com") || /^lh[3-6]\.google\.com$/.test(url.hostname)
+        || url.hostname === "work.fife.usercontent.google.com");
+  } catch (_) { return false; }
+}
+
+function generatedImageKey(image) {
+  return image.image_id || image.url;
+}
+
+function collectGeneratedImages(target, images) {
+  for (const image of images || []) {
+    const key = generatedImageKey(image);
+    if (target.has(key) || target.size < MAX_GENERATED_IMAGES) target.set(key, image);
+  }
+}
+
+function finishGeneratedImages(images, conversation) {
+  return [...images.values()].map(image => ({ ...image, cid: image.cid || conversation.cid || "", rid: image.rid || conversation.rid || "" }));
+}
+
+function candidateGeneratedImages(candidate, metadata) {
+  const source = nestedValue(richContentField(candidate, 7), [0]);
+  if (!Array.isArray(source)) return [];
+  const images = [];
+  for (const data of source.slice(0, MAX_GENERATED_IMAGES)) {
+    const url = nestedValue(data, [0, 3, 3]);
+    if (typeof url !== "string" || url.length > 4096 || !isGeneratedImageUrl(url)) continue;
+    images.push({
+      url,
+      alt: String(nestedValue(data, [0, 3, 2]) || "Generated image").slice(0, 500),
+      image_id: String(nestedValue(data, [1, 0]) || "").slice(0, 1000),
+      cid: String(metadata?.[0] || "").slice(0, 200),
+      rid: String(metadata?.[1] || "").slice(0, 200),
+      rcid: String(candidate?.[0] || "").slice(0, 200),
+    });
+  }
+  return images;
+}
 
 // Decode the envelope and its payload once for both text and model metadata.
 function parseGeminiLine(line) {
   const texts = [];
+  const images = new Map();
+  const conversation = {};
   let actualModel = "";
-  if (!line.includes('"wrb.fr"')) return { texts, actualModel };
+  if (!line.includes('"wrb.fr"')) return { texts, actualModel, images: [], conversation };
   try {
     const rows = JSON.parse(line);
-    if (!Array.isArray(rows)) return { texts, actualModel };
+    if (!Array.isArray(rows)) return { texts, actualModel, images: [], conversation };
     for (const row of rows) {
       if (!Array.isArray(row) || row[0] !== "wrb.fr" || typeof row[2] !== "string") continue;
       let inner;
       try { inner = JSON.parse(row[2]); } catch (_) { continue; }
       if (!Array.isArray(inner)) continue;
+      if (typeof inner[1]?.[0] === "string" && inner[1][0]) conversation.cid = inner[1][0].slice(0, 200);
+      if (typeof inner[1]?.[1] === "string" && inner[1][1]) conversation.rid = inner[1][1].slice(0, 200);
       const label = inner.find(v => typeof v === "string" && ACTUAL_MODEL_RE.test(v));
       if (label) actualModel = label;
       if (!Array.isArray(inner[4])) continue;
       for (const part of inner[4]) {
+        collectGeneratedImages(images, candidateGeneratedImages(part, inner[1]));
         if (Array.isArray(part) && Array.isArray(part[1])) {
           for (const value of part[1]) if (typeof value === "string" && value) texts.push(value);
         }
       }
     }
   } catch (_) {}
-  return { texts, actualModel };
+  return { texts, actualModel, images: finishGeneratedImages(images, conversation), conversation };
 }
 
 function extractTextsFromLine(line) { return parseGeminiLine(line).texts; }
@@ -2318,14 +2390,14 @@ async function* readGeminiFrames(response, stats = { rawLength: 0, snippet: "" }
         const line = parts.length ? parts.join("") + piece : piece;
         parts = []; lineLength = 0;
         const frame = parseGeminiLine(line);
-        if (frame.texts.length || frame.actualModel) yield frame;
+        if (frame.texts.length || frame.actualModel || frame.images.length || frame.conversation.cid || frame.conversation.rid) yield frame;
         start = newline + 1;
       }
       if (done) break;
     }
     if (parts.length) {
       const frame = parseGeminiLine(parts.join(""));
-      if (frame.texts.length || frame.actualModel) yield frame;
+      if (frame.texts.length || frame.actualModel || frame.images.length || frame.conversation.cid || frame.conversation.rid) yield frame;
     }
   } finally {
     signal?.removeEventListener("abort", cancel);
@@ -2366,13 +2438,13 @@ async function buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, e
 async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, modelHeader) {
   let body, url, headers;
   try {
-    await refreshGeminiBl(cfg);
-    body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra);
+    await refreshGeminiBl(cfg, cfg.request_signal);
+    body = await buildRequestBody(cfg, prompt, modelId, thinkingLevel, fileRefs, extra, cfg.request_signal);
     url = getUrl(cfg);
     headers = await buildHeaders(cfg, modelHeader);
   } catch (e) {
-    if (e.code === "resource_limit") throw e;
-    if (cfg.cookie) {
+    if (cfg.request_signal?.aborted || e.code === "resource_limit") throw e;
+    if (cfg.cookie && !cfg.image_generation_only) {
       const reason = String((e && e.message) || e || "authenticated request setup failed");
       log(cfg, `authenticated request setup failed; falling back to guest: ${reason}`);
       return await generateResult(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, modelHeader);
@@ -2388,29 +2460,35 @@ async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRe
         body,
         timeoutMs: cfg.request_timeout_sec * 1000,
         socket: cfg.upstream_socket,
+        signal: cfg.request_signal,
       });
       const stats = { rawLength: 0, snippet: "" };
       let lastText = "", actualModel = "";
+      const images = new Map();
+      const conversation = {};
       for await (const frame of readGeminiFrames(resp, stats)) {
+        Object.assign(conversation, frame.conversation);
+        collectGeneratedImages(images, frame.images);
         if (frame.actualModel) actualModel = frame.actualModel;
         for (const text of frame.texts) if (text.length > lastText.length) lastText = text;
       }
       const text = cleanText(lastText);
-      if (!resp.ok || !text) {
+      if (!resp.ok || (!text && !images.size)) {
         log(cfg, `upstream status=${resp.status} rawLen=${stats.rawLength} parsedLen=${text.length} snippet=${JSON.stringify(stats.snippet)}`);
       }
-      if (cfg.cookie && (!resp.ok || (!text && !actualModel))) {
+      if (cfg.cookie && (!resp.ok || (!text && !actualModel && !images.size))) {
         throw new Error(`authenticated upstream returned ${resp.status} without usable content`);
       }
       return {
         text,
+        images: finishGeneratedImages(images, conversation),
         actualModel,
         status: resp.status,
         contentType: resp.headers.get("content-type"),
         rawLength: stats.rawLength,
       };
     } catch (e) {
-    if (e.code === "resource_limit") throw e;
+    if (cfg.request_signal?.aborted || e.code === "resource_limit") throw e;
       lastErr = e;
       if (attempt < cfg.retry_attempts - 1) {
         log(cfg, `Retry ${attempt + 1}/${cfg.retry_attempts}: ${e}`);
@@ -2418,7 +2496,7 @@ async function generateResult(cfg, prompt, modelId, thinkingLevel, extra, fileRe
       }
     }
   }
-  if (cfg.cookie) {
+  if (cfg.cookie && !cfg.image_generation_only) {
     const reason = String((lastErr && lastErr.message) || lastErr || "authenticated upstream failed");
     log(cfg, `authenticated generation failed; falling back to guest: ${reason}`);
     return await generateResult(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, modelHeader);
@@ -2434,7 +2512,7 @@ async function generate(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, mo
  * 流式生成。每步 yield 一段文本增量(本次新追加的后缀)。
  * 只在尚未 yield 过任何内容时才重试,以避免重复输出。
  */
-async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal) {
+async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal, onImages) {
   signal?.throwIfAborted();
   let body, url, headers;
   try {
@@ -2449,7 +2527,7 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
     if (cfg.cookie) {
       const reason = String((e && e.message) || e || "authenticated stream setup failed");
       log(cfg, `authenticated stream setup failed; falling back to guest: ${reason}`);
-      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal);
+      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal, onImages);
       return;
     }
     throw e;
@@ -2468,7 +2546,11 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
         signal,
       });
       let prevLength = 0, started = false, actualModel = "";
+      const images = new Map();
+      const conversation = {};
       for await (const frame of readGeminiFrames(resp, undefined, signal)) {
+        Object.assign(conversation, frame.conversation);
+        collectGeneratedImages(images, frame.images);
         if (frame.actualModel && frame.actualModel !== actualModel) {
           actualModel = frame.actualModel;
           if (onRoute) onRoute(routeMetadata(modelId, actualModel));
@@ -2486,6 +2568,11 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
         }
       }
       if (!yielded) log(cfg, `stream upstream produced no text (status=${resp.status})`);
+      if (images.size && resp.ok) {
+        // Image-only turns are successful and must not retry as a guest.
+        yielded = true;
+        if (onImages) await onImages(finishGeneratedImages(images, conversation));
+      }
       if (!yielded && cfg.cookie) throw new Error(`authenticated stream returned ${resp.status} without usable content`);
       return;
     } catch (e) {
@@ -2499,7 +2586,7 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
       if (!yielded && cfg.cookie) {
         const reason = String((e && e.message) || e || "authenticated stream failed");
         log(cfg, `authenticated stream failed; falling back to guest: ${reason}`);
-        yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal);
+        yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal, onImages);
         return;
       }
       throw e;
@@ -2509,7 +2596,7 @@ async function* generateStream(cfg, prompt, modelId, thinkingLevel, extra, fileR
     if (cfg.cookie) {
       const reason = String((lastErr && lastErr.message) || lastErr || "authenticated stream failed");
       log(cfg, `authenticated stream failed; falling back to guest: ${reason}`);
-      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal);
+      yield* generateStream(switchToGuest({ ...cfg }, reason), prompt, modelId, thinkingLevel, extra, fileRefs, onRoute, modelHeader, signal, onImages);
       return;
     }
     throw lastErr;
@@ -3180,6 +3267,247 @@ const EMPTY_UPSTREAM_MSG =
   "Run `wrangler tail` to see the upstream status.";
 
 // POST /v1/chat/completions
+function base64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function imageLinkKey(cfg) {
+  const seed = new TextEncoder().encode("gemini-generated-images-v1\n" + JSON.stringify([...(cfg.api_keys || [])].sort()));
+  const digest = await crypto.subtle.digest("SHA-256", seed);
+  return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+async function completionImages(cfg, images) {
+  if (!images?.length) return [];
+  if (!cfg.cookie || !cfg.api_keys?.length || !cfg.worker_origin) throw new Error("Generated images require a protected signed-in Worker");
+  const key = await imageLinkKey(cfg);
+  const session = await cookieSessionKey(cfg);
+  const aad = new TextEncoder().encode("gemini-generated-image-v1:" + cfg.worker_origin);
+  const expiresAt = Date.now() + IMAGE_LINK_TTL_MS;
+  const result = [];
+  for (const image of images.slice(0, MAX_GENERATED_IMAGES)) {
+    if (!isGeneratedImageUrl(image.url)) continue;
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const payload = new TextEncoder().encode(JSON.stringify({ image, session, expires_at: expiresAt,
+      gemini_bl: cfg.gemini_bl, gemini_session_id: cfg.gemini_session_id || "" }));
+    if (payload.length > 9000) throw resourceLimit("generated image metadata is too large", 502);
+    const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: aad }, key, payload));
+    const bytes = new Uint8Array(iv.length + encrypted.length);
+    bytes.set(iv); bytes.set(encrypted, iv.length);
+    result.push({ type: "image_url", image_url: { url: `${cfg.worker_origin}/v1/images/${base64Url(bytes)}` },
+      alt: image.alt || "Generated image", expires_at: new Date(expiresAt).toISOString() });
+  }
+  return result;
+}
+
+function imageMarkdown(images) {
+  return images.map((image, index) => `\n\n![Generated image ${index + 1}](${image.image_url.url})`).join("");
+}
+
+function imageApiModel(models) {
+  const upstream = modelNameForCategory(models, 3);
+  if (!upstream) return null;
+  return {
+    id: IMAGE_API_MODEL, object: "model", created: 1700000000, owned_by: "gemini-web-adapter",
+    display_name: "Nano Banana Pro",
+    description: "Nano Banana Pro · Gemini Web image-only API · uses the account's Pro route",
+    supported_endpoints: ["/v1/images/generations"],
+    upstream_model: upstream,
+  };
+}
+
+function encodeImageBase64(bytes) {
+  const chunks = [];
+  for (let offset = 0; offset < bytes.length; offset += 16384) {
+    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 16384)));
+  }
+  return btoa(chunks.join(""));
+}
+
+async function handleImageGeneration(req, cfg) {
+  const invalid = message => jsonResponse({ error: { code: "invalid_image_request", message } }, 400);
+  if (!req || typeof req !== "object" || Array.isArray(req)) return invalid("Provide a JSON image generation request.");
+  if (typeof req.prompt !== "string" || !req.prompt.trim()) return invalid("prompt must be a non-empty string.");
+  if (req.model !== undefined && req.model !== IMAGE_API_MODEL) return invalid("Use model gemini-nano-banana-pro with /v1/images/generations.");
+  const count = req.n ?? 1;
+  if (!Number.isInteger(count) || count < 1 || count > 4) return invalid("n must be an integer from 1 to 4.");
+  const format = req.response_format ?? "url";
+  if (!["url", "b64_json"].includes(format)) return invalid("response_format must be url or b64_json.");
+  if (req.stream) return invalid("The image API returns a single image response; stream is not supported.");
+  for (const name of ["size", "quality", "background", "output_format"]) {
+    if (req[name] !== undefined && req[name] !== "auto") return invalid(`${name} currently supports only auto; Gemini controls the actual image dimensions and format.`);
+  }
+  if (!cfg.cookie) return jsonResponse({ error: { code: "image_login_required", message: "Import a valid Gemini login before using the image API." } }, 401);
+  const models = await getModelCatalog(cfg);
+  const adapter = imageApiModel(models);
+  if (!adapter) return jsonResponse({ error: { code: "image_model_unavailable", message: "The current session did not expose a Pro route for the image tool; verify the Cookie and account permissions." } }, 503);
+  const model = resolveModel(adapter.upstream_model, cfg.default_model, models);
+  const imageCfg = { ...cfg, image_generation_only: true, retry_attempts: 1 };
+  // Historical native image-tool routing documented in Gemini-API PR #209.
+  // Use account-discovered IDs, never the PR's old hard-coded model signature.
+  const extra = { ...model.extra, 17: [[1]], 49: IMAGE_TOOL_MODE };
+  const data = [];
+  let remainingBytes = MAX_IMAGE_API_BYTES;
+  try {
+    while (data.length < count) {
+      cfg.request_signal?.throwIfAborted();
+      const result = await generateResult(imageCfg, req.prompt.trim(), model.modeId, model.thinkingLevel, extra, null, model.header);
+      if (!result.images?.length) return jsonResponse({ error: {
+        code: "image_not_generated", message: "Gemini's image tool returned no generated image; no chat-mode fallback was attempted.",
+        provider_message: result.text || null,
+      } }, 422);
+      const images = result.images.slice(0, count - data.length);
+      if (format === "url") {
+        for (const image of await completionImages(imageCfg, images)) data.push({ url: image.image_url.url, expires_at: image.expires_at });
+      } else {
+        for (const image of images) {
+          const response = await downloadGeneratedImage(imageCfg, image);
+          const bytes = await readLimitedBytes(response, Math.min(MAX_INLINE_IMAGE_BYTES, remainingBytes), 413, cfg.request_signal);
+          remainingBytes -= bytes.length;
+          data.push({ b64_json: encodeImageBase64(bytes), mime_type: response.headers.get("content-type").split(";")[0] });
+        }
+      }
+    }
+    return jsonResponse({ created: nowSec(), model: IMAGE_API_MODEL, upstream_model: adapter.upstream_model,
+      image_mode: "tool_14", data });
+  } catch (error) {
+    if (cfg.request_signal?.aborted) throw error;
+    return jsonResponse({ error: { code: error.code || "image_generation_failed",
+      message: error.code === "resource_limit" ? error.message : "Gemini image generation or download failed; no chat-mode fallback was attempted." } }, error.status || 502);
+  }
+}
+
+function isImageProxyRequest(method, path) {
+  return ["GET", "HEAD"].includes(method) && /^\/v1\/images\/[A-Za-z0-9_-]{40,14000}$/.test(path);
+}
+
+async function decodeImageLink(cfg, token) {
+  if (!cfg.cookie || !cfg.api_keys?.length) return null;
+  try {
+    const binary = atob(token.replace(/-/g, "+").replace(/_/g, "/"));
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const aad = new TextEncoder().encode("gemini-generated-image-v1:" + cfg.worker_origin);
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12), additionalData: aad },
+      await imageLinkKey(cfg), bytes.slice(12));
+    const payload = JSON.parse(new TextDecoder().decode(plain));
+    if (!Number.isFinite(payload.expires_at) || payload.expires_at <= Date.now()
+      || payload.expires_at > Date.now() + IMAGE_LINK_TTL_MS
+      || payload.session !== await cookieSessionKey(cfg)
+      || !isGeneratedImageUrl(payload.image?.url)) return null;
+    return payload;
+  } catch (_) { return null; }
+}
+
+async function fetchGeneratedImage(cfg, initialUrl, allowTextLinks = false) {
+  let url = initialUrl;
+  for (let hop = 0; hop < 6; hop++) {
+    if (!isGeneratedImageUrl(url)) throw new Error("Invalid generated image host");
+    const headers = { "User-Agent": _UA, Origin: "https://gemini.google.com", Referer: "https://gemini.google.com/" };
+    const cookie = requestCookieHeader(cfg, url);
+    if (cookie) headers.Cookie = cookie;
+    const response = await httpFetch(url, { headers, timeoutMs: 30000, socket: cfg.upstream_socket,
+      redirect: "manual", signal: cfg.request_signal });
+    if (REDIRECT_STATUSES.has(response.status)) {
+      const location = response.headers.get("location");
+      try { await response.body?.cancel(); } catch (_) {}
+      if (!location) throw new Error("Missing image redirect");
+      url = new URL(location, url).href;
+      continue;
+    }
+    const mime = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    if (response.ok && ["image/png", "image/jpeg", "image/webp", "image/gif", "image/avif"].includes(mime)) return response;
+    if (response.ok && allowTextLinks && ["text/plain", "text/html", "application/octet-stream"].includes(mime)) {
+      url = (await readLimitedText(response, 8192, 502, cfg.request_signal)).trim();
+      continue;
+    }
+    try { await response.body?.cancel(); } catch (_) {}
+    throw new Error(`Generated image download failed (HTTP ${response.status}, ${mime || "no content type"})`);
+  }
+  throw new Error("Too many image redirects");
+}
+
+async function downloadGeneratedImage(cfg, image) {
+  // HanaokaYuzu/Gemini-API uses c8o8Fe with these conversation identifiers
+  // before following the text URL responses to the original image bytes.
+  if (image.cid && image.rid && image.rcid && image.image_id && cfg.xsrf_token) {
+    try {
+      const payload = [[[null, null, null, [null, null, null, null, null, ""]], [image.image_id, 0],
+        null, [19, ""], null, null, null, null, null, ""], [image.rid, image.rcid, image.cid, null, ""], 1, 0, 1];
+      const { response, raw } = await executeBatchRpc(cfg, GENERATED_IMAGE_RPC, JSON.stringify(payload));
+      if (!response.ok) throw new Error("Image RPC failed");
+      const originalUrl = extractRpcPayload(raw, GENERATED_IMAGE_RPC)?.[0];
+      if (!isGeneratedImageUrl(originalUrl)) throw new Error("Image RPC returned an invalid URL");
+      const url = new URL(originalUrl);
+      url.pathname += "=d-I";
+      url.searchParams.set("alr", "yes");
+      return await fetchGeneratedImage(cfg, url.href, true);
+    } catch (error) {
+      if (cfg.request_signal?.aborted) throw error;
+      log(cfg, `Original image unavailable; downloading the preview instead (${error.message})`);
+    }
+  }
+  const preview = new URL(image.url);
+  preview.pathname = preview.pathname.includes("=s1024-rj")
+    ? preview.pathname.replace("=s1024-rj", "=s2048-rj")
+    : preview.pathname.includes("=s2048-rj") ? preview.pathname : preview.pathname + "=s2048-rj";
+  try { return await fetchGeneratedImage(cfg, preview.href); }
+  catch (error) {
+    if (cfg.request_signal?.aborted || preview.href === image.url) throw error;
+    return fetchGeneratedImage(cfg, image.url);
+  }
+}
+
+async function handleImageProxy(request, cfg, token) {
+  const payload = await decodeImageLink(cfg, token);
+  if (!payload) return privateJsonResponse({ error: { code: "image_link_invalid", message: "Image link expired or is invalid; generate the image again." } }, 404);
+  try {
+    // The image RPC belongs to the same generation session/build. A later
+    // download request may otherwise reload an older build from CookieStore.
+    if (typeof payload.gemini_bl === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(payload.gemini_bl)) cfg.gemini_bl = payload.gemini_bl;
+    if (typeof payload.gemini_session_id === "string") cfg.gemini_session_id = payload.gemini_session_id;
+    const upstream = await downloadGeneratedImage(cfg, payload.image);
+    const size = Number(upstream.headers.get("content-length"));
+    if (size > MAX_IMAGE_BYTES) {
+      await upstream.body?.cancel();
+      return privateJsonResponse({ error: { code: "image_too_large", message: "Image exceeds 20 MiB." } }, 413);
+    }
+    const headers = {
+      ...corsHeaders(), "Content-Type": upstream.headers.get("content-type"),
+      "Cache-Control": "private, max-age=" + Math.max(0, Math.min(300, Math.floor((payload.expires_at - Date.now()) / 1000))),
+      "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+    };
+    if (request.method === "HEAD") { await upstream.body?.cancel(); return new Response(null, { headers }); }
+    if (!upstream.body) throw new Error("Empty image body");
+    const reader = upstream.body.getReader();
+    const onAbort = () => { void reader.cancel().catch(() => {}); };
+    const cleanup = () => cfg.request_signal?.removeEventListener("abort", onAbort);
+    cfg.request_signal?.addEventListener("abort", onAbort, { once: true });
+    let received = 0;
+    const body = new ReadableStream({
+      async pull(controller) {
+        try {
+          cfg.request_signal?.throwIfAborted();
+          const { done, value } = await reader.read();
+          cfg.request_signal?.throwIfAborted();
+          if (done) { cleanup(); controller.close(); reader.releaseLock(); return; }
+          received += value.byteLength;
+          if (received > MAX_IMAGE_BYTES) throw resourceLimit("image exceeds 20 MiB", 413);
+          controller.enqueue(value);
+        } catch (error) { cleanup(); await reader.cancel().catch(() => {}); controller.error(error); }
+      },
+      async cancel(reason) { cleanup(); await reader.cancel(reason).catch(() => {}); },
+    }, { highWaterMark: 0 });
+    return new Response(body, { headers });
+  } catch (error) {
+    if (cfg.request_signal?.aborted) throw error;
+    log(cfg, `Generated image download failed: ${error.message}`);
+    return privateJsonResponse({ error: { code: "image_download_failed", message: "Unable to download the generated image." } }, 502);
+  }
+}
+
 async function handleChat(req, cfg) {
   const models = await getModelCatalog(cfg);
   const rm = resolveModel(req.model || cfg.default_model, cfg.default_model, models);
@@ -3206,7 +3534,14 @@ async function handleChat(req, cfg) {
         choices: [{ index: 0, delta, finish_reason: finish }],
       })}\n\n`);
       try {
-        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs, (meta) => { route = meta; }, rm.header, signal)) {
+        for await (const delta of generateStream(cfg, prompt, rm.modeId, rm.thinkingLevel, rm.extra, fileRefs,
+          (meta) => { route = meta; }, rm.header, signal, async (images) => {
+            const attachments = await completionImages(cfg, images);
+            if (attachments.length) {
+              got = true;
+              await chunk({ content: imageMarkdown(attachments), images: attachments }, null);
+            }
+          })) {
           got = true;
           await chunk({ content: delta }, null);
         }
@@ -3242,11 +3577,14 @@ async function handleChat(req, cfg) {
     text = clean;
     toolCalls = tc.length ? tc : null;
   }
-  if (!text && !toolCalls) {
+  const attachments = await completionImages(cfg, result.images);
+  if (attachments.length) text += imageMarkdown(attachments);
+  if (!text && !toolCalls && !attachments.length) {
     log(cfg, "chat non-stream produced no content (empty upstream)");
     text = EMPTY_UPSTREAM_MSG; // 可见提示,避免客户端“无返回”
   }
   const msg = { role: "assistant", content: text || null };
+  if (attachments.length) msg.images = attachments;
   if (toolCalls) msg.tool_calls = toolCalls;
   const finish = toolCalls ? "tool_calls" : "stop";
 
@@ -3255,6 +3593,10 @@ async function handleChat(req, cfg) {
       const delta = toolCalls
         ? { tool_calls: toOpenAIStreamToolCallDeltas(toolCalls) }
         : { role: "assistant", content: text || "" };
+      if (attachments.length) {
+        delta.images = attachments;
+        if (toolCalls) delta.content = text;
+      }
       await write(`data: ${JSON.stringify({
         id: cid, object: "chat.completion.chunk", created: nowSec(), model: rm.name,
         ...routeMetadata(rm.modeId, result.actualModel),
@@ -4327,6 +4669,13 @@ function dashboardResponse(cfg) {
       white-space: pre-wrap; overflow-wrap: anywhere; font-size: .95rem; line-height: 1.65;
     }
     .output.idle { color: var(--faint); }
+    .generated-images { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 16px; white-space: normal; }
+    .generated-images:empty { display: none; }
+    .generated-images:not(:empty) { margin-top: 16px; }
+    .generated-images figure { min-width: 0; margin: 0; }
+    .generated-images img { display: block; width: 100%; height: auto; border-radius: 10px; background: var(--panel); }
+    .generated-images figcaption { margin-top: 8px; color: var(--muted); font-size: .85rem; }
+    .generated-images a { color: var(--accent); text-decoration: underline; }
     .out-meta { margin-top: 9px; color: var(--faint); font: .85rem var(--mono); min-height: 1.2em; }
 
     #toast {
@@ -4472,21 +4821,22 @@ function dashboardResponse(cfg) {
     <section class="panel" id="panel-play" role="tabpanel">
       <div class="panel-head">
         <h1>Playground</h1>
-        <p>直接對 <code>/v1/chat/completions</code> 發送測試請求。</p>
+        <p>測試端點：<code id="play-endpoint">/v1/chat/completions</code></p>
       </div>
       <div class="card">
         <div class="play-bar">
           <label>模型
             <select id="play-model"><option value="">（尚未載入）</option></select>
           </label>
-          <label><input type="checkbox" class="switch" id="play-stream" checked>串流輸出</label>
+          <label><input type="checkbox" class="switch" id="play-stream" checked><span id="play-stream-label">串流輸出</span></label>
           <button class="btn primary push-right" id="play-send">送出（Ctrl+Enter）</button>
         </div>
         <div class="prompt">
           <input id="play-system" aria-label="System prompt（選填）" placeholder="System prompt（選填）" spellcheck="false">
-          <textarea id="play-input" rows="5" spellcheck="false" aria-label="訊息內容" placeholder="輸入訊息…"></textarea>
+          <textarea id="play-input" rows="5" spellcheck="false" aria-label="訊息內容" placeholder="輸入訊息，或明確要求「生成一張圖片」…"></textarea>
         </div>
-        <div class="output idle" id="play-output" aria-live="polite">回應會顯示在這裡。</div>
+        <p class="hint" id="play-mode-hint">生成圖片需登入帳號有相應權限；圖片連結有效一小時，請及時下載保存。</p>
+        <div class="output idle" id="play-output" aria-live="polite"><div id="play-text">回應會顯示在這裡。</div><div class="generated-images" id="play-images"></div></div>
         <div class="out-meta" id="play-meta"></div>
       </div>
     </section>
@@ -4776,6 +5126,7 @@ function dashboardResponse(cfg) {
         });
         if (prev && state.models.some(function (m) { return m.id === prev; })) sel.value = prev;
       }
+      syncPlayMode();
     }
 
     async function loadModels(force) {
@@ -4884,11 +5235,66 @@ function dashboardResponse(cfg) {
 
     // ── Playground ──
     var playAbort = null;
+    function isImagePlayMode() {
+      return $("play-model").value === "gemini-nano-banana-pro";
+    }
+    function syncPlayMode() {
+      var imageMode = isImagePlayMode();
+      $("play-endpoint").textContent = imageMode ? "/v1/images/generations" : "/v1/chat/completions";
+      var streamToggle = $("play-stream");
+      if (imageMode && !streamToggle.disabled) {
+        state.chatStream = streamToggle.checked;
+        streamToggle.checked = false;
+      } else if (!imageMode && streamToggle.disabled) streamToggle.checked = state.chatStream !== false;
+      streamToggle.disabled = imageMode;
+      $("play-system").disabled = imageMode;
+      $("play-input").placeholder = imageMode ? "描述你想要的圖片，例如：窗邊橘貓，水彩插畫" : "輸入訊息，或明確要求「生成一張圖片」…";
+      $("play-stream-label").textContent = imageMode ? "圖片 API 不使用串流" : "串流輸出";
+      $("play-mode-hint").textContent = imageMode
+        ? "專用圖片 API：直接輸入畫面描述，只回傳圖片。連結有效一小時。"
+        : "生成圖片需登入帳號有相應權限；圖片連結有效一小時，請及時下載保存。";
+    }
+    $("play-model").addEventListener("change", syncPlayMode);
+    function renderPlayImages(images) {
+      var gallery = $("play-images");
+      (images || []).forEach(function (item) {
+        var value = item && item.image_url && item.image_url.url;
+        var url;
+        try { url = new URL(value); } catch (_) { return; }
+        if (url.origin !== location.origin || !url.pathname.startsWith("/v1/images/")) return;
+        if (Array.prototype.some.call(gallery.querySelectorAll("a"), function (link) { return link.href === url.href; })) return;
+        var figure = document.createElement("figure");
+        var img = document.createElement("img");
+        img.alt = item.alt || "Gemini 生成的圖片";
+        img.loading = "lazy"; img.decoding = "async";
+        var caption = document.createElement("figcaption");
+        var link = document.createElement("a");
+        link.href = url.href; link.target = "_blank"; link.rel = "noopener noreferrer";
+        link.textContent = "開啟圖片／下載";
+        var status = document.createElement("span");
+        status.textContent = " · 載入中…";
+        img.addEventListener("load", function () { status.textContent = " · 連結有效一小時"; });
+        img.addEventListener("error", function () { status.textContent = " · 載入失敗，請開啟連結確認或重新生成"; });
+        caption.append(link, status); figure.append(img, caption); gallery.append(figure);
+        img.src = url.href;
+      });
+    }
+    function renderPlayText(text) {
+      // Render text as text, and only replace our own generated-image Markdown
+      // with the structured gallery. Never interpret upstream HTML.
+      $("play-text").textContent = text.replace(/!\\[Generated image \\d+\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, function (match, value) {
+        try { var url = new URL(value); return url.origin === location.origin && url.pathname.startsWith("/v1/images/") ? "" : match; }
+        catch (_) { return match; }
+      }).trim();
+    }
     async function runPlayground() {
       var btn = $("play-send");
       var out = $("play-output");
+      var textOut = $("play-text");
+      var rawOutput = "";
       var meta = $("play-meta");
       var model = $("play-model").value;
+      var imageMode = isImagePlayMode();
       var text = $("play-input").value.trim();
       if (!model) { toast("尚未載入模型，請先連線", true); return; }
       if (!text) { toast("請輸入訊息", true); return; }
@@ -4897,21 +5303,23 @@ function dashboardResponse(cfg) {
       var sys = $("play-system").value.trim();
       if (sys) messages.push({ role: "system", content: sys });
       messages.push({ role: "user", content: text });
-      var wantStream = $("play-stream").checked;
+      var wantStream = !imageMode && $("play-stream").checked;
 
       playAbort = new AbortController();
       if (!btn.dataset.label) btn.dataset.label = btn.textContent;
       btn.textContent = "中止";
       btn.classList.add("danger");
       out.className = "output";
-      out.textContent = "";
+      textOut.textContent = "";
+      $("play-images").replaceChildren();
       meta.textContent = wantStream ? "串流中…" : "等待回應…";
       var t0 = performance.now();
       try {
-        var res = await fetch("/v1/chat/completions", {
+        var res = await fetch(imageMode ? "/v1/images/generations" : "/v1/chat/completions", {
           method: "POST",
           headers: headersFor(true),
-          body: JSON.stringify({ model: model, messages: messages, stream: wantStream }),
+          body: JSON.stringify(imageMode ? { model: model, prompt: text, n: 1, response_format: "url" }
+            : { model: model, messages: messages, stream: wantStream }),
           signal: playAbort.signal,
         });
         if (!res.ok) {
@@ -4939,7 +5347,10 @@ function dashboardResponse(cfg) {
                 var j = JSON.parse(payload);
                 if (j.upstream_model) upstream = j.upstream_model;
                 var c = j.choices && j.choices[0];
-                if (c && c.delta && c.delta.content) out.textContent += c.delta.content;
+                if (c && c.delta) {
+                  if (c.delta.content) { rawOutput += c.delta.content; renderPlayText(rawOutput); }
+                  if (c.delta.images) renderPlayImages(c.delta.images);
+                }
                 if (c && c.finish_reason) finish = c.finish_reason;
               } catch (_) {}
             });
@@ -4951,22 +5362,32 @@ function dashboardResponse(cfg) {
         } else {
           var data = await res.json();
           elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+          if (imageMode) {
+            renderPlayImages((data.data || []).map(function (image) {
+              return { image_url: { url: image.url }, alt: "Gemini 生成的圖片" };
+            }));
+            meta.textContent = elapsed + "s · 圖片 API · " + (data.data || []).length + " 張圖片";
+          } else {
           var choice = data.choices && data.choices[0];
-          out.textContent = (choice && choice.message && choice.message.content) || "(空回應)";
+          rawOutput = (choice && choice.message && choice.message.content) || "";
+          renderPlayText(rawOutput);
+          if (choice && choice.message) renderPlayImages(choice.message.images);
           var usage = data.usage || {};
           meta.textContent = elapsed + "s" +
             " · 上游 " + (data.upstream_model || "unknown") +
             " · " + (data.route_status || "unknown") +
             (usage.total_tokens != null ? " · " + usage.total_tokens + " tokens" : "");
+          }
         }
-        if (!out.textContent) { out.className = "output idle"; out.textContent = "(沒有文字內容)"; }
+        if (!textOut.textContent && !$("play-images").children.length) { out.className = "output idle"; textOut.textContent = "(沒有文字或圖片內容)"; }
       } catch (e) {
         if (e && e.name === "AbortError") {
-          meta.textContent = "已中止" + (out.textContent ? "（保留已收到的內容）" : "");
-          if (!out.textContent) { out.className = "output idle"; out.textContent = "請求已中止。"; }
+          var hasOutput = !!textOut.textContent || !!$("play-images").children.length;
+          meta.textContent = "已中止" + (hasOutput ? "（保留已收到的內容）" : "");
+          if (!hasOutput) { out.className = "output idle"; textOut.textContent = "請求已中止。"; }
         } else {
           out.className = "output idle";
-          out.textContent = "請求失敗：" + e.message;
+          textOut.textContent = "請求失敗：" + e.message;
           meta.textContent = "失敗";
           toast(e.message, true);
         }
@@ -5047,7 +5468,7 @@ function dashboardResponse(cfg) {
 // Its CPU budget is separate from the Free plan's 10 ms ingress Worker budget.
 // No conversations or response bodies are persisted to Durable Object storage.
 function isGenerationRequest(method, path) {
-  return method === "POST" && (path === "/v1/chat/completions" || path === "/v1/responses"
+  return method === "POST" && (path === "/v1/chat/completions" || path === "/v1/responses" || path === "/v1/images/generations"
     || /^\/v1beta\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/.test(path));
 }
 
@@ -5055,7 +5476,8 @@ export class GenerationRunner {
   constructor(state, env) { this.state = state; this.env = env; }
 
   async fetch(request) {
-    if (!isGenerationRequest(request.method, new URL(request.url).pathname)) {
+    const path = new URL(request.url).pathname;
+    if (!isGenerationRequest(request.method, path) && !isImageProxyRequest(request.method, path)) {
       return jsonResponse({ error: { message: "not found" } }, 404);
     }
     // The internal argument cannot be set by an HTTP header or request body.
@@ -5070,13 +5492,14 @@ async function handleWorkerFetch(request, env, ctx, inGenerationRunner = false) 
     const method = request.method;
     const adminPath = path.startsWith("/admin/");
     const publicGet = method === "GET" && (path === "/" || path === "/health");
+    const imageProxy = isImageProxyRequest(method, path);
     let cfg;
 
-    if (!inGenerationRunner && env?.GENERATION_RUNNER && isGenerationRequest(method, path)) {
+    if (!inGenerationRunner && env?.GENERATION_RUNNER && (isGenerationRequest(method, path) || imageProxy)) {
       // Reject bad keys before allocating an object. Cookie-store access and
       // full credential validation happen inside the runner, before body reads.
       const edgeCfg = getConfig(env);
-      if (!authorized(request, url, edgeCfg)) {
+      if (!imageProxy && !authorized(request, url, edgeCfg)) {
         return jsonResponse({ error: { message: "invalid api key" } }, 401);
       }
       try {
@@ -5097,6 +5520,7 @@ async function handleWorkerFetch(request, env, ctx, inGenerationRunner = false) 
     try {
       cfg = publicGet ? getConfig(env) : await getRequestConfig(env);
       cfg.request_signal = request.signal;
+      cfg.worker_origin = url.origin;
     } catch (e) {
       const baseCfg = getConfig(env);
       log(baseCfg, `Cookie store unavailable; refusing fallback credentials: ${e}`);
@@ -5120,6 +5544,10 @@ async function handleWorkerFetch(request, env, ctx, inGenerationRunner = false) 
         return privateJsonResponse({ error: { message: "API 金鑰無效" } }, 401);
       }
     }
+
+    // Only encrypted, expiring links issued for this Cookie session authorize
+    // downloads without an API key header (ordinary image elements cannot send one).
+    if (imageProxy) return handleImageProxy(request, cfg, path.slice("/v1/images/".length));
 
     if (!adminPath && path !== "/" && path !== "/health" && cfg.cookie && !(cfg.api_keys || []).length) {
       return jsonResponse({
@@ -5159,7 +5587,7 @@ async function handleWorkerFetch(request, env, ctx, inGenerationRunner = false) 
               created: 1700000000,
               owned_by: "google",
               description: c.desc,
-            })),
+            })).concat(imageApiModel(models) || []),
           });
         }
         if (path.startsWith("/v1beta/models")) {
@@ -5197,6 +5625,10 @@ async function handleWorkerFetch(request, env, ctx, inGenerationRunner = false) 
         const bodyText = await readLimitedText(request, MAX_REQUEST_BYTES, 413);
         const req = parseJson(bodyText);
 
+        if (path === "/v1/images/generations") {
+          if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
+          return await handleImageGeneration(req, cfg);
+        }
         if (path === "/v1/chat/completions") {
           if (req === null) return jsonResponse({ error: { message: "invalid JSON" } }, 400);
           return await handleChat(req, cfg);
@@ -5254,7 +5686,7 @@ if (typeof process !== "undefined" && process.versions && process.versions.node)
     parseAuthPayload, cookieSummary, authCacheKey,
     getSetCookieValues, importedCookieJar, normalizeCookieJar, cookieHeaderForUrl, serializeCookieJar, cookieRotationPlan,
     parseSetCookie, mergeCookieJar, mergeRotatedCookies, cookieSessionKey,
-    buildPayload, getUrl, buildHeaders, cleanText,
+    buildPayload, getUrl, buildHeaders, cleanText, completionImages, decodeImageLink, isGeneratedImageUrl,
     extractTextsFromLine, extractResponseText, extractActualModel, routeStatus, generate, generateResult, generateStream,
     messagesToPrompt, parseToolCalls, toOpenAIStreamToolCallDeltas, googleContentsToPrompt, parseGoogleFunctionCalls,
     makeSapisidHash, parseImageUrl, extractGeminiBl, extractPageTokens, hasAuthenticatedPageMarkers, extractXsrfToken, getPageTokens, refreshGeminiBl, uploadImage, resolveImages,

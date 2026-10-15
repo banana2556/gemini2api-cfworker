@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.9.14-62b6ff"></a>
+  <a href="https://github.com/banana2556/gemini2api-cfworker"><img alt="Version" src="https://img.shields.io/badge/version-v1.11.1-62b6ff"></a>
   <a href="https://workers.cloudflare.com/"><img alt="Cloudflare Workers" src="https://img.shields.io/badge/Cloudflare-Workers-f6821f?logo=cloudflareworkers&logoColor=white"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-f6b95c"></a>
   <a href="https://github.com/banana2556"><img alt="Author banana2556" src="https://img.shields.io/badge/GitHub-%40banana2556-8b949e?logo=github"></a>
@@ -45,12 +45,13 @@ health checks, and live requests.
 
 | Interface | Endpoint | Highlights |
 |---|---|---|
-| OpenAI Chat Completions | `POST /v1/chat/completions` | Streaming, tool calls, image input |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | Streaming, tool calls, image input and generated image output |
+| OpenAI Images | `POST /v1/images/generations` | Dedicated image tool, image-only results, URL or Base64 output |
 | OpenAI Responses | `POST /v1/responses` | Codex-compatible events and tool calls |
 | Google AI | `POST /v1beta/models/{model}:generateContent` | Streaming and function calling |
 | Browser console | `GET /` | Status, models, Cookie lifecycle, Playground |
 
-Image input and signed-in model routes require a Gemini Cookie. Anonymous text
+Image input, generated images and signed-in model routes require a Gemini Cookie. Anonymous text
 requests work without configuration through Gemini's guest auto-routing mode.
 
 ## Highlights
@@ -228,11 +229,97 @@ frontend deployment.
 
 ## Models and routing
 
+### Dedicated image API
+
+Use `POST /v1/images/generations` with the adapter model `gemini-nano-banana-pro` to
+request images directly. The prompt is a scene description; no chat messages
+or "generate an image" instruction is required.
+
+```json
+{
+  "model": "gemini-nano-banana-pro",
+  "prompt": "An orange cat beside a sunny window, watercolor illustration",
+  "n": 1,
+  "response_format": "url"
+}
+```
+
+The response has the OpenAI Images envelope: `created` and `data`, with
+`data[].url` and `expires_at`. Use `response_format: "b64_json"` for
+`data[].b64_json` and `mime_type` instead. It does not return completion text or
+Markdown. `n` accepts 1–4; requests for multiple images can require multiple
+upstream generations. URL downloads allow 20 MiB per image. Base64 output is
+limited to 10 MiB per image and 20 MiB of image bytes across one response.
+`size`, `quality`, `background` and `output_format` currently accept only `auto`;
+the service determines actual dimensions, quality and encoding. Image requests
+do not support streaming.
+
+`gemini-nano-banana-pro` is a Worker adapter alias, advertised with
+`supported_endpoints: ["/v1/images/generations"]`; it is not a separately
+discovered Google model. The display name **Nano Banana Pro** follows
+[Google's official name for Gemini 3 Pro Image](https://deepmind.google/models/gemini-image/pro/).
+This alias names the Web Pro image-tool route; the Worker cannot independently
+verify Google's underlying image-model version for every request.
+It selects the current account's Pro route and adds
+native image-tool routing flags (`inner[49] = 14`, `inner[17] = [[1]]`). These
+flags were documented in the upstream project's
+[unmerged ImageMode PR #209](https://github.com/HanaokaYuzu/Gemini-API/pull/209),
+not the current library's `generate_content()` interface. The old fixed model
+signature from that PR is not used; model IDs remain account-discovered.
+Google may change this private protocol or restrict image access by account.
+If the route fails or returns only text, the endpoint returns an error rather
+than falling back to ordinary chat or guest generation. A login and an available
+Pro route are required.
+
+Select `gemini-nano-banana-pro` in Playground to test this endpoint; it switches the
+request format and disables chat-only controls. Passing `gemini-nano-banana-pro` to Chat
+Completions returns an endpoint guidance error.
+
+### Generate images through Chat Completions
+
+Use the same `POST /v1/chat/completions` endpoint and explicitly ask Gemini to
+generate an image. Image generation must be enabled for the signed-in account;
+the Worker does not grant permissions or force a text-only model to generate
+images. The upstream [Gemini-API library](https://github.com/HanaokaYuzu/Gemini-API)
+calls this `GeminiClient.generate_content()`; it is not itself an OpenAI HTTP
+server.
+
+```json
+{
+  "model": "your-model-id-from-v1-models",
+  "messages": [{"role": "user", "content": "Generate an image of an orange cat sitting by a window."}],
+  "stream": false
+}
+```
+
+`choices[0].message.content` includes Markdown image links for chat clients.
+The additional `choices[0].message.images` array provides structured
+`{"type":"image_url","image_url":{"url":"https://your-worker/v1/images/…"},"alt":"…","expires_at":"…"}`
+attachments. With `stream: true`, text remains incremental and a final image
+chunk carries `delta.images` plus the Markdown links before `[DONE]`. Repeated
+upstream image frames are deduplicated, and image-only turns are valid outputs.
+Playground shows the images with download links in either mode.
+
+Image URLs are encrypted capability links, valid for one hour, and can be opened
+without adding an Authorization header. Anyone holding a link can download
+that image until it expires. API keys and Google Cookies are not included in
+the URL. Changing the configured keys or login session invalidates existing
+links. Save the image while its link is valid; the Worker does not store image
+files. Downloads attempt the upstream original-image RPC and fall back to the
+preview when the original is unavailable. Only approved Google image hosts are
+followed, and each download is streamed with a 20 MiB limit inside the generation
+runner when available. Generated image output is exposed through Chat
+Completions and the dedicated Images endpoint; the Responses and Google API
+formats do not yet expose generated image attachments.
+
+### Model discovery
+
 With a configured Cookie, `GET /v1/models` exposes every model returned by
 the account's current `GetUserStatus` response, with a standard and Extended
 Thinking alias each. The catalog has no fixed model count or category allowlist;
 new names such as Argon appear when Google includes them for that account.
-Common aliases include:
+The OpenAI model list also adds the `gemini-nano-banana-pro` adapter when the session has
+a Pro route. Common chat aliases include:
 
 | Family | Standard | Extended Thinking |
 |---|---|---|
@@ -327,6 +414,8 @@ after setup and troubleshooting are complete.
 | `GET` | `/health` | Public health, version, and current Gemini build |
 | `GET` | `/v1/models` | OpenAI-style dynamic model catalog |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/images/generations` | Image-only API using the dedicated `gemini-nano-banana-pro` model |
+| `GET` / `HEAD` | `/v1/images/{token}` | Download a generated image using its one-hour encrypted link |
 | `POST` | `/v1/responses` | OpenAI Responses-compatible endpoint |
 | `GET` | `/v1beta/models` | Google-style dynamic model catalog |
 | `POST` | `/v1beta/models/{model}:generateContent` | Google non-streaming generation |
